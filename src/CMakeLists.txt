@@ -1,0 +1,5 @@
+add_subdirectory(cpu)
+add_subdirectory(bus)
+add_subdirectory(keyboard)
+add_subdirectory(lcd)
+add_subdirectory(host)
