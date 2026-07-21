@@ -221,20 +221,30 @@ calculator-style digit pad.
   emulation, only if the emulator ever needs to interpret BASIC-level
   display calls rather than raw buffer writes).
 
-Not yet researched: the SC882G's own command/addressing protocol (i.e.
+**Column-to-address mapping, resolved via the CPU test suite**: the
+earlier working assumption here was a packed-nibble scheme splitting each
+byte across two chips. That's now superseded — tracing the manual's own
+worked "display reverse" example (chapter 1, hand-assembled program;
+see `lh5801_test.cpp`'s `testManualDisplayReverseExample`) shows it
+operates on exactly two **78-byte** chunks, `7600H`-`764DH` and
+`7700H`-`774DH`. `78 × 2 = 156`, exactly the panel's column count. That's
+strong direct evidence for a much simpler model: **one byte = one full
+7-dot column**, no nibble-splitting, with only the first 78 bytes of each
+256-byte half (`7600H-764DH`, `7700H-774DH`) being real display columns —
+the remainder of each 256-byte range (`764EH-76FFH`, `774EH-77FFH`) is
+presumably repurposed as the "fixed variable area" the manual mentions
+sharing this chip-select block. Column ordering (which half is visually
+left vs. right) is still an assumption — `7600H`-based half = columns
+0-77 (left), `7700H`-based half = columns 78-155 (right) — a natural,
+likely-but-unconfirmed convention, not verified against real hardware.
+
+Still not researched: the SC882G's own command/addressing protocol (i.e.
 whether the CPU's plain memory writes to `7600H-77FFH` go straight to
 SC882G-internal display RAM with no separate "set column address" style
-command, or whether there's a thin latch/counter in between). Given the
-manual describes these addresses as plain memory (chip-selected exactly
-like RAM, in the ME0 chip-select truth table), the working assumption is
-**direct-mapped**: writing byte N to `7600H + col` (or `7700H + col`) sets
-that column's 7 dots on chip 1/2 respectively (packed nibble scheme:
-`7600H-76FFH` byte = {chip3 high nibble, chip1 low nibble} for the
-first half of the display, `7700H-77FFH` similarly for chips 2/4).
-**This nibble-packing detail is an inference from the chip-pairing text
-in chapter 4-2-1, not independently confirmed against a chip datasheet —
-worth validating once bring-up testing is possible against real ROM
-behavior (task: Integration).**
+command, or whether there's a thin latch/counter in between) — moot for
+the emulator's purposes now that the byte-to-column mapping above is
+solidly evidenced, but would matter if real display-refresh *timing*
+ever needs to be modeled.
 
 ## Other hardware noted but out of scope / deferred
 
