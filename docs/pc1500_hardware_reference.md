@@ -131,12 +131,30 @@ The manual's key matrix diagram (labeled page 109) shows the physical
 key-to-(PA column, IN row) mapping for every key, and a separate "key code
 chart" gives the BASIC/software-level key-code numbering (used by
 `KEYSTAT`-style system subroutines) — a different, higher-level numbering
-than the raw matrix position. **Not yet transcribed here**: the scan of
-that page was too small to reliably read off which key sits at each of the
-64 matrix intersections. Follow-up: re-extract that page at higher
-zoom/resolution (or cross-reference the PC-1600 manual's appendix 10.2 "KEY
-CODE TABLE", which may cover the same physical layout family) before
-implementing keyboard input, rather than guessing key placement.
+than the raw matrix position, not needed for hardware-level emulation since
+the real ROM does that translation itself from the raw matrix state.
+
+### Physical key matrix (labeled page 109)
+
+Transcribed directly off the manual by Paul (my own OCR pass on this page
+wasn't reliable enough to trust — small circle labels at scan resolution).
+`?` marks a position neither of us could read confidently; fill in once a
+sharper scan or a real PC-1500 photo is available. Columns are PA0-PA7,
+rows are IN0-IN7 (i.e. cell = key pressed when that PA line is strobed and
+that IN line reads active).
+
+| Row | PA0 | PA1 | PA2 | PA3 | PA4 | PA5 | PA6 | PA7 |
+|---|---|---|---|---|---|---|---|---|
+| IN0 | 2 | ? | 1 | ? | + | - | ▶ | 3 |
+| IN1 | 5 | ? | 4 | ! | * | ◄ | MODE | E |
+| IN2 | 8 | OFF | 7 | C | ? | P | RCL | ? |
+| IN3 | H | S | J | K | D | : | A | ? |
+| IN4 | SHIFT | F1 | F5 | F6 | F2 | F3 | OFF | F4 |
+| IN5 | Y | W | ? | ? | ?(looks like `!`) | ? | ? | ? |
+| IN6 | ? | X | M | ? | ? | ? | / | ? |
+| IN7 | ? | ? | ? | ENTER | RCL | ? | SML | . |
+
+(ON key: not part of this grid — see BFI note above.)
 
 ## LCD
 
