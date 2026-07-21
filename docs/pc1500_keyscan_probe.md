@@ -7,6 +7,7 @@ rather than reading it off the (illegible-in-places) manual scan.
 ## Type this into the PC-1500 in BASIC
 
 ```basic
+1 WAIT 0
 5 FOR I=0 TO 47:READ D:POKE 17408+I,D:NEXT I
 6 DATA 181,255,253,174,240,12,74,0,88,68,90,40,85,253,174,240,14,253,186,183
 7 DATA 255,137,9,64,78,8,153,16,181,255,74,255,174,68,129,4,174,68,128,154
@@ -15,6 +16,12 @@ rather than reading it off the (illegible-in-places) manual scan.
 20 PRINT PEEK(17536);PEEK(17537)
 30 GOTO 10
 ```
+
+Line 1 (`WAIT 0`) disables the default post-`PRINT` pause that Sharp
+pocket-computer BASICs use to give you time to read the tiny single-line
+display — without it, each `PRINT` was returning to immediate mode after
+one pass rather than looping. `WAIT 0` should be a persistent setting once
+executed, so it only needs to run once at the top.
 
 (Two earlier revisions of this had bugs. First, the strobe table was at a
 separate address [`4090H`], needing two POKE loops — fixed by putting it
