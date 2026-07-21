@@ -158,14 +158,14 @@ that IN line reads active).
 
 | Row | PA0 | PA1 | PA2 | PA3 | PA4 | PA5 | PA6 | PA7 |
 |---|---|---|---|---|---|---|---|---|
-| IN0 | 2 | ? | 1 | ? | + | - | ▶ | 3 |
-| IN1 | 5 | ? | 4 | ? | * | ◄ | MODE | 6 |
+| IN0 | 2 | . | 1 | ) | + | = | ▶ | 3 |
+| IN1 | 5 | - | 4 | L | * | ◄ | MODE | 6 |
 | IN2 | 8 | OFF | 7 | C | ? | P | CL | 9 |
 | IN3 | H | S | J | K | D | : | A | ? |
 | IN4 | SHIFT | F1 | F5 | F6 | F2 | F3 | DEF | F4 |
 | IN5 | Y | W | ? | ? | ? | ? | ? | ? |
 | IN6 | ? | X | M | ? | ? | ? | / | ? |
-| IN7 | ? | ? | ? | ENTER | RCL | ? | SML | . |
+| IN7 | ▲ | ↕ | 0 | ENT | RCL | SPACE | SML | ▼ |
 
 (ON key: not part of this grid — see BFI note above.)
 
@@ -173,10 +173,10 @@ Canonical key list (given by Paul, from the physical keyboard directly —
 use this to sanity-check the matrix table above): `OFF`, `ON`, `DEF`,
 `F1`-`F6`, `A`-`Z`, `=`, `(`, `)`, up, down, left, right, `SML`, an
 up/down rocker (distinct from the plain up/down arrows), `RCL`, `SPACE`,
-`ENTER`, `0`-`9`, `.`, `ENT`, `/`, `*`, `+`, `-`, `MODE`, `CL`. Note `ENTER`
-and `ENT` are both listed as distinct — not yet reconciled; could be a
-duplicate mention or two genuinely different keys (e.g. a scientific-
-notation exponent key). Worth clarifying before finalizing.
+`ENTER`, `0`-`9`, `.`, `ENT`, `/`, `*`, `+`, `-`, `MODE`, `CL`. `ENTER` and
+`ENT` are confirmed as two genuinely distinct physical keys (`ENT` is a
+separate, smaller Enter key) — `ENT` is now located at IN7/PA3. The main
+`ENTER` key's matrix position is still unknown.
 
 **Three-column digit pad confirmed**: PA0, PA2, and PA7 each step by 3 down
 rows IN0-IN2 (PA2: `1,4,7`; PA0: `2,5,8`; PA7: `3,6,9`) — the classic
