@@ -163,7 +163,7 @@ that IN line reads active).
 | IN2 | 8 | OFF | 7 | C | ? | P | CL | 9 |
 | IN3 | H | S | J | K | D | : | A | ? |
 | IN4 | SHIFT | F1 | F5 | F6 | F2 | F3 | DEF | F4 |
-| IN5 | Y | W | ? | ? | ? | ? | ? | ? |
+| IN5 | Y | W | U | I | E | R | Q | T |
 | IN6 | N | X | M | ( | C | V | / | B |
 | IN7 | ▲ | ↕ | 0 | ENT | RCL | SPACE | SML | ▼ |
 
