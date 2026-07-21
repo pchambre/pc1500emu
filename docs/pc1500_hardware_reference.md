@@ -149,40 +149,49 @@ the real ROM does that translation itself from the raw matrix state.
 
 ### Physical key matrix (labeled page 109)
 
-Transcribed directly off the manual by Paul (my own OCR pass on this page
-wasn't reliable enough to trust — small circle labels at scan resolution).
-`?` marks a position neither of us could read confidently; fill in once a
-sharper scan or a real PC-1500 photo is available. Columns are PA0-PA7,
-rows are IN0-IN7 (i.e. cell = key pressed when that PA line is strobed and
-that IN line reads active).
+Fully confirmed via live hardware testing (see `pc1500_keyscan_probe.md`) —
+a first pass transcribed directly off the manual page had several
+misreads (small circle labels at scan resolution; my own OCR pass on that
+page wasn't reliable enough to trust either), all caught and corrected by
+pressing each key on a real PC-1500 and reading back the actual matrix
+position. Columns are PA0-PA7, rows are IN0-IN7 (i.e. cell = key pressed
+when that PA line is strobed and that IN line reads active).
 
 | Row | PA0 | PA1 | PA2 | PA3 | PA4 | PA5 | PA6 | PA7 |
 |---|---|---|---|---|---|---|---|---|
 | IN0 | 2 | . | 1 | ) | + | = | ▶ | 3 |
 | IN1 | 5 | - | 4 | L | * | ◄ | MODE | 6 |
-| IN2 | 8 | OFF | 7 | C | ? | P | CL | 9 |
-| IN3 | H | S | J | K | D | : | A | ? |
+| IN2 | 8 | OFF | 7 | O | / | P | CL | 9 |
+| IN3 | H | S | J | K | D | : | A | G |
 | IN4 | SHIFT | F1 | F5 | F6 | F2 | F3 | DEF | F4 |
 | IN5 | Y | W | U | I | E | R | Q | T |
-| IN6 | N | X | M | ( | C | V | / | B |
+| IN6 | N | X | M | ( | C | V | Z | B |
 | IN7 | ▲ | ↕ | 0 | ENT | RCL | SPACE | SML | ▼ |
 
 (ON key: not part of this grid — see BFI note above.)
 
-Canonical key list (given by Paul, from the physical keyboard directly —
-use this to sanity-check the matrix table above): `OFF`, `ON`, `DEF`,
-`F1`-`F6`, `A`-`Z`, `=`, `(`, `)`, up, down, left, right, `SML`, an
-up/down rocker (distinct from the plain up/down arrows), `RCL`, `SPACE`,
-`ENTER`, `0`-`9`, `.`, `ENT`, `/`, `*`, `+`, `-`, `MODE`, `CL`. `ENTER` and
-`ENT` are confirmed as two genuinely distinct physical keys (`ENT` is a
-separate, smaller Enter key) — `ENT` is now located at IN7/PA3. The main
-`ENTER` key's matrix position is still unknown.
+Canonical key list (given by Paul, from the physical keyboard directly):
+`OFF`, `ON`, `DEF`, `F1`-`F6`, `A`-`Z`, `=`, `(`, `)`, up, down, left,
+right, `SML`, an up/down rocker (distinct from the plain up/down arrows,
+found at IN7/PA1), `RCL`, `SPACE`, `ENTER`, `0`-`9`, `.`, `ENT`, `/`, `*`,
+`+`, `-`, `MODE`, `CL`. All 64 matrix cells are now accounted for against
+this list, with two loose ends:
+- `ENTER` and `ENT` are confirmed as two genuinely distinct physical keys
+  (`ENT` is a separate, smaller Enter key, located at IN7/PA3) — but the
+  main `ENTER` key's own matrix position was never separately identified.
+  Possibly it doesn't have a dedicated matrix cell at all (e.g. mapped to
+  the same electrical position as `ENT` via a secondary keycap legend);
+  unconfirmed.
+- The letter `F` never showed up as its own matrix cell either — only
+  `F1`-`F6`. Likely a secondary legend sharing a keycap with something
+  already placed (mirroring how `F1`-`F6` themselves visually share
+  keycaps with the digit/`SHIFT`/`SML` row per the manual's separate
+  "key code chart"), rather than a distinct 65th position that a strict
+  8×8=64 matrix couldn't have anyway.
 
-**Three-column digit pad confirmed**: PA0, PA2, and PA7 each step by 3 down
-rows IN0-IN2 (PA2: `1,4,7`; PA0: `2,5,8`; PA7: `3,6,9`) — the classic
-calculator-style digit pad. IN1/PA7 was originally misread as `E`; Paul
-confirmed it's `6`, completing the pattern. IN2/PA7 (`9`) was filled in by
-this same inference and also confirmed. Digit `0` is still unplaced.
+**Three-column digit pad**: PA0, PA2, and PA7 each step by 3 down rows
+IN0-IN2 (PA2: `1,4,7`; PA0: `2,5,8`; PA7: `3,6,9`) — the classic
+calculator-style digit pad.
 
 ## LCD
 
