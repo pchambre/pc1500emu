@@ -4,12 +4,119 @@
 
 namespace lh5801 {
 
-// Placeholder CPU core. Register set, flags, and instruction decode are
-// pending ISA research (docs/lh5801_isa.md) and will replace this stub.
+// LH5801 has two independent 64KB memory spaces (ME0, ME1). Plain (Rreg)/(ab)
+// addressing modes hit ME0; #(Rreg)/#(ab) hit ME1. On the PC-1500, ME1 holds
+// only the LH5811 I/O port controller (F000H-F00FH); everything else the CPU
+// can address lives in ME0. See docs/lh5801_opcode_reference.md and
+// docs/pc1500_hardware_reference.md.
+class MemoryBus {
+ public:
+  virtual ~MemoryBus() = default;
+  virtual uint8_t readME0(uint16_t addr) = 0;
+  virtual void writeME0(uint16_t addr, uint8_t value) = 0;
+  virtual uint8_t readME1(uint16_t addr) = 0;
+  virtual void writeME1(uint16_t addr, uint8_t value) = 0;
+
+  // IN0-IN7: CPU-direct key input pins (not part of either memory space,
+  // read only via the ITA instruction). Bit i = INi.
+  virtual uint8_t readInputPort() { return 0xFF; }
+};
+
+struct Flags {
+  bool c = false;
+  bool v = false;
+  bool z = false;
+  bool h = false;
+  bool ie = false;
+};
+
+// Instruction-accurate LH5801 CPU core. Every opcode's behavior and byte
+// encoding is taken from docs/lh5801_opcode_reference.md (cross-verified
+// against two independent manual scans). A few things are honest
+// simplifications/assumptions where the manual doesn't spell out exact
+// bit-level behavior; each is flagged with a comment at its point of use:
+//   - The T (status) register's bit layout (used by ATT/TTA/RTI) is not
+//     documented anywhere we found; this core picks an internally-consistent
+//     layout (assumed, see packFlags/unpackFlags in lh5801.cpp) that
+//     round-trips correctly but may not match real ROM code that inspects
+//     T's bits directly rather than just save/restore via ATT/TTA/RTI.
+//   - ROL/ROR/SHL/SHR are documented as changing C,V,H,Z, but the manual
+//     doesn't specify V/H's exact meaning for a rotate/shift (unlike
+//     CPA, where it's explicit that V/H "may change but have no meaning").
+//     This core updates C and Z; V and H are left unchanged for these four
+//     instructions rather than guess at undocumented semantics.
 class CPU {
  public:
+  explicit CPU(MemoryBus& bus) : bus_(bus) {}
+
   void reset();
-  int step();  // returns cycle count consumed
+
+  // Executes exactly one instruction. Returns the cycle count consumed
+  // (per the opcode reference's cycle table), or 0 if halted (HLT).
+  int step();
+
+  // Accessors mainly for tests/debugging.
+  uint8_t a() const { return a_; }
+  uint16_t x() const { return x_; }
+  uint16_t y() const { return y_; }
+  uint16_t u() const { return u_; }
+  uint16_t s() const { return s_; }
+  uint16_t p() const { return p_; }
+  const Flags& flags() const { return flags_; }
+  bool halted() const { return halted_; }
+  bool bf() const { return bf_; }
+  bool disp() const { return disp_; }
+  bool pu() const { return pu_; }
+  bool pv() const { return pv_; }
+
+  void setP(uint16_t p) { p_ = p; }
+  void setS(uint16_t s) { s_ = s; }
+
+  // Hardware-level ON-key press: sets BFI high, which (on real hardware)
+  // supplies VCC via BFO. Independent of any CPU instruction; the OFF
+  // instruction is software's way to reset it back low.
+  void pressOnKey() { bf_ = true; }
+
+ private:
+  MemoryBus& bus_;
+
+  uint8_t a_ = 0;
+  uint16_t x_ = 0, y_ = 0, u_ = 0;
+  uint16_t s_ = 0;
+  uint16_t p_ = 0;
+  Flags flags_;
+  bool halted_ = false;
+
+  // CPU-internal flip-flops exposed for the bus/host to read.
+  bool bf_ = false;    // BF flip-flop (BFI/BFO wake latch)
+  bool disp_ = false;  // LCD on/off control flip-flop (SDP/RDP)
+  bool pu_ = false;    // general-purpose flip-flop PU (SPU/RPU)
+  bool pv_ = false;    // general-purpose flip-flop PV (SPV/RPV)
+
+  // Register-select family used by ADC/SBC/CPA/LDA/STA/etc: 0=X, 1=Y, 2=U.
+  uint16_t regR16(int rsel) const;
+  void setRegR16(int rsel, uint16_t v);
+  uint8_t regRL(int rsel) const;
+  void setRegRL(int rsel, uint8_t v);
+  uint8_t regRH(int rsel) const;
+  void setRegRH(int rsel, uint8_t v);
+
+  uint8_t fetch8();
+  uint16_t fetch16();  // high byte first, then low (matches (ab) notation)
+
+  void push8(uint8_t v);
+  uint8_t pop8();
+  void push16(uint16_t v);  // low byte first, then high (matches manual)
+  uint16_t pop16();
+
+  // Shared add/subtract-as-add-of-complement ALU op; updates C,V,H,Z.
+  uint8_t doAdd(uint8_t opA, uint8_t opB, bool carryIn);
+
+  uint8_t packFlags() const;
+  void unpackFlags(uint8_t v);
+
+  void execPrimary(uint8_t opcode, int& cycles);
+  void execFD(uint8_t opcode, int& cycles);
 };
 
 }  // namespace lh5801
