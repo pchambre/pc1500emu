@@ -146,8 +146,8 @@ that IN line reads active).
 | Row | PA0 | PA1 | PA2 | PA3 | PA4 | PA5 | PA6 | PA7 |
 |---|---|---|---|---|---|---|---|---|
 | IN0 | 2 | ? | 1 | ? | + | - | ▶ | 3 |
-| IN1 | 5 | ? | 4 | ? | * | ◄ | MODE | E |
-| IN2 | 8 | OFF | 7 | C | ? | P | CL | ? |
+| IN1 | 5 | ? | 4 | ? | * | ◄ | MODE | 6 |
+| IN2 | 8 | OFF | 7 | C | ? | P | CL | 9 |
 | IN3 | H | S | J | K | D | : | A | ? |
 | IN4 | SHIFT | F1 | F5 | F6 | F2 | F3 | DEF | F4 |
 | IN5 | Y | W | ? | ? | ? | ? | ? | ? |
@@ -165,16 +165,11 @@ and `ENT` are both listed as distinct — not yet reconciled; could be a
 duplicate mention or two genuinely different keys (e.g. a scientific-
 notation exponent key). Worth clarifying before finalizing.
 
-**One pattern worth checking against the actual page**: columns PA2 and
-PA0 both step by 3 down rows IN0-IN2 (PA2: `1,4,7`; PA0: `2,5,8`) — the
-classic three-column digit-pad layout. PA7 fits the same pattern for its
-first entry (IN0/PA7 = `3`), which would predict IN1/PA7 = `6` and
-IN2/PA7 = `9` to complete `3,6,9`. IN2/PA7 is currently blank (`?`), so
-`9` is a reasonable guess there. IN1/PA7 is currently recorded as `E`
-though, not `6` — worth a second look at that one specific cell, since
-`E` and `6` are easy to confuse at scan resolution and this is the only
-cell breaking an otherwise clean pattern. Not changing either cell based
-on inference alone; flagging for direct confirmation.
+**Three-column digit pad confirmed**: PA0, PA2, and PA7 each step by 3 down
+rows IN0-IN2 (PA2: `1,4,7`; PA0: `2,5,8`; PA7: `3,6,9`) — the classic
+calculator-style digit pad. IN1/PA7 was originally misread as `E`; Paul
+confirmed it's `6`, completing the pattern. IN2/PA7 (`9`) was filled in by
+this same inference and also confirmed. Digit `0` is still unplaced.
 
 ## LCD
 
