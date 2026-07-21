@@ -130,10 +130,14 @@ void testBranchPolarityBothDirectionsSameCondition() {
 }
 
 // The manual's own worked "display reverse" example (chapter 1, page 2
-// label). Traced through by hand: it reverses two 78-byte chunks
-// (0x7700-0x774D and 0x7600-0x764D -- the two halves of the 156-column LCD
-// buffer) and falls through to RTN, making it a deterministic, bounded
-// end-to-end exercise of LDI/DEC/LDA/EAI/STA/LOP/CPI/BCS/RTN together.
+// label) -- identical byte-for-byte to section 6-2 "Display inversion"
+// (labeled page 145), which makes sense: on a 1-bit-per-pixel display,
+// bitwise-complementing the buffer (EAI FFH) *is* inverting on/off
+// pixels, just described from two angles in two different chapters.
+// Traced through by hand: it reverses two 78-byte chunks (0x7700-0x774D
+// and 0x7600-0x764D -- the two halves of the 156-column LCD buffer) and
+// falls through to RTN, making it a deterministic, bounded end-to-end
+// exercise of LDI/DEC/LDA/EAI/STA/LOP/CPI/BCS/RTN together.
 void testManualDisplayReverseExample() {
   TestBus bus;
   lh5801::CPU cpu(bus);
