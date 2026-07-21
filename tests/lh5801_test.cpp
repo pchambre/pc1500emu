@@ -79,6 +79,32 @@ void testCpaConvention() {
   CHECK(cpu.flags().z == false);
 }
 
+void testAttTtaBitLayout() {
+  TestBus bus;
+  lh5801::CPU cpu(bus);
+  cpu.reset();
+  // T layout per manual 2-2-3: H,V,Z,IE,C from left to right (C=bit0,
+  // IE=bit1, Z=bit2, V=bit3, H=bit4). LDI A,i ; ATT (FD EC) ; then TTA
+  // (FD AA) should round-trip and unpack into the right individual flags.
+  bus.writeME0(0, 0xB5);  // LDI A,i
+  bus.writeME0(1, 0x1D);  // 0b00011101: C=1,IE=0,Z=1,V=1,H=1
+  bus.writeME0(2, 0xFD);
+  bus.writeME0(3, 0xEC);  // ATT
+  cpu.setP(0);
+  cpu.step();  // LDI
+  cpu.step();  // ATT
+  CHECK(cpu.flags().c == true);
+  CHECK(cpu.flags().ie == false);
+  CHECK(cpu.flags().z == true);
+  CHECK(cpu.flags().v == true);
+  CHECK(cpu.flags().h == true);
+
+  bus.writeME0(4, 0xFD);
+  bus.writeME0(5, 0xAA);  // TTA
+  cpu.step();
+  CHECK(cpu.a() == 0x1D);
+}
+
 void testBranchPolarityBothDirectionsSameCondition() {
   TestBus bus;
   lh5801::CPU cpu(bus);
@@ -165,6 +191,7 @@ int main() {
   testReset();
   testAdcCarry();
   testCpaConvention();
+  testAttTtaBitLayout();
   testBranchPolarityBothDirectionsSameCondition();
   testManualDisplayReverseExample();
 

@@ -32,14 +32,12 @@ struct Flags {
 
 // Instruction-accurate LH5801 CPU core. Every opcode's behavior and byte
 // encoding is taken from docs/lh5801_opcode_reference.md (cross-verified
-// against two independent manual scans). A few things are honest
-// simplifications/assumptions where the manual doesn't spell out exact
-// bit-level behavior; each is flagged with a comment at its point of use:
-//   - The T (status) register's bit layout (used by ATT/TTA/RTI) is not
-//     documented anywhere we found; this core picks an internally-consistent
-//     layout (assumed, see packFlags/unpackFlags in lh5801.cpp) that
-//     round-trips correctly but may not match real ROM code that inspects
-//     T's bits directly rather than just save/restore via ATT/TTA/RTI.
+// against two independent manual scans). The T (status) register's bit
+// layout (used by ATT/TTA/RTI) is documented in manual section 2-2-3: low
+// 5 bits are H,V,Z,IE,C from left to right (C in the 1s position, H in the
+// 16s) -- see packFlags/unpackFlags in lh5801.cpp.
+//
+// One remaining honest simplification, flagged at its point of use:
 //   - ROL/ROR/SHL/SHR are documented as changing C,V,H,Z, but the manual
 //     doesn't specify V/H's exact meaning for a rotate/shift (unlike
 //     CPA, where it's explicit that V/H "may change but have no meaning").

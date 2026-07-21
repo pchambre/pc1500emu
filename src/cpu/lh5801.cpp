@@ -108,26 +108,24 @@ uint8_t CPU::doAdd(uint8_t opA, uint8_t opB, bool carryIn) {
   return result;
 }
 
-// Bit layout for ATT/TTA/RTI's T register is not documented anywhere in the
-// manual sections we found -- this is an assumed, internally-consistent
-// layout (round-trips correctly through ATT/TTA/RTI) rather than a
-// confirmed hardware fact.
+// T register bit layout, per manual section 2-2-3: low-order 5 bits are
+// H,V,Z,IE,C from left to right -- C in the 1s position, H in the 16s.
 uint8_t CPU::packFlags() const {
   uint8_t v = 0;
   if (flags_.c) v |= 0x01;
-  if (flags_.v) v |= 0x02;
-  if (flags_.h) v |= 0x04;
-  if (flags_.z) v |= 0x08;
-  if (flags_.ie) v |= 0x10;
+  if (flags_.ie) v |= 0x02;
+  if (flags_.z) v |= 0x04;
+  if (flags_.v) v |= 0x08;
+  if (flags_.h) v |= 0x10;
   return v;
 }
 
 void CPU::unpackFlags(uint8_t v) {
   flags_.c = (v & 0x01) != 0;
-  flags_.v = (v & 0x02) != 0;
-  flags_.h = (v & 0x04) != 0;
-  flags_.z = (v & 0x08) != 0;
-  flags_.ie = (v & 0x10) != 0;
+  flags_.ie = (v & 0x02) != 0;
+  flags_.z = (v & 0x04) != 0;
+  flags_.v = (v & 0x08) != 0;
+  flags_.h = (v & 0x10) != 0;
 }
 
 int CPU::step() {
