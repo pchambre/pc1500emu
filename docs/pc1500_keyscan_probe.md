@@ -7,15 +7,20 @@ rather than reading it off the (illegible-in-places) manual scan.
 ## Type this into the PC-1500 in BASIC
 
 ```basic
-5 FOR I=0 TO 39:READ D:POKE 16384+I,D:NEXT I
-6 FOR I=0 TO 7:READ D:POKE 16528+I,D:NEXT I
-7 DATA 181,255,253,174,240,12,74,0,88,64,90,144,85,253,174,240,14,253,186,183
-8 DATA 255,137,9,64,78,8,153,16,181,255,74,255,174,64,129,4,174,64,128,154
-9 DATA 254,253,251,247,239,223,191,127
+5 FOR I=0 TO 47:READ D:POKE 16384+I,D:NEXT I
+6 DATA 181,255,253,174,240,12,74,0,88,64,90,40,85,253,174,240,14,253,186,183
+7 DATA 255,137,9,64,78,8,153,16,181,255,74,255,174,64,129,4,174,64,128,154
+8 DATA 254,253,251,247,239,223,191,127
 10 CALL 16384
 20 PRINT PEEK(16512);PEEK(16513)
 30 GOTO 10
 ```
+
+(An earlier version of this put the strobe table at a separate address
+[`4090H`], which needed two POKE loops to land each block correctly. The
+table now sits immediately after the code at `4028H`, so it's one
+contiguous 48-byte block and one loop — only the `LDI YL` operand byte
+changed, from `90H` to `28H`, i.e. DATA item 12 went from `144` to `40`.)
 
 Run it (`RUN`), then press keys one at a time. Each press prints two numbers:
 **column index (0-7, matching PA0-PA7)** and **row byte** (the raw `IN0-IN7`
@@ -28,8 +33,9 @@ To stop: `BREAK`/`ON` should interrupt it (standard PC-1500 BASIC behavior),
 since `GOTO 10` loops forever otherwise.
 
 **If it never shows anything but `255 255` while a key is held**, the strobe
-polarity assumption is backwards for this hardware. Fix: change line 9's
-`DATA` to `1,2,4,8,16,32,64,128` (active-high strobe) and swap `PEEK(16513)`
+polarity assumption is backwards for this hardware. Fix: change the last 8
+values in line 8's `DATA` (currently `254,253,251,247,239,223,191,127`) to
+`1,2,4,8,16,32,64,128` (active-high strobe) and swap `PEEK(16513)`
 comparisons/expectations accordingly — but try it as-is first; active-low
 with pulled-up rows is the standard convention for this class of chip.
 
@@ -40,15 +46,15 @@ just move to the next key once you've noted one reading.
 
 Loaded at `4000H` (16384 decimal) — safely below the BASIC program area,
 which starts at `40C5H` per the manual's `NEW` command documentation.
-Results land at `4080H`/`4081H` (16512/16513); the strobe table at `4090H`
-(16528).
+Results land at `4080H`/`4081H` (16512/16513); the strobe table immediately
+follows the code at `4028H`.
 
 ```
 4000: B5 FF          LDI  A,0FFH
 4002: FD AE F0 0C    STA  #(0F00CH)     ; DDA = FFH  (PA0-7 all output)
 4006: 4A 00          LDI  XL,00H        ; XL = column counter
 4008: 58 40          LDI  YH,40H
-400A: 5A 90          LDI  YL,90H        ; Y = strobe table (4090H)
+400A: 5A 28          LDI  YL,28H        ; Y = strobe table (4028H)
 400C: 55             LIN  Y             ; L1: A = strobe byte, Y++
 400D: FD AE F0 0E    STA  #(0F00EH)     ; OPA = A  (drive this column)
 4011: FD BA          ITA                ; A = IN0..7
@@ -64,7 +70,7 @@ Results land at `4080H`/`4081H` (16512/16513); the strobe table at `4090H`
 4024: AE 40 80       STA  (4080H)       ; save column index
 4027: 9A             RTN
 
-4090: FE FD FB F7 EF DF BF 7F   ; strobe table: bit c=0, others=1, c=0..7
+4028: FE FD FB F7 EF DF BF 7F   ; strobe table: bit c=0, others=1, c=0..7
 ```
 
 Every opcode above is taken from `lh5801_opcode_reference.md` (already
