@@ -8,12 +8,12 @@ rather than reading it off the (illegible-in-places) manual scan.
 
 ```basic
 1 WAIT 0
-5 FOR I=0 TO 58:READ D:POKE 17408+I,D:NEXT I
-6 DATA 181,255,253,174,240,12,74,0,88,68,90,51,85,253,174,240,14,253,186,183
-7 DATA 255,137,11,64,78,8,153,16,74,255,106,255,142,8,106,0,209,129,3,98
-8 DATA 158,6,4,174,68,59,36,174,68,60,154,254,253,251,247,239,223,191,127
+5 FOR I=0 TO 47:READ D:POKE 17408+I,D:NEXT I
+6 DATA 181,255,253,174,240,12,74,0,88,68,90,40,85,253,174,240,14,253,186,183
+7 DATA 255,137,9,64,78,8,153,16,181,255,74,255,174,68,129,4,174,68,128,154
+8 DATA 254,253,251,247,239,223,191,127
 10 CALL 17408
-20 PRINT PEEK(17467);PEEK(17468)
+20 PRINT 255-PEEK(17537);PEEK(17536)
 30 GOTO 10
 ```
 
@@ -23,10 +23,18 @@ display — without it, each `PRINT` was returning to immediate mode after
 one pass rather than looping. `WAIT 0` should be a persistent setting once
 executed, so it only needs to run once at the top.
 
-This revision adds a bit-scan in machine code so the second printed number
-is already the **row-line index (0-7)**, not the raw row byte — no manual
-bit decoding needed. Both printed numbers are now directly comparable to
-the matrix table: `(column, row)` = `(PA index, IN index)`.
+Line 20 prints **row value, then column** (row first). `255-PEEK(17537)`
+turns the raw row byte (one bit low, rest high) back into a plain power of
+two: `1,2,4,8,16,32,64,128` for `IN0`-`IN7` respectively — much easier to
+eyeball than the complemented byte, and needs no changes to the machine
+code or the `DATA` already typed in. (For no key pressed it prints `0`,
+since `255-255=0`.)
+
+There's also a machine-code version that computes the row index directly
+(no BASIC-side math at all) — see "What it loads" below. It's documented
+for reference but wasn't the one actually used, since it would have meant
+retyping the already-entered `DATA` lines for no real benefit once the
+one-line `PRINT` fix above works just as well.
 
 (Two earlier revisions of this had bugs. First, the strobe table was at a
 separate address [`4090H`], needing two POKE loops — fixed by putting it
@@ -47,13 +55,14 @@ page-high-byte, everywhere it's used as part of an address rather than as
 an instruction opcode.)
 
 Run it (`RUN`), then press keys one at a time. Each press prints two
-numbers: **column index (0-7, matching PA0-PA7)** and **row index (0-7,
-matching IN0-IN7)**. If no key is pressed during a pass it prints `255 255`.
+numbers: **a power of two (1,2,4,8,16,32,64,128, matching IN0-IN7
+respectively)**, then **column index (0-7, matching PA0-PA7)**. If no key
+is pressed during a pass it prints `0 0`.
 
 To stop: `BREAK`/`ON` should interrupt it (standard PC-1500 BASIC behavior),
 since `GOTO 10` loops forever otherwise.
 
-**If it never shows anything but `255 255` while a key is held**, the strobe
+**If it never shows anything but `0 0` while a key is held**, the strobe
 polarity assumption is backwards for this hardware. Fix: change the last 8
 values in line 8's `DATA` (currently `254,253,251,247,239,223,191,127`) to
 `1,2,4,8,16,32,64,128` (active-high strobe) — but try it as-is first;
@@ -63,12 +72,48 @@ of chip.
 Runs in a tight loop, so a held key prints repeatedly — that's expected,
 just move to the next key once you've noted one reading.
 
-## What it loads (annotated, for reference/verification)
+## What the running version loads (annotated, for reference/verification)
 
 Loaded at `4400H` (17408 decimal) — clear of the reserve area (`4000H`-
 `40C4H`) and of the BASIC program area starting at `40C5H`. Results land at
-`443BH`/`443CH` (17467/17468); the strobe table immediately follows the
-code at `4433H`.
+`4480H`/`4481H` (17536/17537); the strobe table immediately follows the
+code at `4428H`.
+
+```
+4400: B5 FF          LDI  A,0FFH
+4402: FD AE F0 0C    STA  #(0F00CH)     ; DDA = FFH  (PA0-7 all output)
+4406: 4A 00          LDI  XL,00H        ; XL = column counter
+4408: 58 44          LDI  YH,44H
+440A: 5A 28          LDI  YL,28H        ; Y = strobe table (4428H)
+440C: 55             LIN  Y             ; L1: A = strobe byte, Y++
+440D: FD AE F0 0E    STA  #(0F00EH)     ; OPA = A  (drive this column)
+4411: FD BA          ITA                ; A = IN0..7
+4413: B7 FF          CPI  A,0FFH
+4415: 89 09          BZR  +9            ; -> FOUND if A != FFH (key hit)
+4417: 40             INC  XL
+4418: 4E 08          CPI  XL,08H
+441A: 99 10          BZR  -10H          ; -> L1 if XL != 8 (keep scanning)
+441C: B5 FF          LDI  A,0FFH        ; no key found this pass
+441E: 4A FF          LDI  XL,0FFH
+4420: AE 44 81       STA  (4481H)       ; FOUND: save row byte
+4423: 04             LDA  XL
+4424: AE 44 80       STA  (4480H)       ; save column index
+4427: 9A             RTN
+
+4428: FE FD FB F7 EF DF BF 7F   ; strobe table: bit c=0, others=1, c=0..7
+```
+
+This is the version actually in use, confirmed working on real hardware
+(once `WAIT 0` was added at the BASIC level).
+
+## Alternate machine-code version (row index computed on-chip, unused)
+
+Documented for reference — not the version actually typed in, since it
+would have meant retyping the already-entered `DATA` lines for no benefit
+once the one-line `PRINT` fix above works just as well. Loaded at the same
+`4400H` base, but 11 bytes longer (adds a `ROR`-based bit-scan), so the
+table and result addresses shift: results at `443BH`/`443CH`
+(17467/17468), table at `4433H`.
 
 ```
 4400: B5 FF          LDI  A,0FFH
