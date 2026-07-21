@@ -38,6 +38,19 @@ forms access ME1 (see `lh5801_opcode_reference.md`). On the PC-1500:
 | `8000H`-`BFFFH` | CE-150/CE-153/CE-158 system program + I/O PC (only present if that peripheral is connected) |
 | `C000H`-`FFFFH` | PC-1500 system ROM (16KB, chip SC61328F) |
 
+**Gotcha, learned the hard way**: `4000H`-`47FFH` being "standard user RAM"
+at the chip-select level does *not* mean all of it is free scratch space.
+On a bare PC-1500 (no CE-151/CE-155/CE-159 module), the BASIC ROM firmware
+uses `4000H`-`40C4H` as its "reserve area" (section 5-3-6 of the manual) —
+a status marker, a pointer to the BASIC program, and the F1-F6
+key-reassignment table live there, and the actual BASIC program only
+starts at `40C5H`. Overwriting that range (e.g. with a hand-POKEd ML
+routine) doesn't fail the POKE — it's still plain RAM — but corrupts state
+the interpreter depends on. See `pc1500_keyscan_probe.md` for how this bit
+us in practice. Safe scratch space for small ML routines is somewhere
+comfortably above `40C5H` + whatever the current BASIC program/variables
+occupy.
+
 Chip-select is built from two decoders (TC40H139F, TC40H138F) gated by CPU
 signals `BFO`/`AD14`/`AD15` (top-level 16KB-region select `1Y0`-`1Y3`) and
 `AD11`-`AD13` with `ME0` (sub-region select `S0`-`S7` within the `4000H`-`7FFFH`
