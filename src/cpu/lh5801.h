@@ -69,6 +69,9 @@ class CPU {
 
   void setP(uint16_t p) { p_ = p; }
   void setS(uint16_t s) { s_ = s; }
+  void setX(uint16_t x) { x_ = x; }
+  void setY(uint16_t y) { y_ = y; }
+  void setU(uint16_t u) { u_ = u; }
 
   // Hardware-level ON-key press: sets BFI high, which (on real hardware)
   // supplies VCC via BFO. Independent of any CPU instruction; the OFF
