@@ -78,6 +78,23 @@ class CPU {
   // instruction is software's way to reset it back low.
   void pressOnKey() { bf_ = true; }
 
+  // External maskable interrupt pin (MI). Vector FFF8H, gated by IE.
+  void requestMI() { miPending_ = true; }
+  // Non-maskable interrupt pin (NMI). Vector FFFCH, always responds.
+  void requestNMI() { nmiPending_ = true; }
+
+  // Advances the internal 9-bit timer counter by one tick. Per the PC-2
+  // assembly language reference (Bruce Elliott, TRS-80 Microcomputer News,
+  // May 1983): the timer is a free-running 9-bit counter, and a timer
+  // interrupt (vector FFFAH, gated by IE) is requested when its content
+  // is 1FFH. The real tick rate comes from a divider off the crystal
+  // (documented there as crystal/128 for the PC-2's 4MHz crystal); the
+  // PC-1500 uses a 2.6MHz crystal and we don't have its exact divider
+  // depth confirmed, so callers should treat the rate as an approximation
+  // (see main.cpp) rather than a cycle-accurate figure.
+  void tickTimer();
+  uint16_t timerCounter() const { return timerCounter_; }
+
  private:
   MemoryBus& bus_;
 
@@ -93,6 +110,15 @@ class CPU {
   bool disp_ = false;  // LCD on/off control flip-flop (SDP/RDP)
   bool pu_ = false;    // general-purpose flip-flop PU (SPU/RPU)
   bool pv_ = false;    // general-purpose flip-flop PV (SPV/RPV)
+
+  // Interrupts. MI/NMI are external-pin requests latched until dispatched;
+  // the timer interrupt is generated internally by tickTimer(). All three
+  // wake the CPU from HLT; MI/timer additionally require IE=1.
+  bool miPending_ = false;
+  bool nmiPending_ = false;
+  bool timerInterruptPending_ = false;
+  uint16_t timerCounter_ = 0;
+  void dispatchInterrupt(uint16_t vectorAddr, int& cycles);
 
   // Register-select family used by ADC/SBC/CPA/LDA/STA/etc: 0=X, 1=Y, 2=U.
   uint16_t regR16(int rsel) const;

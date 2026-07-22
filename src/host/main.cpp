@@ -24,6 +24,11 @@ constexpr int kCyclesPerSecond = 1300000;
 constexpr int kFramesPerSecond = 60;
 constexpr int kCyclesPerFrame = kCyclesPerSecond / kFramesPerSecond;
 
+// Timer tick rate: approximated as machine-cycle/64, by analogy with the
+// PC-2's documented crystal/128 divider (see lh5801::CPU::tickTimer's
+// comment) -- not confirmed for the PC-1500's own divider depth.
+constexpr int kCyclesPerTimerTick = 64;
+
 // SDL keycode -> PC-1500 matrix key. Host physical key state maps directly
 // to PC-1500 physical key state (ignoring host shift/modifiers) since the
 // PC-1500's own Shift/Sml keys are themselves ordinary matrix keys --
@@ -128,6 +133,7 @@ int main(int argc, char** argv) {
   auto readByte = [&](uint16_t addr) { return bus.readME0(addr); };
 
   bool running = true;
+  int cyclesSinceTimerTick = 0;
   while (running) {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -149,13 +155,19 @@ int main(int argc, char** argv) {
       }
     }
 
-    if (!cpu.halted()) {
-      int cyclesRun = 0;
-      while (cyclesRun < kCyclesPerFrame) {
-        int c = cpu.step();
-        cyclesRun += (c > 0) ? c : 1;
-        if (cpu.halted()) break;
+    // step() checks for pending interrupts even while halted (and clears
+    // halted_ if one dispatches), so keep calling it either way rather
+    // than skipping entirely -- that's the only way HLT can ever resume.
+    int cyclesRun = 0;
+    while (cyclesRun < kCyclesPerFrame) {
+      int c = cpu.step();
+      cyclesRun += (c > 0) ? c : 1;
+      cyclesSinceTimerTick += (c > 0) ? c : 1;
+      while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+        cpu.tickTimer();
+        cyclesSinceTimerTick -= kCyclesPerTimerTick;
       }
+      if (cpu.halted()) break;
     }
 
     SDL_SetRenderDrawColor(renderer, 0xC8, 0xD8, 0xC0, 255);  // unlit LCD background

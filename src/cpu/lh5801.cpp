@@ -25,11 +25,40 @@ void CPU::reset() {
   flags_ = Flags();
   halted_ = false;
   bf_ = disp_ = pu_ = pv_ = false;
+  miPending_ = nmiPending_ = timerInterruptPending_ = false;
+  timerCounter_ = 0;
   // "The contents of the address FFFEH are transferred to the PH register
   // and the contents of FFFFH to the PL register." (manual 2-3-3 Reset)
   uint8_t hi = bus_.readME0(0xFFFE);
   uint8_t lo = bus_.readME0(0xFFFF);
   p_ = static_cast<uint16_t>((hi << 8) | lo);
+}
+
+void CPU::tickTimer() {
+  timerCounter_ = static_cast<uint16_t>((timerCounter_ + 1) & 0x1FF);
+  if (timerCounter_ == 0x1FF) timerInterruptPending_ = true;
+}
+
+// Entry sequence for MI/NMI/timer interrupts. Derived from RTI's documented
+// pop order -- (S+1)->PH, (S+2)->PL, (S+3)->T -- which, since pops happen in
+// the reverse order of pushes, means entry must push T first, then PL, then
+// PH last (so PH is popped first by RTI, matching its own listed order).
+void CPU::dispatchInterrupt(uint16_t vectorAddr, int& cycles) {
+  uint8_t t = packFlags();
+  uint8_t pl = static_cast<uint8_t>(p_ & 0xFF);
+  uint8_t ph = static_cast<uint8_t>(p_ >> 8);
+  push8(t);
+  push8(pl);
+  push8(ph);
+  flags_.ie = false;  // disable further interrupts until RTI restores T
+  uint8_t hi = bus_.readME0(vectorAddr);
+  uint8_t lo = bus_.readME0(static_cast<uint16_t>(vectorAddr + 1));
+  p_ = static_cast<uint16_t>((hi << 8) | lo);
+  halted_ = false;
+  // No documented cycle cost for interrupt acknowledgment; approximated as
+  // RTI's cycle count (14), since the work done (3 pushes + vector fetch)
+  // is symmetric with RTI's 3 pops + resume.
+  cycles = 14;
 }
 
 uint16_t CPU::regR16(int rsel) const {
@@ -129,8 +158,25 @@ void CPU::unpackFlags(uint8_t v) {
 }
 
 int CPU::step() {
-  if (halted_) return 0;
+  // NMI always responds; MI and the timer interrupt require IE=1. All
+  // three wake the CPU from HLT (dispatchInterrupt clears halted_).
   int cycles = 0;
+  if (nmiPending_) {
+    nmiPending_ = false;
+    dispatchInterrupt(0xFFFC, cycles);
+    return cycles;
+  }
+  if (flags_.ie && miPending_) {
+    miPending_ = false;
+    dispatchInterrupt(0xFFF8, cycles);
+    return cycles;
+  }
+  if (flags_.ie && timerInterruptPending_) {
+    timerInterruptPending_ = false;
+    dispatchInterrupt(0xFFFA, cycles);
+    return cycles;
+  }
+  if (halted_) return 0;
   uint8_t opcode = fetch8();
   if (opcode == 0xFD) {
     uint8_t sub = fetch8();
@@ -589,10 +635,12 @@ void CPU::execFD(uint8_t opcode, int& cycles) {
     case 0xEC: unpackFlags(a_); cycles = 9; break;
     case 0xAA: { a_ = packFlags(); flags_.z = (a_ == 0); cycles = 9; break; }
 
-    // ---- AM0 / AM1 / ATP: timer/output-port hardware not modeled yet ----
-    case 0xCE: cycles = 9; break;  // AM0
-    case 0xDE: cycles = 9; break;  // AM1
-    case 0xCC: cycles = 9; break;  // ATP
+    // ---- AM0 / AM1: load the 9-bit timer counter from A ----
+    case 0xCE: timerCounter_ = static_cast<uint16_t>(a_); cycles = 9; break;        // AM0: MSB=0
+    case 0xDE: timerCounter_ = static_cast<uint16_t>(a_ | 0x100); cycles = 9; break; // AM1: MSB=1
+
+    // ---- ATP: output port hardware not modeled yet ----
+    case 0xCC: cycles = 9; break;
 
     // ---- CDV: divider reset, no CPU-visible effect modeled ----
     case 0x8E: cycles = 8; break;
