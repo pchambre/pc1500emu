@@ -25,6 +25,11 @@ class IoPortController {
   // column strobe sees.
   uint8_t opaOutput() const;
 
+  // PB7 is hardwired as the ON-key input regardless of DDB (see
+  // docs/pc1500_hardware_reference.md) -- live level, not a latch, so it
+  // tracks the physical key state directly.
+  void setOnKeyLine(bool pressed) { onKeyLine_ = pressed; }
+
  private:
   uint8_t dda_ = 0;
   uint8_t ddb_ = 0;
@@ -35,6 +40,7 @@ class IoPortController {
   uint8_t g_ = 0;
   uint8_t msk_ = 0;
   uint8_t if_ = 0;
+  bool onKeyLine_ = false;
 };
 
 // PC-1500 memory map (see docs/pc1500_hardware_reference.md). ME0 holds
@@ -64,9 +70,24 @@ class Bus : public lh5801::MemoryBus {
   static bool isRom(uint16_t addr) { return addr >= 0xC000; }
   static bool isUnmapped(uint16_t addr) {
     return (addr <= 0x3FFF) ||                    // option user memory (no module)
-           (addr >= 0x4800 && addr <= 0x67FF) ||   // option user memory
-           (addr >= 0x6800 && addr <= 0x75FF) ||   // unused / inhibited
+           (addr >= 0x4800 && addr <= 0x6FFF) ||   // module RAM (no module installed)
            (addr >= 0x8000 && addr <= 0xBFFF);     // CE-150/153/158 (not connected)
+  }
+  // 7C00H-7FFFH is a duplicate of 7800H-7BFFH (the 1K system RAM) -- a
+  // half-decoded chip-select block, confirmed directly on real hardware.
+  //
+  // The PC-2 memory map (TRS-80 Microcomputer News, March 1983, p.26)
+  // claims all of 7000H-75FFH duplicates 7600H-7BFFH, but real-hardware
+  // testing shows that's overstated: 7000H/7100H do mirror 7600H/7700H,
+  // but 7400H does NOT mirror 7A00H (they hold independently different
+  // values). The actual mirrored range is just 7000H-71FFH -> 7600H-77FFH
+  // (512 bytes, matching the display chip-select block); 7200H-75FFH is
+  // real, independent RAM. 4000H-47FFH (the 2K user RAM) is NOT mirrored
+  // into 4800H-4FFFH either.
+  static uint16_t effectiveAddr(uint16_t addr) {
+    if (addr >= 0x7000 && addr <= 0x71FF) return static_cast<uint16_t>(addr + 0x0600);
+    if (addr >= 0x7C00 && addr <= 0x7FFF) return static_cast<uint16_t>(addr - 0x0400);
+    return addr;
   }
 
   std::array<uint8_t, 65536> me0_{};

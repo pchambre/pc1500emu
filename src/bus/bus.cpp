@@ -12,7 +12,7 @@ uint8_t IoPortController::read(uint8_t reg) const {
     case 0x0C: return dda_;
     case 0x0D: return ddb_;
     case 0x0E: return opa_;
-    case 0x0F: return opb_;
+    case 0x0F: return static_cast<uint8_t>((opb_ & 0x7F) | (onKeyLine_ ? 0x80 : 0x00));
     default: return 0xFF;  // divider (0100)/serial (0101/0110): not modeled yet
   }
 }
@@ -42,25 +42,31 @@ uint8_t IoPortController::opaOutput() const {
 
 uint8_t Bus::readME0(uint16_t addr) {
   if (isUnmapped(addr)) return 0xFF;
-  return me0_[addr];
+  return me0_[effectiveAddr(addr)];
 }
 
 void Bus::writeME0(uint16_t addr, uint8_t value) {
   if (isUnmapped(addr) || isRom(addr)) return;
-  me0_[addr] = value;
+  me0_[effectiveAddr(addr)] = value;
 }
 
+namespace {
+// CS0/CS1/CS2 are tied to AD12/AD13/(fixed) -- AD14/AD15 aren't part of the
+// decode. Confirmed on real hardware: F00AH/F00BH and B00AH/B00BH read back
+// identical, live values (F000H=1111..., B000H=1011... -- they differ only
+// in bit 14). So the controller is selected whenever bits 12-13 are both
+// set, regardless of bits 14-15 (or bits 4-11, which are likewise unused --
+// only RS0-RS3, bits 0-3, select the register).
+bool IoControllerSelected(uint16_t addr) { return (addr & 0x3000) == 0x3000; }
+}  // namespace
+
 uint8_t Bus::readME1(uint16_t addr) {
-  if (addr >= 0xF000 && addr <= 0xF00F) {
-    return io_.read(static_cast<uint8_t>(addr & 0x0F));
-  }
-  return 0xFF;  // nothing else mapped in ME1 on a stock PC-1500
+  if (IoControllerSelected(addr)) return io_.read(static_cast<uint8_t>(addr & 0x0F));
+  return 0xFF;
 }
 
 void Bus::writeME1(uint16_t addr, uint8_t value) {
-  if (addr >= 0xF000 && addr <= 0xF00F) {
-    io_.write(static_cast<uint8_t>(addr & 0x0F), value);
-  }
+  if (IoControllerSelected(addr)) io_.write(static_cast<uint8_t>(addr & 0x0F), value);
 }
 
 uint8_t Bus::readInputPort() { return keyboard_.scan(io_.opaOutput()); }

@@ -27,14 +27,14 @@ forms access ME1 (see `lh5801_opcode_reference.md`). On the PC-1500:
 | Range | Contents |
 |---|---|
 | `0000H`-`3FFFH` | Option user memory (module unit RAM/ROM slot) |
-| `4000H`-`47FFH` | Standard user RAM (built-in, 2KB, chip HM6116) |
-| `4800H`-`67FFH` | Option user memory (module unit, further banks) |
-| `6800H`-`6FFFH` | Unused ("do not use" per manual) |
-| `7000H`-`75FFH` | Inhibited |
+| `4000H`-`47FFH` | Standard user RAM (built-in, 2KB, chip HM6116). NOT mirrored into `4800H`-`4FFFH` (confirmed real hardware). |
+| `4800H`-`6FFFH` | Option user memory (module unit, further banks) -- absent on a stock unit |
+| `7000H`-`71FFH` | Duplicate of `7600H`-`77FFH` (confirmed on real hardware -- see below) |
+| `7200H`-`75FFH` | Independent RAM, not mirrored (confirmed real hardware: `PEEK 7400H` != `PEEK 7A00H`). Purpose not identified; the PC-2 memory map (TRS-80 Microcomputer News, March 1983, p.26) calls all of `7000H`-`75FFH` "duplicate of `7600H`-`7BFFH`", but that's overstated -- only the first 512 bytes actually mirror. |
 | `7600H`-`76FFH` | Display buffer, chips 1 & 3 (see LCD section) |
 | `7700H`-`77FFH` | Display buffer, chips 2 & 4 |
 | `7800H`-`7BFFH` | System RAM (fixed variable area) |
-| `7C00H`-`7FFFH` | (within the same chip-select block as system RAM; exact use not detailed) |
+| `7C00H`-`7FFFH` | Duplicate of `7800H`-`7BFFH` (confirmed on real hardware) |
 | `8000H`-`BFFFH` | CE-150/CE-153/CE-158 system program + I/O PC (only present if that peripheral is connected) |
 | `C000H`-`FFFFH` | PC-1500 system ROM (16KB, chip SC61328F) |
 
@@ -116,7 +116,7 @@ ones — G, F, MSK/IF beyond basic IRQ, serial U/transmit):
 | PC0-PC5 | — | timer control |
 | PC6 | — | buzzer on/off control |
 | PC7 | — | not used |
-| CS0/CS1/CS2 | chip select | tied to AD12/AD13/(fixed), decode to F000H-F00FH in ME1 |
+| CS0/CS1/CS2 | chip select | tied to AD12/AD13/(fixed) -- confirmed on real hardware (`F00AH`/`F00BH` and `B00AH`/`B00BH` read back identical, live values) that AD14/AD15 aren't part of the decode: `F000H` and `B000H` agree on bits 12-13 (`0011...`) and differ only in bit 14, so the controller mirrors to *any* address with bits 12-13 both set, regardless of bits 4-15 elsewhere. `F000H-F00FH` is just the conventional address the ROM uses, not the only one that works. |
 | RS0-RS3 | register select | tied to AD0-AD3 (register map above) |
 | ME1 | — | tied high so this chip lives in ME1, not ME0 |
 
@@ -237,6 +237,17 @@ sharing this chip-select block. Column ordering (which half is visually
 left vs. right) is still an assumption — `7600H`-based half = columns
 0-77 (left), `7700H`-based half = columns 78-155 (right) — a natural,
 likely-but-unconfirmed convention, not verified against real hardware.
+
+**Fixed-segment status indicators** (not part of the dot matrix -- small
+text shown above the main display, confirmed by Paul): two bytes right
+after the 78-column dot-matrix data, one per chip-pair half.
+- `764EH`: bit0=Busy, bit1=Shift, bit2=Japanese (two katakana characters),
+  bit3=Small, bit4=III, bit5=II, bit6=I, bit7=Def
+- `764FH`: bit0=De, bit1=G, bit2=Rad (De+G together likely spell "Deg"),
+  bit3=unused, bit4=Reserve, bit5=Pro, bit6=Run, bit7=unused
+
+Not yet rendered by `Lcd`/`main.cpp` -- only the 156x7 dot matrix is drawn
+today.
 
 Still not researched: the SC882G's own command/addressing protocol (i.e.
 whether the CPU's plain memory writes to `7600H-77FFH` go straight to

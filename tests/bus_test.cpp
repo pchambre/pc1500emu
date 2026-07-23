@@ -23,10 +23,32 @@ void testUnmappedRegionsReadHighAndIgnoreWrites() {
   bus.writeME0(0x0000, 0x42);
   CHECK(bus.readME0(0x0000) == 0xFF);  // write ignored
 
-  // Inhibited/unused region.
-  CHECK(bus.readME0(0x7000) == 0xFF);
   // CE-150/153/158 region, not connected.
   CHECK(bus.readME0(0x9000) == 0xFF);
+}
+
+void testMirroredRegionsAliasRealRam() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  // 7C00H-7FFFH is a duplicate of 7800H-7BFFH (the 1K system RAM),
+  // confirmed directly on real hardware.
+  bus.writeME0(0x7C00, 0x33);
+  CHECK(bus.readME0(0x7800) == 0x33);
+  bus.writeME0(0x7FFF, 0x44);
+  CHECK(bus.readME0(0x7BFF) == 0x44);
+
+  // The PC-2 memory map (TRS-80 Microcomputer News, March 1983 p.26)
+  // claims all of 7000H-75FFH duplicates 7600H-7BFFH, but real-hardware
+  // testing shows that's overstated. Only 7000H-71FFH -> 7600H-77FFH (512
+  // bytes) actually mirrors; 7200H-75FFH is independent RAM.
+  bus.writeME0(0x7000, 0x11);
+  CHECK(bus.readME0(0x7600) == 0x11);
+  bus.writeME0(0x71FF, 0x22);
+  CHECK(bus.readME0(0x77FF) == 0x22);
+
+  bus.writeME0(0x7400, 0x33);
+  CHECK(bus.readME0(0x7400) == 0x33);
+  CHECK(bus.readME0(0x7A00) == 0x00);  // unaffected -- independent storage, not mirrored
 }
 
 void testRomIsReadOnly() {
@@ -63,25 +85,34 @@ void testIoPortControllerDdaGatesOpaReadback() {
   CHECK(io.read(0x0E) == 0xAB);  // raw register readback is unaffected by DDA
 }
 
-void testMe1OnlyMapsIoPortControllerRange() {
+void testMe1MirrorsIoPortControllerWhereAd12Ad13BothSet() {
+  // CS0/CS1/CS2 tied to AD12/AD13/(fixed) -- confirmed on real hardware
+  // that AD14/AD15 aren't decoded (F00AH/F00BH and B00AH/B00BH read back
+  // identical, live values: F000H and B000H agree on bits 12-13, differing
+  // only in bit 14). Addresses where bits 12-13 aren't both set stay
+  // genuinely unmapped.
   pc1500::Keyboard kb;
   pc1500::Bus bus(kb);
   bus.writeME1(0xF00C, 0xFF);  // DDA = all outputs
   bus.writeME1(0xF00E, 0x55);  // OPA = 0x55
   CHECK(bus.readME1(0xF00E) == 0x55);
-  CHECK(bus.readME1(0x1234) == 0xFF);  // nothing else mapped in ME1
-  bus.writeME1(0x1234, 0x00);          // write outside F000-F00F is a no-op
-  CHECK(bus.readME1(0x1234) == 0xFF);
+  CHECK(bus.readME1(0xB00E) == 0x55);  // same register, aliased address (bits 12-13 agree)
+  bus.writeME1(0xB00D, 0xAA);          // write DDB via a different aliased address
+  CHECK(bus.readME1(0xF00D) == 0xAA);  // visible through the "canonical" address too
+  CHECK(bus.readME1(0x1234) == 0xFF);  // bits 12-13 not both set -- genuinely unmapped
+  bus.writeME1(0x1234, 0x00);
+  CHECK(bus.readME1(0x1234) == 0xFF);  // write outside the decode is a no-op
 }
 
 }  // namespace
 
 int main() {
   testUnmappedRegionsReadHighAndIgnoreWrites();
+  testMirroredRegionsAliasRealRam();
   testRomIsReadOnly();
   testRamRegionsAreReadWrite();
   testIoPortControllerDdaGatesOpaReadback();
-  testMe1OnlyMapsIoPortControllerRange();
+  testMe1MirrorsIoPortControllerWhereAd12Ad13BothSet();
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

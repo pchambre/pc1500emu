@@ -36,17 +36,18 @@ one, the emulator runs with a zero-filled ROM area, which spins harmlessly
 rather than doing anything useful. Pass a real dump's path to load it at
 `C000H`.
 
-Keyboard mapping (host key -> PC-1500 key) is defined in `src/host/main.cpp`.
-Digits, letters, arrows, F1-F6, Enter, and Space map directly; a few
-PC-1500 keys without an obvious host equivalent use nearby substitutes
-(Tab->Mode, Backspace->Def, End->Off, Delete->Cl, Insert->Rcl,
+Keyboard mapping (host key -> PC-1500 key) is defined in `src/host/main.cpp`
+(`kKeyMap[]`). Digits, letters, arrows, F1-F6, Enter, and Space map
+directly; a few PC-1500 keys without an obvious host equivalent use nearby
+substitutes (Tab->Mode, Backspace->Def, End->Off, Delete->Cl, Insert->Rcl,
 PageUp/PageDown->the up/down rocker key). **F12 is the ON key** (it's wired
 directly to the CPU, not part of the keyboard matrix, so it's handled
-separately from every other key).
+separately from every other key). **F11 is a host-only RESET key**, mimicking
+the real machine's recessed ALL RESET pinhole switch (also not part of the
+matrix) — it re-runs `CPU::reset()` without otherwise touching RAM.
 
-Known limitation: `HLT` is one-way in this emulator — real hardware wakes
-from halt via interrupt, but interrupt delivery isn't implemented yet, so
-a halted program will not resume.
+Interrupt delivery (MI/NMI/timer) is implemented, so `HLT` resumes normally
+when one fires.
 
 ## Layout
 

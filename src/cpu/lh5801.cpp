@@ -333,17 +333,18 @@ void CPU::execPrimary(uint8_t opcode, int& cycles) {
     case 0x66: setRegR16(2, static_cast<uint16_t>(regR16(2) - 1)); cycles = 5; break;
 
     // ---- DRL / DRR (X only in primary form) ----
-    // Reconstructed from the manual's worked numeric examples rather than
-    // its (harder to parse unambiguously) prose description -- moderate
-    // confidence, not independently re-verified against the source images
-    // in this session. Worth a dedicated recheck before relying on these
-    // for anything BCD-display-critical.
+    // Cross-checked against forever1500.fr's (working, mature) PC-1500
+    // emulator: the accumulator is fully replaced by the OLD memory byte
+    // (both nibbles, not just one); the memory byte's nibbles rotate with
+    // the accumulator's OLD value filling the vacated slot. DRL: mem_high
+    // <- mem_low, mem_low <- acc_high (old). DRR is the mirror: mem_low <-
+    // mem_high, mem_high <- acc_low (old).
     case 0xD7: {
       uint16_t addr = regR16(0);
       uint8_t memOld = bus_.readME0(addr);
       uint8_t aOld = a_;
+      uint8_t memNew = static_cast<uint8_t>(((memOld & 0x0F) << 4) | ((aOld & 0xF0) >> 4));
       a_ = memOld;
-      uint8_t memNew = static_cast<uint8_t>(((memOld & 0x0F) << 4) | ((aOld >> 4) & 0x0F));
       bus_.writeME0(addr, memNew);
       cycles = 12;
       break;
@@ -351,8 +352,9 @@ void CPU::execPrimary(uint8_t opcode, int& cycles) {
     case 0xD3: {
       uint16_t addr = regR16(0);
       uint8_t memOld = bus_.readME0(addr);
+      uint8_t aOld = a_;
+      uint8_t memNew = static_cast<uint8_t>(((aOld & 0x0F) << 4) | ((memOld & 0xF0) >> 4));
       a_ = memOld;
-      uint8_t memNew = static_cast<uint8_t>(((memOld & 0x0F) << 4) | ((memOld >> 4) & 0x0F));
       bus_.writeME0(addr, memNew);
       cycles = 12;
       break;
@@ -462,26 +464,33 @@ void CPU::execPrimary(uint8_t opcode, int& cycles) {
     case 0x99: { uint8_t i = fetch8(); if (!flags_.z) { p_ = static_cast<uint16_t>(p_ - i); cycles = 11; } else { cycles = 8; } break; }
 
     // ---- VEJ: one-byte vector call, FF00+opcode ----
+    // FF00-FFFF is a table of 2-byte pointers (confirmed against a real ROM
+    // dump: FFF8-FFFF decode cleanly as four 16-bit addresses matching the
+    // MI/Timer/NMI/Reset vectors, not instructions), so the vector slot's
+    // *contents* is the jump target -- not the slot address itself.
     case 0xC0: case 0xC2: case 0xC4: case 0xC6: case 0xC8: case 0xCA: case 0xCC: case 0xCE:
     case 0xD0: case 0xD2: case 0xD4: case 0xD6: case 0xD8: case 0xDA: case 0xDC: case 0xDE:
     case 0xE0: case 0xE2: case 0xE4: case 0xE6: case 0xE8: case 0xEA: case 0xEC: case 0xEE:
     case 0xF0: case 0xF2: case 0xF4: case 0xF6: {
+      uint16_t vectorAddr = static_cast<uint16_t>(0xFF00 | opcode);
+      uint8_t hi = bus_.readME0(vectorAddr);
+      uint8_t lo = bus_.readME0(static_cast<uint16_t>(vectorAddr + 1));
       push16(p_);
-      p_ = static_cast<uint16_t>(0xFF00 | opcode);
+      p_ = static_cast<uint16_t>((hi << 8) | lo);
       flags_.z = false;
       cycles = 17;
       break;
     }
 
     // ---- VMJ / VCS / VCR / VHS / VHR / VZS / VZR / VVS ----
-    case 0xCD: { uint8_t i = fetch8(); push16(p_); p_ = static_cast<uint16_t>(0xFF00 | i); flags_.z = false; cycles = 20; break; }
-    case 0xC3: { uint8_t i = fetch8(); if (flags_.c) { push16(p_); p_ = static_cast<uint16_t>(0xFF00 | i); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
-    case 0xC1: { uint8_t i = fetch8(); if (!flags_.c) { push16(p_); p_ = static_cast<uint16_t>(0xFF00 | i); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
-    case 0xC7: { uint8_t i = fetch8(); if (flags_.h) { push16(p_); p_ = static_cast<uint16_t>(0xFF00 | i); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
-    case 0xC5: { uint8_t i = fetch8(); if (!flags_.h) { push16(p_); p_ = static_cast<uint16_t>(0xFF00 | i); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
-    case 0xCB: { uint8_t i = fetch8(); if (flags_.z) { push16(p_); p_ = static_cast<uint16_t>(0xFF00 | i); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
-    case 0xC9: { uint8_t i = fetch8(); if (!flags_.z) { push16(p_); p_ = static_cast<uint16_t>(0xFF00 | i); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
-    case 0xCF: { uint8_t i = fetch8(); if (flags_.v) { push16(p_); p_ = static_cast<uint16_t>(0xFF00 | i); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
+    case 0xCD: { uint8_t i = fetch8(); uint16_t va = static_cast<uint16_t>(0xFF00 | i); uint8_t hi = bus_.readME0(va); uint8_t lo = bus_.readME0(static_cast<uint16_t>(va + 1)); push16(p_); p_ = static_cast<uint16_t>((hi << 8) | lo); flags_.z = false; cycles = 20; break; }
+    case 0xC3: { uint8_t i = fetch8(); if (flags_.c) { uint16_t va = static_cast<uint16_t>(0xFF00 | i); uint8_t hi = bus_.readME0(va); uint8_t lo = bus_.readME0(static_cast<uint16_t>(va + 1)); push16(p_); p_ = static_cast<uint16_t>((hi << 8) | lo); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
+    case 0xC1: { uint8_t i = fetch8(); if (!flags_.c) { uint16_t va = static_cast<uint16_t>(0xFF00 | i); uint8_t hi = bus_.readME0(va); uint8_t lo = bus_.readME0(static_cast<uint16_t>(va + 1)); push16(p_); p_ = static_cast<uint16_t>((hi << 8) | lo); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
+    case 0xC7: { uint8_t i = fetch8(); if (flags_.h) { uint16_t va = static_cast<uint16_t>(0xFF00 | i); uint8_t hi = bus_.readME0(va); uint8_t lo = bus_.readME0(static_cast<uint16_t>(va + 1)); push16(p_); p_ = static_cast<uint16_t>((hi << 8) | lo); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
+    case 0xC5: { uint8_t i = fetch8(); if (!flags_.h) { uint16_t va = static_cast<uint16_t>(0xFF00 | i); uint8_t hi = bus_.readME0(va); uint8_t lo = bus_.readME0(static_cast<uint16_t>(va + 1)); push16(p_); p_ = static_cast<uint16_t>((hi << 8) | lo); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
+    case 0xCB: { uint8_t i = fetch8(); if (flags_.z) { uint16_t va = static_cast<uint16_t>(0xFF00 | i); uint8_t hi = bus_.readME0(va); uint8_t lo = bus_.readME0(static_cast<uint16_t>(va + 1)); push16(p_); p_ = static_cast<uint16_t>((hi << 8) | lo); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
+    case 0xC9: { uint8_t i = fetch8(); if (!flags_.z) { uint16_t va = static_cast<uint16_t>(0xFF00 | i); uint8_t hi = bus_.readME0(va); uint8_t lo = bus_.readME0(static_cast<uint16_t>(va + 1)); push16(p_); p_ = static_cast<uint16_t>((hi << 8) | lo); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
+    case 0xCF: { uint8_t i = fetch8(); if (flags_.v) { uint16_t va = static_cast<uint16_t>(0xFF00 | i); uint8_t hi = bus_.readME0(va); uint8_t lo = bus_.readME0(static_cast<uint16_t>(va + 1)); push16(p_); p_ = static_cast<uint16_t>((hi << 8) | lo); flags_.z = false; cycles = 21; } else { cycles = 8; } break; }
 
     default:
       // Undocumented/unused opcode byte. Real hardware behavior for these
@@ -566,9 +575,14 @@ void CPU::execFD(uint8_t opcode, int& cycles) {
     case 0xEF: { uint16_t addr = fetch16(); uint8_t i = fetch8(); uint8_t v = doAdd(bus_.readME1(addr), i, false); bus_.writeME1(addr, v); cycles = 23; break; }
 
     // ---- ADR ----
-    case 0xCA: { uint8_t newRl = doAdd(regRL(0), a_, false); setRegRL(0, newRl); if (flags_.c) setRegRH(0, static_cast<uint8_t>(regRH(0) + 1)); cycles = 11; break; }
-    case 0xDA: { uint8_t newRl = doAdd(regRL(1), a_, false); setRegRL(1, newRl); if (flags_.c) setRegRH(1, static_cast<uint8_t>(regRH(1) + 1)); cycles = 11; break; }
-    case 0xEA: { uint8_t newRl = doAdd(regRL(2), a_, false); setRegRL(2, newRl); if (flags_.c) setRegRH(2, static_cast<uint8_t>(regRH(2) + 1)); cycles = 11; break; }
+    // Documented as "no change in CVHZ" -- cross-checked against
+    // forever1500.fr's emulator, which explicitly saves/restores flags
+    // around the internal add. Our own doAdd() always sets flags_ as a
+    // side effect, so without this save/restore ADR was silently
+    // clobbering the caller's flags.
+    case 0xCA: { uint8_t savedFlags = packFlags(); uint8_t newRl = doAdd(regRL(0), a_, false); setRegRL(0, newRl); if (flags_.c) setRegRH(0, static_cast<uint8_t>(regRH(0) + 1)); unpackFlags(savedFlags); cycles = 11; break; }
+    case 0xDA: { uint8_t savedFlags = packFlags(); uint8_t newRl = doAdd(regRL(1), a_, false); setRegRL(1, newRl); if (flags_.c) setRegRH(1, static_cast<uint8_t>(regRH(1) + 1)); unpackFlags(savedFlags); cycles = 11; break; }
+    case 0xEA: { uint8_t savedFlags = packFlags(); uint8_t newRl = doAdd(regRL(2), a_, false); setRegRL(2, newRl); if (flags_.c) setRegRH(2, static_cast<uint8_t>(regRH(2) + 1)); unpackFlags(savedFlags); cycles = 11; break; }
 
     // ---- DCA / DCS #(R) ----
     case 0x8C: { uint8_t op = bus_.readME1(regR16(0)); a_ = static_cast<uint8_t>(a_ + 0x66); a_ = doAdd(a_, op, flags_.c); a_ = static_cast<uint8_t>(a_ + daForAdd(flags_.c, flags_.h)); cycles = 19; break; }
@@ -586,13 +600,13 @@ void CPU::execFD(uint8_t opcode, int& cycles) {
     case 0x52: setRegRH(1, doAdd(regRH(1), static_cast<uint8_t>(~1), true)); cycles = 9; break;
     case 0x62: setRegRH(2, doAdd(regRH(2), static_cast<uint8_t>(~1), true)); cycles = 9; break;
 
-    // ---- DRL / DRR #(X) ---- (see primary-form comment re: confidence)
+    // ---- DRL / DRR #(X) ---- (see primary-form comment re: semantics)
     case 0xD7: {
       uint16_t addr = regR16(0);
       uint8_t memOld = bus_.readME1(addr);
       uint8_t aOld = a_;
+      uint8_t memNew = static_cast<uint8_t>(((memOld & 0x0F) << 4) | ((aOld & 0xF0) >> 4));
       a_ = memOld;
-      uint8_t memNew = static_cast<uint8_t>(((memOld & 0x0F) << 4) | ((aOld >> 4) & 0x0F));
       bus_.writeME1(addr, memNew);
       cycles = 16;
       break;
@@ -600,8 +614,9 @@ void CPU::execFD(uint8_t opcode, int& cycles) {
     case 0xD3: {
       uint16_t addr = regR16(0);
       uint8_t memOld = bus_.readME1(addr);
+      uint8_t aOld = a_;
+      uint8_t memNew = static_cast<uint8_t>(((aOld & 0x0F) << 4) | ((memOld & 0xF0) >> 4));
       a_ = memOld;
-      uint8_t memNew = static_cast<uint8_t>(((memOld & 0x0F) << 4) | ((memOld >> 4) & 0x0F));
       bus_.writeME1(addr, memNew);
       cycles = 16;
       break;
