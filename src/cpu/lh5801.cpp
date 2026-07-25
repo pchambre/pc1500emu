@@ -158,22 +158,25 @@ void CPU::unpackFlags(uint8_t v) {
 }
 
 int CPU::step() {
-  // NMI always responds; MI and the timer interrupt require IE=1. All
-  // three wake the CPU from HLT (dispatchInterrupt clears halted_).
+  // Priority order per the technical reference manual's "2-3-4 CPU system
+  // sequence" flowchart: IR0 (NMI) is checked first and always responds;
+  // IR1 (timer) is checked next; IR2 (maskable/MI) last. Timer and MI both
+  // require IE=1. All three wake the CPU from HLT (dispatchInterrupt clears
+  // halted_).
   int cycles = 0;
   if (nmiPending_) {
     nmiPending_ = false;
     dispatchInterrupt(0xFFFC, cycles);
     return cycles;
   }
-  if (flags_.ie && miPending_) {
-    miPending_ = false;
-    dispatchInterrupt(0xFFF8, cycles);
-    return cycles;
-  }
   if (flags_.ie && timerInterruptPending_) {
     timerInterruptPending_ = false;
     dispatchInterrupt(0xFFFA, cycles);
+    return cycles;
+  }
+  if (flags_.ie && miPending_) {
+    miPending_ = false;
+    dispatchInterrupt(0xFFF8, cycles);
     return cycles;
   }
   if (halted_) return 0;
@@ -364,10 +367,52 @@ void CPU::execPrimary(uint8_t opcode, int& cycles) {
     case 0xF1: a_ = static_cast<uint8_t>(((a_ & 0x0F) << 4) | ((a_ >> 4) & 0x0F)); cycles = 6; break;
 
     // ---- Rotate / shift ----
-    case 0xDB: { bool oldC = flags_.c; bool newC = (a_ & 0x80) != 0; a_ = static_cast<uint8_t>((a_ << 1) | (oldC ? 1 : 0)); flags_.c = newC; flags_.z = (a_ == 0); cycles = 8; break; }
-    case 0xD1: { bool oldC = flags_.c; bool newC = (a_ & 0x01) != 0; a_ = static_cast<uint8_t>((a_ >> 1) | (oldC ? 0x80 : 0)); flags_.c = newC; flags_.z = (a_ == 0); cycles = 9; break; }
-    case 0xD9: { bool newC = (a_ & 0x80) != 0; a_ = static_cast<uint8_t>(a_ << 1); flags_.c = newC; flags_.z = (a_ == 0); cycles = 6; break; }
-    case 0xD5: { bool newC = (a_ & 0x01) != 0; a_ = static_cast<uint8_t>(a_ >> 1); flags_.c = newC; flags_.z = (a_ == 0); cycles = 9; break; }
+    // All four clear C/V/H (leaving IE alone) and recompute from the
+    // result, per the reference implementation -- confirmed missing
+    // here (H and V were simply never touched, left stale from whatever
+    // ran before) via a real bug: the PC-1500's MODE-key handler reads H
+    // right after a SHR to decide whether to force RUN or actually
+    // toggle to PRO, and a stuck H=1 made it force RUN every time.
+    case 0xDB: {  // ROL
+      bool oldBit7 = (a_ & 0x80) != 0, oldCarry = flags_.c;
+      a_ = static_cast<uint8_t>((a_ << 1) | (oldCarry ? 1 : 0));
+      flags_.c = oldBit7;
+      flags_.h = (a_ & 0x10) != 0;
+      flags_.v = (oldBit7 != ((a_ & 0x80) != 0));
+      flags_.z = (a_ == 0);
+      cycles = 8;
+      break;
+    }
+    case 0xD1: {  // ROR
+      bool oldBit0 = (a_ & 0x01) != 0, oldCarry = flags_.c;
+      a_ = static_cast<uint8_t>((a_ >> 1) | (oldCarry ? 0x80 : 0));
+      flags_.c = oldBit0;
+      flags_.h = (a_ & 0x08) != 0;
+      flags_.v = false;
+      flags_.z = (a_ == 0);
+      cycles = 9;
+      break;
+    }
+    case 0xD9: {  // SHL
+      bool oldBit7 = (a_ & 0x80) != 0;
+      a_ = static_cast<uint8_t>(a_ << 1);
+      flags_.c = oldBit7;
+      flags_.h = (a_ & 0x10) != 0;
+      flags_.v = (oldBit7 != ((a_ & 0x80) != 0));
+      flags_.z = (a_ == 0);
+      cycles = 6;
+      break;
+    }
+    case 0xD5: {  // SHR
+      bool oldBit0 = (a_ & 0x01) != 0;
+      a_ = static_cast<uint8_t>(a_ >> 1);
+      flags_.c = oldBit0;
+      flags_.h = (a_ & 0x08) != 0;
+      flags_.v = false;
+      flags_.z = (a_ == 0);
+      cycles = 9;
+      break;
+    }
 
     // ---- Flip-flops / CPU control ----
     case 0xE3: pu_ = false; cycles = 4; break;

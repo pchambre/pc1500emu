@@ -71,6 +71,76 @@ void Bus::writeME1(uint16_t addr, uint8_t value) {
 
 uint8_t Bus::readInputPort() { return keyboard_.scan(io_.opaOutput()); }
 
+namespace {
+bool isCursorKey(Key key) {
+  return key == Key::Left || key == Key::Right || key == Key::Up || key == Key::Down ||
+         key == Key::UpDownRocker;
+}
+}  // namespace
+
+void Bus::setKeyState(Key key, bool pressed) {
+  if (pressed) {
+    // A fresh press cancels any release we were about to apply for this
+    // same key (host OS key-repeat, or a very fast re-tap) -- it's back
+    // down, so there's nothing left to release.
+    for (auto it = pendingReleases_.begin(); it != pendingReleases_.end(); ++it) {
+      if (it->key == key) {
+        pendingReleases_.erase(it);
+        break;
+      }
+    }
+    keyboard_.setKeyState(key, true);
+    if (isCursorKey(key)) {
+      // Only reset the repeat timer on a genuinely new press -- host OS
+      // key-repeat re-sends "pressed" for a key that's already held, at a
+      // much faster rate than our ~200ms window, which would otherwise
+      // keep resetting the counter before it ever fires again.
+      if (!cursorKeyHeld_ || heldCursorKey_ != key) {
+        cursorRepeatCycles_ = 0;
+      }
+      cursorKeyHeld_ = true;
+      heldCursorKey_ = key;
+    }
+    return;
+  }
+
+  // Defer the actual release: the ROM only polls the keyboard once per
+  // timer-interrupt period (~25ms). A host keypress briefer than that
+  // (or one whose press and release both land in the same emulated cycle
+  // batch) could otherwise go all the way down and back up without any
+  // ROM scan ever seeing it. Holding it down a little longer than the
+  // host actually did guarantees at least one scan period sees it.
+  pendingReleases_.push_back({key, kMinimumHoldCycles});
+}
+
+void Bus::applyRelease(Key key) {
+  keyboard_.setKeyState(key, false);
+  if (isCursorKey(key)) {
+    if (key == heldCursorKey_) cursorKeyHeld_ = false;
+  } else if (!keyboard_.anyPressed()) {
+    writeME0(0x7B0E, static_cast<uint8_t>(readME0(0x7B0E) & 0xFE));
+  }
+}
+
+void Bus::advanceCycles(int cycles) {
+  if (cursorKeyHeld_) {
+    cursorRepeatCycles_ += cycles;
+    if (cursorRepeatCycles_ >= kCursorRepeatCycles) {
+      cursorRepeatCycles_ = 0;
+      writeME0(0x7B0E, static_cast<uint8_t>(readME0(0x7B0E) & 0xFE));
+    }
+  }
+  for (auto it = pendingReleases_.begin(); it != pendingReleases_.end();) {
+    it->cyclesRemaining -= cycles;
+    if (it->cyclesRemaining <= 0) {
+      applyRelease(it->key);
+      it = pendingReleases_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 void Bus::loadME0(uint16_t addr, const uint8_t* data, size_t size) {
   for (size_t i = 0; i < size; i++) {
     uint32_t target = static_cast<uint32_t>(addr) + i;

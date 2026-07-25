@@ -37,25 +37,30 @@ void testMirroredRegionsAliasRealRam() {
   bus.writeME0(0x7FFF, 0x44);
   CHECK(bus.readME0(0x7BFF) == 0x44);
 
-  // The PC-2 memory map (TRS-80 Microcomputer News, March 1983 p.26)
-  // claims all of 7000H-75FFH duplicates 7600H-7BFFH, but real-hardware
-  // testing shows that's overstated. Only 7000H-71FFH -> 7600H-77FFH (512
-  // bytes) actually mirrors; 7200H-75FFH is independent RAM.
+  // 7000H-77FFH is driven by a RAM chip smaller than its address window:
+  // bits 9/10 (0200H/0400H) aren't decoded, so every address aliases the
+  // one with those bits forced high (addr | 0600H). 7000H<->7600H,
+  // 7100H<->7700H, 7200H<->7600H, and 7400H<->7600H are each confirmed
+  // directly on real hardware.
   bus.writeME0(0x7000, 0x11);
   CHECK(bus.readME0(0x7600) == 0x11);
   bus.writeME0(0x71FF, 0x22);
   CHECK(bus.readME0(0x77FF) == 0x22);
-
   bus.writeME0(0x7400, 0x33);
-  CHECK(bus.readME0(0x7400) == 0x33);
-  CHECK(bus.readME0(0x7A00) == 0x00);  // unaffected -- independent storage, not mirrored
+  CHECK(bus.readME0(0x7600) == 0x33);
+  bus.writeME0(0x7200, 0x55);
+  CHECK(bus.readME0(0x7600) == 0x55);
+
+  bus.writeME0(0x7A00, 0x00);
+  bus.writeME0(0x7400, 0x77);
+  CHECK(bus.readME0(0x7A00) == 0x00);  // unaffected -- outside this chip-select block
 }
 
 void testRomIsReadOnly() {
   pc1500::Keyboard kb;
   pc1500::Bus bus(kb);
   bus.writeME0(0xC000, 0x99);
-  CHECK(bus.readME0(0xC000) == 0x00);  // write to ROM region ignored
+  CHECK(bus.readME0(0xC000) == 0xFF);  // write to ROM region ignored (0xFF is the unwritten default)
 
   uint8_t data[] = {0x11, 0x22, 0x33};
   bus.loadME0(0xC000, data, sizeof(data));

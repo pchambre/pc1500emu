@@ -35,6 +35,10 @@ class Keyboard {
   // with a currently-strobed (bit low) column.
   uint8_t scan(uint8_t driveLines) const;
 
+  // True if any matrix key is currently held, regardless of column strobe
+  // state -- used by Bus to detect the "nothing at all is pressed" moment.
+  bool anyPressed() const;
+
  private:
   static constexpr int kRows = 8;
   static constexpr int kCols = 8;

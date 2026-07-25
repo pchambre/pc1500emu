@@ -29,12 +29,11 @@ forms access ME1 (see `lh5801_opcode_reference.md`). On the PC-1500:
 | `0000H`-`3FFFH` | Option user memory (module unit RAM/ROM slot) |
 | `4000H`-`47FFH` | Standard user RAM (built-in, 2KB, chip HM6116). NOT mirrored into `4800H`-`4FFFH` (confirmed real hardware). |
 | `4800H`-`6FFFH` | Option user memory (module unit, further banks) -- absent on a stock unit |
-| `7000H`-`71FFH` | Duplicate of `7600H`-`77FFH` (confirmed on real hardware -- see below) |
-| `7200H`-`75FFH` | Independent RAM, not mirrored (confirmed real hardware: `PEEK 7400H` != `PEEK 7A00H`). Purpose not identified; the PC-2 memory map (TRS-80 Microcomputer News, March 1983, p.26) calls all of `7000H`-`75FFH` "duplicate of `7600H`-`7BFFH`", but that's overstated -- only the first 512 bytes actually mirror. |
+| `7000H`-`77FFH` | Aliases `7600H`-`77FFH` (`addr \| 0600H`). Per the manual's own chip-select schematic (4-2-3): the first decoder stage asserts S6 for this whole window from AD11/AD12/AD13 alone; a second stage then asserts V2 (display chips 1&3) when AD8=0 and DME0=1, or V3 (chips 2&4) when AD8=1 and DME0=1 -- neither depends on AD9/AD10 at all, so any address in the window with the right AD8 hits the same display-chip latch regardless of AD9/AD10. The manual's own summary diagram labels `7000H`-`75FFH` "INHIBITED" (i.e. not a documented/supported address), but the ROM's own boot-message renderer relies on exactly this aliasing (composing glyph columns at `7400H`+ to make them appear at `7600H`+). Confirmed directly on real hardware for `7000H`, `7100H`, `7200H`, and `7400H` each aliasing `7600H`, and that this does NOT extend to `7A00H`-`7BFFH` (outside this chip-select block; see below). |
 | `7600H`-`76FFH` | Display buffer, chips 1 & 3 (see LCD section) |
 | `7700H`-`77FFH` | Display buffer, chips 2 & 4 |
 | `7800H`-`7BFFH` | System RAM (fixed variable area) |
-| `7C00H`-`7FFFH` | Duplicate of `7800H`-`7BFFH` (confirmed on real hardware) |
+| `7C00H`-`7FFFH` | Duplicate of `7800H`-`7BFFH` (confirmed on real hardware). Per 4-2-3's schematic, chip-select S7 (system RAM, chip TC5514) is asserted for the whole `7800H`-`7FFFH` window from AD11/AD12/AD13 alone, same mechanism as the `7000H`-`77FFH` case above -- the actual RAM chip doesn't distinguish bit 10 within that window. |
 | `8000H`-`BFFFH` | CE-150/CE-153/CE-158 system program + I/O PC (only present if that peripheral is connected) |
 | `C000H`-`FFFFH` | PC-1500 system ROM (16KB, chip SC61328F) |
 
@@ -205,38 +204,44 @@ calculator-style digit pad.
   buffer lives directly in ME0 at `7600H`-`77FFH` (256 bytes per chip-pair,
   512 bytes total) — plain LH5801 store instructions (`STA`, etc.) write it,
   no port-controller register involved.
-- **Buffer format**: confirmed via the manual's "Graphic display" BASIC
-  system-subroutine documentation (entry `EDEFH`, labeled page 134) — each
-  byte written is one **column** of dots; bit 0 = topmost of the 7 visible
-  rows, bit 6 = bottommost (bit 7 unused, only 7 rows exist). This is
-  consistent with 156 columns × 7 rows = the panel's native resolution.
+- **Buffer format, fully confirmed via a systematic real-hardware
+  POKE/observe walkthrough** (isolating one bit at a time, clearing
+  between pokes): each of the four column-driver chips covers a
+  **39-column quarter** of the 156-column width -- chip1 = columns 0-38,
+  chip2 = 39-77, chip3 = 78-116, chip4 = 117-155. Chip1 and chip3 (which
+  share one chip-select per the 4-2-3 schematic, V2) split the 8-bit data
+  bus at `7600H`-`764DH`: chip1 = low nibble, chip3 = high nibble. Chip2
+  and chip4 (V3) do the same at `7700H`-`774DH`. Within either range,
+  a single column needs **two consecutive byte offsets**, not one: the
+  even offset's relevant nibble holds rows 0-3 (bit0=row0 ... bit3=row3),
+  the odd offset's relevant nibble holds rows 4-6 (bit0=row4 ... bit2=row6,
+  top bit of that nibble unused). So chip-local column N lives at
+  `base+2N` (rows 0-3) and `base+2N+1` (rows 4-6); 39 columns × 2 bytes =
+  78 bytes, exactly filling each range's first 78 bytes -- matching the
+  manual's own worked "display reverse" example (chapter 1; see
+  `lh5801_test.cpp`'s `testManualDisplayReverseExample`), which inverts
+  precisely those two 78-byte spans. (An earlier version of this doc
+  concluded from that same example that each byte was one full 7-dot
+  column with no nibble-splitting -- that was wrong; the example's 78-byte
+  span boundaries are consistent with *either* model, and only the direct
+  POKE walkthrough distinguished them. See `src/lcd/lcd.h`/`lcd.cpp` for
+  the resulting `columnBits()` implementation, and `tests/lcd_test.cpp`'s
+  `testConfirmedBitMapping` for the exact real-hardware observations this
+  is built from.)
   Character-cell display routines address the buffer via a **cursor
   pointer at `7875H`**, valid range `00H`-`98H` (per section 5-4-5) — i.e.
   cursor addressing covers a subset of the 156 raw columns, reflecting
   character-cell (not raw-pixel) addressing for text output; the graphic
-  subroutine writes raw columns directly.
+  subroutine (`EDEFH`, labeled page 134) writes one column's already-
+  assembled data at a time (per its worked example using values like
+  `2BH`/`5AH` that read directly as 7-bit row patterns) -- it's presumably
+  the ROM's internal helper that does the nibble/byte-pair split described
+  above before actually touching `7600H`-`774DH`.
 - Two more relevant fixed addresses from section 5-4-5: `7880H` is a
   "parameter FF" byte controlling how the built-in `program display`
   subroutine renders numeric/string/program data (not needed for low-level
   emulation, only if the emulator ever needs to interpret BASIC-level
   display calls rather than raw buffer writes).
-
-**Column-to-address mapping, resolved via the CPU test suite**: the
-earlier working assumption here was a packed-nibble scheme splitting each
-byte across two chips. That's now superseded — tracing the manual's own
-worked "display reverse" example (chapter 1, hand-assembled program;
-see `lh5801_test.cpp`'s `testManualDisplayReverseExample`) shows it
-operates on exactly two **78-byte** chunks, `7600H`-`764DH` and
-`7700H`-`774DH`. `78 × 2 = 156`, exactly the panel's column count. That's
-strong direct evidence for a much simpler model: **one byte = one full
-7-dot column**, no nibble-splitting, with only the first 78 bytes of each
-256-byte half (`7600H-764DH`, `7700H-774DH`) being real display columns —
-the remainder of each 256-byte range (`764EH-76FFH`, `774EH-77FFH`) is
-presumably repurposed as the "fixed variable area" the manual mentions
-sharing this chip-select block. Column ordering (which half is visually
-left vs. right) is still an assumption — `7600H`-based half = columns
-0-77 (left), `7700H`-based half = columns 78-155 (right) — a natural,
-likely-but-unconfirmed convention, not verified against real hardware.
 
 **Fixed-segment status indicators** (not part of the dot matrix -- small
 text shown above the main display, confirmed by Paul): two bytes right

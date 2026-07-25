@@ -35,6 +35,15 @@ void Keyboard::setKeyState(Key key, bool pressed) {
   }
 }
 
+bool Keyboard::anyPressed() const {
+  for (const auto& row : keys_) {
+    for (bool k : row) {
+      if (k) return true;
+    }
+  }
+  return false;
+}
+
 uint8_t Keyboard::scan(uint8_t driveLines) const {
   uint8_t result = 0xFF;
   for (int col = 0; col < kCols; col++) {
