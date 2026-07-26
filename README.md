@@ -131,7 +131,9 @@ Commands:
   Unmapped characters are skipped with a stderr warning — use `key` instead.
 - `key <name>` — a named key with no natural printable form: `enter`, `cl`,
   `mode`, `def`, `sml`, `rcl`, `shift`, `off`, `up`/`down`/`left`/`right`,
-  `f1`-`f6`, `space`.
+  `f1`-`f6`, `space`. Prefix with `shift+` (e.g. `key shift+mode`) to send
+  a genuine PC-1500 Shift-tap before it, same mechanism as typing a
+  host-Shift symbol.
 - `peek <addr>` / `poke <addr> <val>` — addresses and values in hex.
 - `dump <start> <end>` — hex bytes, 16 per line, address-prefixed.
 - `status` — CPU registers/flags and the fixed-segment indicator bits.

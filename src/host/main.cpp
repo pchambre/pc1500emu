@@ -258,6 +258,25 @@ constexpr SymbolMapping kSymbolMap[] = {
     // key -- see the comment where hasTarget is computed for why.
     {SDLK_INSERT, pc1500::Key::Right, true, pc1500::Key::Right},  // Insert -> Shift+Right
     {SDLK_DELETE, pc1500::Key::Left, true, pc1500::Key::Left},    // Delete -> Shift+Left
+    // F1-F6 and Mode: the ROM itself decides what a *plain* F-key press
+    // means (an unassigned reserve key shows "!" etc.; an assigned one
+    // runs/types whatever was registered in RESERVE mode; plain Mode
+    // toggles RUN/PRO) -- our job is only to always send the plain matrix
+    // key (via kKeyMap, unaffected by these entries: hasUnshiftedTarget is
+    // false, so an unshifted press here falls through exactly like before)
+    // and to genuinely engage PC-1500 Shift, via the same Shift-tap
+    // mechanism as the symbols above, when host Shift is actually held --
+    // e.g. Shift+F1 always types "!" regardless of F1's current RESERVE
+    // assignment, and Shift+Mode enters/exits RESERVE mode (confirmed by
+    // Paul; previously host Shift was silently ignored for these keys,
+    // so Shift+Mode could never reach RESERVE mode at all).
+    {SDLK_F1, pc1500::Key::F1, false, {}},
+    {SDLK_F2, pc1500::Key::F2, false, {}},
+    {SDLK_F3, pc1500::Key::F3, false, {}},
+    {SDLK_F4, pc1500::Key::F4, false, {}},
+    {SDLK_F5, pc1500::Key::F5, false, {}},
+    {SDLK_F6, pc1500::Key::F6, false, {}},
+    {SDLK_F8, pc1500::Key::Mode, false, {}},
 };
 // clang-format on
 
@@ -662,8 +681,21 @@ int main(int argc, char** argv) {
     } else if (cmd == "key") {
       std::string name;
       iss >> name;
+      // "shift+NAME" queues a genuine PC-1500 Shift-tap before NAME's tap,
+      // same mechanism kSymbolMap uses for e.g. Shift+F1 -- for testing
+      // host-Shift-combo behavior directly via the command interface.
+      bool withShift = false;
+      constexpr const char* kShiftPrefix = "shift+";
+      if (name.rfind(kShiftPrefix, 0) == 0) {
+        withShift = true;
+        name = name.substr(std::strlen(kShiftPrefix));
+      }
       pc1500::Key k;
       if (nameToKey(name, &k)) {
+        if (withShift) {
+          symbolActionQueue.push_back({pc1500::Key::Shift, true, kTapFrames});
+          symbolActionQueue.push_back({pc1500::Key::Shift, false, kIdleFrames});
+        }
         symbolActionQueue.push_back({k, true, kTapFrames});
         symbolActionQueue.push_back({k, false, kIdleFrames});
       } else {
