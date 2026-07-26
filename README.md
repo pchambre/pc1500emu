@@ -85,3 +85,7 @@ when one fires.
 - `src/host/` — host-side glue (windowing, input, main loop)
 - `tests/` — unit tests
 - `docs/` — technical reference notes (ISA, hardware) backing the implementation
+
+## License
+
+Licensed under the Apache License, Version 2.0 -- see `LICENSE`.
