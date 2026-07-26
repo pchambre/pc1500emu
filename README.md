@@ -99,8 +99,11 @@ native OS menu) sits above the display:
   options; 10K is the window's full physical span (`4800H`-`6FFFH`) --
   not a real period-correct module, but easy to emulate.
 - **Settings > Extension RAM (0000H)** — None (default) / 16K of emulated
-  module RAM at `0000H`-`3FFFH`. Not a real 1982-era option at all (nothing
-  plugged in there back then), but physically possible now.
+  module RAM at `0000H`-`3FFFH`.
+
+When "adding" RAM, it is necessary to reset the emulator (Ctrl+F12), then
+press CL and execute NEW0 to update the emulator to be aware of the
+additional memory.
 
 While a menu dialog has keyboard focus, keystrokes go to the dialog's text
 fields, not the emulated PC-1500 keyboard.
