@@ -71,7 +71,11 @@ constexpr const char* kThree = "III";
 constexpr const char* kAllIndicatorTexts[] = {
     kBusy, kShift, kKatakana, kSmall, kDeg, kRad, kGrad, kRun, kPro, kReserve, kDef, kOne, kTwo, kThree,
 };
-constexpr int kIndicatorSlotCount = 12;  // left-to-right positions on the real display
+// I/II/III are a tight cluster of program-level indicators on real
+// hardware (basically one space apart from each other -- confirmed by
+// Paul), not spread evenly across the bar like the other indicators, so
+// they're laid out separately from kIndicatorSlotCount below.
+constexpr int kIndicatorSlotCount = 9;  // left-to-right positions for the other indicators
 
 // Approximate: 2.6MHz crystal / 2 = 1.3MHz internal machine cycle (manual
 // section 4-2-1). Not cycle-accurate frame pacing, just a reasonable bring
@@ -742,6 +746,26 @@ int main(int argc, char** argv) {
       std::string error;
       bool ok = loadBinary(bus, static_cast<uint16_t>(addr), path.c_str(), &error);
       writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "call") {
+      long addr = 0;
+      iss >> std::hex >> addr;
+      cpu.setP(static_cast<uint16_t>(addr));
+    } else if (cmd == "run") {
+      long cycles = 0;
+      iss >> std::dec >> cycles;
+      long ticks = 0;
+      for (long i = 0; i < cycles;) {
+        int c = cpu.step();
+        int used = (c > 0) ? c : 1;
+        i += used;
+        cyclesSinceTimerTick += used;
+        bus.advanceCycles(used);
+        while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+          cpu.tickTimer();
+          cyclesSinceTimerTick -= kCyclesPerTimerTick;
+          ticks++;
+        }
+      }
     } else if (!cmd.empty()) {
       std::fprintf(stderr, "pc1500emu: unknown command '%s'\n", cmd.c_str());
     }
@@ -1181,7 +1205,7 @@ int main(int argc, char** argv) {
 
     // Fixed-segment status indicators (764EH/764FH) -- left to right:
     // BUSY, SHIFT, katakana, SMALL, DEG/RAD/GRAD, RUN, PRO, RESERVE, DEF,
-    // I, II, III.
+    // then I/II/III as a tight cluster (see kIndicatorSlotCount's comment).
     uint8_t ind1 = bus.readME0(0x764E);
     uint8_t ind2 = bus.readME0(0x764F);
     bool de = ind2 & 0x01, g = ind2 & 0x02, rad = ind2 & 0x04;
@@ -1199,11 +1223,8 @@ int main(int argc, char** argv) {
         (ind2 & 0x20) ? kPro : nullptr,        // Pro
         (ind2 & 0x10) ? kReserve : nullptr,    // Reserve
         (ind1 & 0x80) ? kDef : nullptr,        // Def
-        (ind1 & 0x40) ? kOne : nullptr,        // I
-        (ind1 & 0x20) ? kTwo : nullptr,        // II
-        (ind1 & 0x10) ? kThree : nullptr,      // III
     };
-    int slotWidth = kWindowW / kIndicatorSlotCount;
+    int slotWidth = kWindowW / (kIndicatorSlotCount + 1);  // +1 reserves the last slot for I/II/III
     for (int slot = 0; slot < kIndicatorSlotCount; slot++) {
       if (!slotText[slot]) continue;
       SDL_Texture* tex = indicatorTexture(slotText[slot]);
@@ -1213,6 +1234,29 @@ int main(int argc, char** argv) {
       SDL_Rect dst{slot * slotWidth + (slotWidth - texW) / 2,
                    kMenuBarHeight + (kIndicatorBarHeight - texH) / 2, texW, texH};
       SDL_RenderCopy(renderer, tex, nullptr, &dst);
+    }
+
+    // I/II/III: tight cluster, one space apart, centered in the last slot.
+    const char* romanTexts[3] = {(ind1 & 0x40) ? kOne : nullptr, (ind1 & 0x20) ? kTwo : nullptr,
+                                  (ind1 & 0x10) ? kThree : nullptr};
+    int spaceW = 0, spaceH = 0;
+    TTF_SizeUTF8(indicatorFont, " ", &spaceW, &spaceH);
+    int romanTotalW = 0;
+    for (const char* t : romanTexts) {
+      if (!t) continue;
+      int w, h;
+      SDL_QueryTexture(indicatorTexture(t), nullptr, nullptr, &w, &h);
+      romanTotalW += (romanTotalW > 0 ? spaceW : 0) + w;
+    }
+    int romanX = kIndicatorSlotCount * slotWidth + (slotWidth - romanTotalW) / 2;
+    for (const char* t : romanTexts) {
+      if (!t) continue;
+      SDL_Texture* tex = indicatorTexture(t);
+      int texW, texH;
+      SDL_QueryTexture(tex, nullptr, nullptr, &texW, &texH);
+      SDL_Rect dst{romanX, kMenuBarHeight + (kIndicatorBarHeight - texH) / 2, texW, texH};
+      SDL_RenderCopy(renderer, tex, nullptr, &dst);
+      romanX += texW + spaceW;
     }
 
     ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);

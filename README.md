@@ -139,6 +139,10 @@ Commands:
 - `savebasic <path>` / `loadbasic <path>` / `savebinary <addr> <len> <path>`
   / `loadbinary <addr> <path>` — the same functions the File menu's dialogs
   call, invokable directly without going through the GUI.
+- `call <addr>` — sets the CPU's `P` register directly (hex address).
+- `run <cycles>` — steps the CPU exactly `<cycles>` cycles synchronously
+  (decimal), independent of the normal ~60fps frame loop. Useful for
+  driving execution deterministically in a test script.
 
 `type`/`key` commands queue onto the same mechanism real typing uses, so
 scripted and live keyboard input interleave safely rather than racing.
