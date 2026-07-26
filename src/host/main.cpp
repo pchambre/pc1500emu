@@ -782,6 +782,19 @@ int main(int argc, char** argv) {
       long addr = 0;
       iss >> std::hex >> addr;
       cpu.setP(static_cast<uint16_t>(addr));
+    } else if (cmd == "presskey" || cmd == "releasekey") {
+      // Direct, synchronous bus.setKeyState -- bypasses the symbolActionQueue
+      // that type/key use (which only drains via the normal ~60fps frame
+      // loop), so a `trace`/`run` right after this actually captures the
+      // key's effect instead of racing an undrained queue.
+      std::string name;
+      iss >> name;
+      pc1500::Key k;
+      if (nameToKey(name, &k)) {
+        bus.setKeyState(k, cmd == "presskey");
+      } else {
+        std::fprintf(stderr, "pc1500emu: no mapping for name '%s'\n", name.c_str());
+      }
     } else if (cmd == "run") {
       long cycles = 0;
       iss >> std::dec >> cycles;
@@ -798,6 +811,31 @@ int main(int argc, char** argv) {
           ticks++;
         }
       }
+    } else if (cmd == "trace") {
+      long cycles = 0;
+      iss >> std::dec >> cycles;
+      std::ostringstream out;
+      long i = 0;
+      while (i < cycles) {
+        uint16_t pBefore = cpu.p();
+        uint8_t op = bus.readME0(pBefore);
+        int c = cpu.step();
+        int used = (c > 0) ? c : 1;
+        i += used;
+        cyclesSinceTimerTick += used;
+        bus.advanceCycles(used);
+        while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+          cpu.tickTimer();
+          cyclesSinceTimerTick -= kCyclesPerTimerTick;
+        }
+        out << std::hex << std::uppercase;
+        out.width(4); out.fill('0'); out << pBefore << " ";
+        out.width(2); out.fill('0'); out << static_cast<int>(op) << " A=";
+        out.width(2); out.fill('0'); out << static_cast<int>(cpu.a()) << " X=";
+        out.width(4); out.fill('0'); out << cpu.x() << " Y=";
+        out.width(4); out.fill('0'); out << cpu.y() << "\n";
+      }
+      writeResponse(out.str());
     } else if (!cmd.empty()) {
       std::fprintf(stderr, "pc1500emu: unknown command '%s'\n", cmd.c_str());
     }

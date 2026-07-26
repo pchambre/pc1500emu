@@ -95,6 +95,31 @@ edit-cursor-like pointer at `78A6H`/`78A7H`) but wasn't needed to make
 `LIST`/`RUN` work correctly -- only `7867H`/`7868H` was confirmed
 necessary and sufficient for that.
 
+**F1-F6 reserve-key assignment never committed -- root cause found and
+fixed (2026-07-26)**: reassigning a function key (SHIFT+MODE, select a
+key, type replacement text, ENTER) silently did nothing -- the new text
+never appeared, and re-entering RESERVE mode still showed the key as
+unassigned. Instruction-level tracing (the `trace` FIFO command) showed
+the assignment-lookup/append routine (`CEC6H`-`CECFH`: `ldi xl,56h` then
+a `lin x` / `cpa (7884h)` scan loop) never terminates within the
+documented 189-byte reserve area -- it's a linear scan for either a `00H`
+"end of assignments" byte or a match, and it just runs off past `40C4H`
+into whatever garbage follows, because **no ROM code path ever
+initializes `4008H`-`40C4H`** (confirmed by tracing straight through
+power-on, `CL`, and `NEW0` -- the whole area stayed at `pc1500emu`'s
+generic uninitialized-RAM fill value throughout). Real hardware always
+reads `0` there for an unassigned key (confirmed by Paul via `PEEK`), so
+that 189-byte structure must already be a valid, zeroed, `00H`-terminated
+list before the ROM ever touches it -- there is no real-hardware
+equivalent of a truly *uninitialized* reserve area for the ROM to cope
+with. Fixed in `Bus`'s constructor (`src/bus/bus.h`) by seeding exactly
+`4008H`-`40C4H` to `0x00` (leaving the rest of the generic `0xFF` fill
+alone, since that's still correct elsewhere -- see the `79FFH` note
+above). Verified end-to-end against the exact walkthrough this bug was
+reported with: `CL`/`NEW0` -> `F1` shows `!` -> assign `F1`=`PRINT` ->
+`F1` shows `PRINT`, `SHIFT+F1` still shows `!`, and re-entering RESERVE
+mode shows `F1:PRINT`.
+
 **Reserve-area leading address is configuration-dependent** (confirmed
 against real hardware): a bare 2K-RAM PC-1500 uses `4000H` (program at
 `40C5H`, as above), but a unit with extra RAM installed uses a different

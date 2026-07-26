@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -57,7 +58,21 @@ class Bus : public lh5801::MemoryBus {
   // PEEK immediately after ALL RESET + CL with fresh batteries -- no
   // code path anywhere in the ROM ever writes that address) relies on
   // this undocumented hardware behavior. See docs/pc1500_hardware_reference.md.
-  explicit Bus(Keyboard& keyboard) : keyboard_(keyboard) { me0_.fill(0xFF); }
+  //
+  // The F1-F6 reserve-key area (4008H-40C4H) is the one documented
+  // exception: no ROM code path ever initializes it either (confirmed via
+  // instruction tracing -- the assignment-lookup loop at CEC6h just scans
+  // past 40C4H into whatever garbage follows, since it never finds the
+  // 00H "end of assignments" terminator the manual requires), yet real
+  // hardware reads 0 there whenever no keys are assigned. That 189-byte
+  // structure must already be a valid (all-zero, i.e. "nothing assigned
+  // yet") 00H-terminated list before the ROM ever touches it -- there is
+  // no real-hardware state equivalent to our synthetic all-0xFF default
+  // for this specific range, so it's seeded to 0 explicitly here.
+  explicit Bus(Keyboard& keyboard) : keyboard_(keyboard) {
+    me0_.fill(0xFF);
+    std::fill(me0_.begin() + 0x4008, me0_.begin() + 0x40C5, 0x00);
+  }
 
   uint8_t readME0(uint16_t addr) override;
   void writeME0(uint16_t addr, uint8_t value) override;
