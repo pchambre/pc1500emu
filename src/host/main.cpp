@@ -1,11 +1,24 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 
+#include "imgui.h"
+#include "imgui_impl_sdl2.h"
+#include "imgui_impl_sdlrenderer2.h"
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <array>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <fstream>
+#include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -17,6 +30,8 @@
 namespace {
 
 constexpr int kScale = 6;         // pixels per dot
+// ImGui's default main menu bar height at default font size.
+constexpr int kMenuBarHeight = 19;
 constexpr int kMarginTop = 20;
 constexpr int kMarginBottom = 20;
 constexpr int kMarginLeft = 3 * kScale;
@@ -35,7 +50,7 @@ constexpr const char* kIndicatorFontPath = "/usr/share/fonts/opentype/noto/NotoS
 constexpr int kIndicatorFontFaceIndex = 0;
 
 constexpr int kWindowH =
-    pc1500::Lcd::kRows * kScale + kMarginTop + kMarginBottom + kIndicatorBarHeight;
+    pc1500::Lcd::kRows * kScale + kMarginTop + kMarginBottom + kIndicatorBarHeight + kMenuBarHeight;
 
 // The fixed set of strings the indicator row can ever show -- rendered
 // once into cached textures at startup rather than every frame.
@@ -242,6 +257,30 @@ constexpr SymbolMapping kSymbolMap[] = {
 };
 // clang-format on
 
+// "(" and ")" are each their own dedicated, unshifted physical key on real
+// PC-1500 hardware (IN6/PA3 and IN0/PA3 -- see docs/pc1500_hardware_reference.md's
+// key matrix), same as kKeyMap's other direct mappings -- unlike
+// kSymbolMap's entries above, sending them needs no PC-1500 Shift at all.
+// But on a QWERTY host they're naturally typed as Shift+9/Shift+0, and
+// SDLK_9/SDLK_0 are otherwise plain kKeyMap digit keys (Digit9/Digit0)
+// regardless of host Shift -- so without this, Shift+9/Shift+0 just typed
+// "9"/"0" instead of "("/")", with no way to reach the parens at all
+// (confirmed as a real gap by Paul: the *only* working path was the
+// unshifted `[`/`]` keys in kKeyMap below, which isn't how a QWERTY typist
+// would ever guess to type them). Handled as its own small dispatch step,
+// separate from kSymbolMap's PC-1500-Shift-tap-queue machinery, since
+// there's no PC-1500 Shift involved -- just an instant, direct keypress of
+// a different target key than kKeyMap's own unshifted entry for the same
+// host keycode.
+struct ShiftedDirectMapping {
+  SDL_Keycode keycode;
+  pc1500::Key shiftedTarget;
+};
+constexpr ShiftedDirectMapping kShiftedDirectMap[] = {
+    {SDLK_9, pc1500::Key::LeftParen},   // Shift+9 -> (
+    {SDLK_0, pc1500::Key::RightParen},  // Shift+0 -> )
+};
+
 // One step of a queued symbol-tap sequence (see kSymbolMap above): set a
 // PC-1500 key's state, then wait `framesToWait` real frames before the
 // next queued action runs. Processed one action at a time in the main
@@ -253,9 +292,229 @@ struct QueuedKeyAction {
   int framesToWait;
 };
 
+// ---- Scriptable command FIFO (/tmp/pc1500emu.cmd) ----
+//
+// Lets an external process (Claude, via Bash) drive a *running* emulator
+// session directly -- type text, press named keys, peek/poke memory, dump
+// the display -- instead of relaying everything through a human typing on
+// the actual keyboard and reporting results back by hand. Query commands
+// (peek/dump/status/display) write their result to a response file
+// (kResponsePath) for the caller to read back afterward.
+//
+// Deliberately simple/textual (one command per line) and POSIX-only (this
+// is a dev/debug tool, not a portability-sensitive feature).
+constexpr const char* kCommandFifoPath = "/tmp/pc1500emu.cmd";
+constexpr const char* kResponsePath = "/tmp/pc1500emu.response";
+
+// Maps a plain typed character to a direct PC-1500 keypress (letters,
+// digits, space) or a Shift-tap sequence (symbols that need PC-1500 Shift,
+// mirroring kSymbolMap's mechanism above) -- returns false if there's no
+// mapping at all, in which case the caller should use `key NAME` instead.
+bool charToTapActions(char c, std::deque<QueuedKeyAction>* out) {
+  pc1500::Key direct{};
+  bool hasDirect = true;
+  char upper = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c;
+  if (upper >= 'A' && upper <= 'Z') {
+    direct = static_cast<pc1500::Key>(static_cast<int>(pc1500::Key::A) + (upper - 'A'));
+  } else if (c >= '0' && c <= '9') {
+    direct = static_cast<pc1500::Key>(static_cast<int>(pc1500::Key::Digit0) + (c - '0'));
+  } else if (c == ' ') {
+    direct = pc1500::Key::Space;
+  } else if (c == '.') {
+    direct = pc1500::Key::Period;
+  } else if (c == '/') {
+    direct = pc1500::Key::Slash;
+  } else if (c == '+') {
+    direct = pc1500::Key::Plus;
+  } else if (c == '-') {
+    direct = pc1500::Key::Minus;
+  } else if (c == '=') {
+    direct = pc1500::Key::Equals;
+  } else {
+    hasDirect = false;
+  }
+  if (hasDirect) {
+    out->push_back({direct, true, kTapFrames});
+    out->push_back({direct, false, kIdleFrames});
+    return true;
+  }
+  // Symbols needing a PC-1500 Shift-tap sequence (see kSymbolMap above) --
+  // only the ones actually needed for BASIC program text so far.
+  pc1500::Key shiftedTarget{};
+  bool hasShifted = true;
+  if (c == '"') {
+    shiftedTarget = pc1500::Key::F2;
+  } else if (c == ':') {
+    shiftedTarget = pc1500::Key::Asterisk;
+  } else if (c == '<') {
+    shiftedTarget = pc1500::Key::LeftParen;
+  } else if (c == '>') {
+    shiftedTarget = pc1500::Key::RightParen;
+  } else {
+    hasShifted = false;
+  }
+  if (hasShifted) {
+    out->push_back({pc1500::Key::Shift, true, kTapFrames});
+    out->push_back({pc1500::Key::Shift, false, kIdleFrames});
+    out->push_back({shiftedTarget, true, kTapFrames});
+    out->push_back({shiftedTarget, false, kIdleFrames});
+    return true;
+  }
+  return false;
+}
+
+// Maps a `key NAME` command's name (case-insensitive) to a PC-1500 key for
+// a direct tap -- covers keys with no natural printable-character form
+// (Enter, Cl, Mode, ...) plus a few redundant-but-harmless aliases.
+bool nameToKey(std::string name, pc1500::Key* out) {
+  for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  static const std::pair<const char*, pc1500::Key> kNames[] = {
+      {"enter", pc1500::Key::Ent},   {"ent", pc1500::Key::Ent},
+      {"cl", pc1500::Key::Cl},       {"mode", pc1500::Key::Mode},
+      {"def", pc1500::Key::Def},     {"sml", pc1500::Key::Sml},
+      {"rcl", pc1500::Key::Rcl},     {"shift", pc1500::Key::Shift},
+      {"off", pc1500::Key::Off},     {"up", pc1500::Key::Up},
+      {"down", pc1500::Key::Down},   {"left", pc1500::Key::Left},
+      {"right", pc1500::Key::Right}, {"space", pc1500::Key::Space},
+      {"f1", pc1500::Key::F1},       {"f2", pc1500::Key::F2},
+      {"f3", pc1500::Key::F3},       {"f4", pc1500::Key::F4},
+      {"f5", pc1500::Key::F5},       {"f6", pc1500::Key::F6},
+  };
+  for (const auto& [n, k] : kNames) {
+    if (name == n) {
+      *out = k;
+      return true;
+    }
+  }
+  return false;
+}
+
 std::vector<uint8_t> readFile(const char* path) {
   std::ifstream f(path, std::ios::binary);
   return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+// ---- ML/binary load-save: CLOAD M / CSAVE M semantics (PC-1500 Technical
+// Reference Manual) -- a plain [addr, addr+len) byte range plus a filename,
+// no BASIC-state awareness at all (that's BASIC load/save's job, see
+// loadBasicProgram/saveBasicProgram below). The real CLOAD M/CSAVE M take
+// an explicit address (and, for CSAVE M, length) argument for exactly this
+// reason -- unlike a BASIC program, a hand-assembled ML routine has no
+// self-describing bounds the machine could infer on its own.
+bool loadBinary(pc1500::Bus& bus, uint16_t addr, const char* path, std::string* error) {
+  std::vector<uint8_t> data = readFile(path);
+  if (data.empty()) {
+    *error = "Could not read file (or file is empty).";
+    return false;
+  }
+  bus.loadME0(addr, data.data(), data.size());
+  return true;
+}
+
+bool saveBinary(pc1500::Bus& bus, uint16_t addr, uint32_t len, const char* path, std::string* error) {
+  if (len == 0) {
+    *error = "Length must be greater than 0.";
+    return false;
+  }
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    *error = "Could not open file for writing.";
+    return false;
+  }
+  for (uint32_t i = 0; i < len; i++) {
+    uint8_t b = bus.readME0(static_cast<uint16_t>(addr + i));
+    f.put(static_cast<char>(b));
+  }
+  return true;
+}
+
+// ---- BASIC load-save: CLOAD / CSAVE semantics (filename only, no offsets)
+// ----
+//
+// The BASIC program itself always starts at 40C5H on a bare PC-1500 (see
+// docs/pc1500_hardware_reference.md's reserve-area note) and is a sequence
+// of lines, each [2-byte line number][1-byte line size][line-size bytes of
+// tokenized code][0DH], terminated by a single FFH byte after the last
+// line (PC-1500 Technical Reference Manual section 5-3-5, "Structure of
+// program", confirmed against its own worked example). That FFH byte is
+// what CLOAD/CSAVE actually key off, *not* anything in the 4000H-40C4H
+// reserve area -- an earlier version of our own hardware-reference doc
+// assumed the reserve area held a live "pointer to the BASIC program",
+// but on closer reading (PC1500_Technical_reference_manual.pdf section
+// 5-3-6) that area is ROM/module bookkeeping and F1-F6 key-reassignment
+// shortcuts, unrelated to CLOAD/CSAVE bounds -- see the correction in
+// that doc.
+//
+// We walk the line structure (rather than just scanning for the first FFH
+// byte) so an FFH that happens to occur *inside* a line's own tokenized
+// content or a string literal can't be mistaken for the terminator -- each
+// line's own size field tells us exactly how many content bytes to skip.
+constexpr uint16_t kBasicProgramStart = 0x40C5;
+
+// Returns the address of the terminating FFH byte (i.e. one past the last
+// real program byte), or 0 if the structure runs off the end of the
+// addressable range without finding one (a corrupt/never-initialized
+// program area).
+uint32_t findBasicProgramEnd(pc1500::Bus& bus) {
+  uint32_t addr = kBasicProgramStart;
+  while (addr <= 0xFFFF) {
+    uint8_t hi = bus.readME0(static_cast<uint16_t>(addr));
+    if (hi == 0xFF) return addr;  // end-of-program marker
+    if (addr + 2 > 0xFFFF) break;
+    uint8_t lineSize = bus.readME0(static_cast<uint16_t>(addr + 2));
+    // lineSize already includes the trailing 0DH terminator byte (verified
+    // against the manual's own worked example: line "10 PRINT A"'s size
+    // byte is 04H, covering exactly F0 97 41 0D -- 3 content bytes plus
+    // the CR, not just the content).
+    addr += 3 + lineSize;  // line#(2) + size(1) + (content + CR)(lineSize)
+  }
+  return 0;
+}
+
+bool saveBasicProgram(pc1500::Bus& bus, const char* path, std::string* error) {
+  uint32_t endAddr = findBasicProgramEnd(bus);
+  if (endAddr == 0) {
+    *error = "Could not find end of BASIC program (corrupt program area?).";
+    return false;
+  }
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    *error = "Could not open file for writing.";
+    return false;
+  }
+  for (uint32_t a = kBasicProgramStart; a <= endAddr; a++) {
+    f.put(static_cast<char>(bus.readME0(static_cast<uint16_t>(a))));
+  }
+  return true;
+}
+
+// The ROM tracks the program's end address itself (not just the FFH byte
+// in-place) at this fixed system-RAM location -- big-endian, value = the
+// address of the FFH terminator itself (i.e. exactly what
+// findBasicProgramEnd() returns). Found empirically: LIST/RUN both showed
+// nothing for a program whose bytes were otherwise byte-for-byte correct
+// (verified via direct memory dump) until this pointer was also updated to
+// match -- writing raw program bytes into 40C5H+ alone isn't sufficient,
+// this cached pointer has to agree or the ROM still thinks the program
+// ends wherever it last did (e.g. right at 40C5H, if the program was
+// cleared just before loading).
+constexpr uint16_t kProgramEndPointerAddr = 0x7867;
+
+bool loadBasicProgram(pc1500::Bus& bus, const char* path, std::string* error) {
+  std::vector<uint8_t> data = readFile(path);
+  if (data.empty()) {
+    *error = "Could not read file (or file is empty).";
+    return false;
+  }
+  if (data.back() != 0xFF) {
+    *error = "File doesn't end with the BASIC end-of-program marker (FFH) -- not a saved BASIC program?";
+    return false;
+  }
+  bus.loadME0(kBasicProgramStart, data.data(), data.size());
+  uint32_t endAddr = kBasicProgramStart + data.size() - 1;
+  bus.writeME0(kProgramEndPointerAddr, static_cast<uint8_t>(endAddr >> 8));
+  bus.writeME0(kProgramEndPointerAddr + 1, static_cast<uint8_t>(endAddr & 0xFF));
+  return true;
 }
 
 }  // namespace
@@ -304,6 +563,14 @@ int main(int argc, char** argv) {
   SDL_Window* window = SDL_CreateWindow("pc1500emu", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                         kWindowW, kWindowH, SDL_WINDOW_SHOWN);
   SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+  Uint32 mainWindowID = SDL_GetWindowID(window);
+
+  IMGUI_CHECKVERSION();
+  ImGuiContext* mainImguiCtx = ImGui::CreateContext();
+  ImGuiIO& imguiIo = ImGui::GetIO();
+  imguiIo.IniFilename = nullptr;  // no persisted window-layout state -- menu bar only
+  ImGui_ImplSDL2_InitForSDLRenderer(window, renderer);
+  ImGui_ImplSDLRenderer2_Init(renderer);
 
   // Pre-render every indicator label once; each frame just picks which
   // (if any) cached texture to blit per slot, based on the live 764EH/
@@ -331,6 +598,17 @@ int main(int argc, char** argv) {
 
   auto readByte = [&](uint16_t addr) { return bus.readME0(addr); };
 
+  // See kCommandFifoPath's comment (near QueuedKeyAction) for the overall
+  // design. mkfifo() is a no-op (EEXIST) on repeated launches -- the FIFO
+  // just persists on disk between runs, same file every time.
+  mkfifo(kCommandFifoPath, 0666);
+  int cmdFifoFd = open(kCommandFifoPath, O_RDONLY | O_NONBLOCK);
+  if (cmdFifoFd < 0) {
+    std::fprintf(stderr, "pc1500emu: could not open command FIFO '%s': %s\n", kCommandFifoPath,
+                 strerror(errno));
+  }
+  std::string cmdBuf;
+
   bool running = true;
   int cyclesSinceTimerTick = 0;
   // Tracks which action F10/F12 actually triggered on press, so release
@@ -347,16 +625,216 @@ int main(int argc, char** argv) {
   // time) rather than being symbol-queued, so release matches whichever
   // actually happened even if Shift's state changed in between.
   std::array<bool, std::size(kSymbolMap)> engagedViaKeyMap{};
+  // Per kShiftedDirectMap entry: whether the *last* press of that host key
+  // used the shifted-direct target (so release matches even if Shift's
+  // state changed mid-hold) -- same pattern as engagedViaKeyMap/f10IsRocker.
+  std::array<bool, std::size(kShiftedDirectMap)> shiftedKeyActive{};
+
+  // Command FIFO dispatcher -- see kCommandFifoPath's comment. Parses one
+  // line at a time; `type`/`key` append to the same queue kSymbolMap's
+  // punctuation handling uses (so scripted and real typing interleave
+  // naturally instead of racing); `peek`/`dump`/`status`/`display` write
+  // their result to kResponsePath immediately (no queueing needed -- these
+  // don't touch the keyboard at all).
+  auto writeResponse = [&](const std::string& text) {
+    std::ofstream f(kResponsePath, std::ios::trunc);
+    f << text;
+  };
+  auto processCommand = [&](const std::string& line) {
+    std::istringstream iss(line);
+    std::string cmd;
+    iss >> cmd;
+    for (char& c : cmd) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (cmd == "type") {
+      std::string text;
+      std::getline(iss, text);
+      size_t start = text.find_first_not_of(' ');
+      if (start != std::string::npos) text = text.substr(start);
+      for (char c : text) {
+        if (!charToTapActions(c, &symbolActionQueue)) {
+          std::fprintf(stderr, "pc1500emu: 'type' has no mapping for char '%c' -- use 'key NAME'\n", c);
+        }
+      }
+    } else if (cmd == "key") {
+      std::string name;
+      iss >> name;
+      pc1500::Key k;
+      if (nameToKey(name, &k)) {
+        symbolActionQueue.push_back({k, true, kTapFrames});
+        symbolActionQueue.push_back({k, false, kIdleFrames});
+      } else {
+        std::fprintf(stderr, "pc1500emu: 'key' has no mapping for name '%s'\n", name.c_str());
+      }
+    } else if (cmd == "peek") {
+      long addr = 0;
+      iss >> std::hex >> addr;
+      writeResponse(std::to_string(bus.readME0(static_cast<uint16_t>(addr))));
+    } else if (cmd == "poke") {
+      long addr = 0, val = 0;
+      iss >> std::hex >> addr >> val;
+      bus.writeME0(static_cast<uint16_t>(addr), static_cast<uint8_t>(val));
+    } else if (cmd == "dump") {
+      long start = 0, end = 0;
+      iss >> std::hex >> start >> end;
+      std::ostringstream out;
+      for (long a = start; a <= end; a += 16) {
+        out << std::hex << std::uppercase;
+        out.width(4);
+        out.fill('0');
+        out << a << ": ";
+        for (long b = a; b < a + 16 && b <= end; b++) {
+          out.width(2);
+          out.fill('0');
+          out << static_cast<int>(bus.readME0(static_cast<uint16_t>(b))) << " ";
+        }
+        out << "\n";
+      }
+      writeResponse(out.str());
+    } else if (cmd == "status") {
+      std::ostringstream out;
+      out << std::hex << std::uppercase;
+      out << "P=" << cpu.p() << " A=" << static_cast<int>(cpu.a()) << " X=" << cpu.x()
+          << " Y=" << cpu.y() << " U=" << cpu.u() << " S=" << cpu.s() << "\n";
+      out << std::dec;
+      out << "halted=" << cpu.halted() << " bf=" << cpu.bf() << " disp=" << cpu.disp()
+          << " pu=" << cpu.pu() << " pv=" << cpu.pv() << "\n";
+      uint8_t ind1 = bus.readME0(0x764E), ind2 = bus.readME0(0x764F);
+      out << "ind1(764E)=" << std::hex << static_cast<int>(ind1) << " ind2(764F)="
+          << static_cast<int>(ind2) << std::dec
+          << " [busy=" << ((ind1 & 0x01) != 0) << " shift=" << ((ind1 & 0x02) != 0)
+          << " small=" << ((ind1 & 0x08) != 0) << " def=" << ((ind1 & 0x80) != 0)
+          << " run=" << ((ind2 & 0x40) != 0) << " pro=" << ((ind2 & 0x20) != 0)
+          << " reserve=" << ((ind2 & 0x10) != 0) << "]\n";
+      writeResponse(out.str());
+    } else if (cmd == "display") {
+      std::ostringstream out;
+      for (int row = 0; row < pc1500::Lcd::kRows; row++) {
+        for (int col = 0; col < pc1500::Lcd::kColumns; col++) {
+          out << (lcd.dot(col, row, cpu.disp(), readByte) ? '#' : '.');
+        }
+        out << "\n";
+      }
+      writeResponse(out.str());
+    } else if (cmd == "savebasic") {
+      std::string path;
+      iss >> path;
+      std::string error;
+      bool ok = saveBasicProgram(bus, path.c_str(), &error);
+      writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "loadbasic") {
+      std::string path;
+      iss >> path;
+      std::string error;
+      bool ok = loadBasicProgram(bus, path.c_str(), &error);
+      writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "savebinary") {
+      long addr = 0, len = 0;
+      std::string path;
+      iss >> std::hex >> addr >> len >> path;
+      std::string error;
+      bool ok = saveBinary(bus, static_cast<uint16_t>(addr), static_cast<uint32_t>(len),
+                            path.c_str(), &error);
+      writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "loadbinary") {
+      long addr = 0;
+      std::string path;
+      iss >> std::hex >> addr >> path;
+      std::string error;
+      bool ok = loadBinary(bus, static_cast<uint16_t>(addr), path.c_str(), &error);
+      writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (!cmd.empty()) {
+      std::fprintf(stderr, "pc1500emu: unknown command '%s'\n", cmd.c_str());
+    }
+  };
+
+  // File menu dialog state. The dialog form gets its own separate OS
+  // window (SDL_Window/SDL_Renderer/ImGuiContext), created on demand --
+  // the main emulator window is too small to comfortably fit it (Paul's
+  // report). Dear ImGui's SDL2 backend already self-filters events by the
+  // window it was bound to at init (see ImGui_ImplSDL2_GetViewportForWindowID
+  // in imgui_impl_sdl2.cpp), so routing every SDL event through *both*
+  // contexts' ImGui_ImplSDL2_ProcessEvent (switching ImGui::SetCurrentContext
+  // first) is safe -- whichever context wasn't bound to that event's window
+  // just ignores it.
+  enum class ActiveDialog { None, LoadBasic, SaveBasic, LoadBinary, SaveBinary };
+  ActiveDialog activeDialog = ActiveDialog::None;
+  char filenameBuf[512] = "";
+  char addrBuf[8] = "4600";
+  char lenBuf[8] = "100";
+  char callAddrBuf[8] = "4000";
+  bool callAddrTouched = false;  // stops callAddrBuf auto-tracking addrBuf once the user edits it directly
+  bool autoCallOnLoad = false;
+  std::string dialogError;
+  SDL_Window* dialogWindow = nullptr;
+  SDL_Renderer* dialogRenderer = nullptr;
+  ImGuiContext* dialogImguiCtx = nullptr;
+
+  auto closeDialogWindow = [&]() {
+    if (!dialogWindow) return;
+    ImGui::SetCurrentContext(dialogImguiCtx);
+    ImGui_ImplSDLRenderer2_Shutdown();
+    ImGui_ImplSDL2_Shutdown();
+    ImGui::DestroyContext(dialogImguiCtx);
+    ImGui::SetCurrentContext(mainImguiCtx);
+    SDL_DestroyRenderer(dialogRenderer);
+    SDL_DestroyWindow(dialogWindow);
+    dialogWindow = nullptr;
+    dialogRenderer = nullptr;
+    dialogImguiCtx = nullptr;
+  };
+  auto openDialogWindow = [&](const char* title) {
+    closeDialogWindow();  // in case a different dialog was already open
+    dialogWindow = SDL_CreateWindow(title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 440,
+                                     260, SDL_WINDOW_SHOWN);
+    dialogRenderer = SDL_CreateRenderer(dialogWindow, -1, SDL_RENDERER_ACCELERATED);
+    dialogImguiCtx = ImGui::CreateContext();
+    ImGui::SetCurrentContext(dialogImguiCtx);
+    ImGui::GetIO().IniFilename = nullptr;
+    ImGui_ImplSDL2_InitForSDLRenderer(dialogWindow, dialogRenderer);
+    ImGui_ImplSDLRenderer2_Init(dialogRenderer);
+    ImGui::SetCurrentContext(mainImguiCtx);
+  };
   // Temporary: logs every real key event with a precise timestamp, so a
   // captured typing sample can be replayed against the C++ core exactly
   // as typed (see /tmp/pc1500emu_keycapture.log).
   std::ofstream keyCaptureLog("/tmp/pc1500emu_keycapture.log", std::ios::app);
   auto captureStart = std::chrono::steady_clock::now();
   while (running) {
+    if (cmdFifoFd >= 0) {
+      char buf[4096];
+      ssize_t n;
+      while ((n = read(cmdFifoFd, buf, sizeof(buf))) > 0) {
+        cmdBuf.append(buf, static_cast<size_t>(n));
+      }
+      size_t nl;
+      while ((nl = cmdBuf.find('\n')) != std::string::npos) {
+        std::string line = cmdBuf.substr(0, nl);
+        cmdBuf.erase(0, nl + 1);
+        processCommand(line);
+      }
+    }
+
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+      ImGui::SetCurrentContext(mainImguiCtx);
+      ImGui_ImplSDL2_ProcessEvent(&event);
+      if (dialogImguiCtx) {
+        ImGui::SetCurrentContext(dialogImguiCtx);
+        ImGui_ImplSDL2_ProcessEvent(&event);
+        ImGui::SetCurrentContext(mainImguiCtx);
+      }
       if (event.type == SDL_QUIT) {
         running = false;
+      } else if (dialogWindow && event.type == SDL_WINDOWEVENT &&
+                 event.window.windowID == SDL_GetWindowID(dialogWindow) &&
+                 event.window.event == SDL_WINDOWEVENT_CLOSE) {
+        activeDialog = ActiveDialog::None;
+        closeDialogWindow();
+      } else if ((event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) &&
+                 event.key.windowID != mainWindowID) {
+        // Belongs to the dialog window (or something else) -- its own
+        // ImGui context already processed it above; never feed it to the
+        // emulated keyboard regardless of focus/capture state.
       } else if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
         bool pressed = (event.type == SDL_KEYDOWN);
         SDL_Keycode kc = event.key.keysym.sym;
@@ -389,6 +867,33 @@ int main(int argc, char** argv) {
           if (pressed) f10IsRocker = shiftHeld;
           bus.setKeyState(f10IsRocker ? pc1500::Key::UpDownRocker : pc1500::Key::Sml, pressed);
         } else {
+          bool handledByShiftedDirectMap = false;
+          for (size_t i = 0; i < std::size(kShiftedDirectMap); i++) {
+            const ShiftedDirectMapping& sdm = kShiftedDirectMap[i];
+            if (sdm.keycode != kc) continue;
+            if (pressed) {
+              if (event.key.repeat) {
+                handledByShiftedDirectMap = shiftedKeyActive[i];
+                break;
+              }
+              if (shiftHeld) {
+                bus.setKeyState(sdm.shiftedTarget, true);
+                shiftedKeyActive[i] = true;
+                handledByShiftedDirectMap = true;
+              } else {
+                shiftedKeyActive[i] = false;  // falls through to kKeyMap below
+              }
+            } else if (shiftedKeyActive[i]) {
+              bus.setKeyState(sdm.shiftedTarget, false);
+              shiftedKeyActive[i] = false;
+              handledByShiftedDirectMap = true;
+            }
+            break;
+          }
+          if (handledByShiftedDirectMap) {
+            // Handled above -- skip kSymbolMap/kKeyMap entirely for this
+            // event.
+          } else {
           bool handledBySymbolMap = false;
           for (size_t i = 0; i < std::size(kSymbolMap); i++) {
             const SymbolMapping& sm = kSymbolMap[i];
@@ -454,7 +959,178 @@ int main(int argc, char** argv) {
               }
             }
           }
+          }
         }
+      }
+    }
+
+    ImGui_ImplSDLRenderer2_NewFrame();
+    ImGui_ImplSDL2_NewFrame();
+    ImGui::NewFrame();
+
+    if (ImGui::BeginMainMenuBar()) {
+      if (ImGui::BeginMenu("File")) {
+        auto startDialog = [&](ActiveDialog which, const char* title) {
+          activeDialog = which;
+          filenameBuf[0] = '\0';
+          dialogError.clear();
+          callAddrTouched = false;
+          std::strncpy(callAddrBuf, addrBuf, sizeof(callAddrBuf));
+          openDialogWindow(title);
+        };
+        if (ImGui::MenuItem("Load BASIC...")) startDialog(ActiveDialog::LoadBasic, "Load BASIC");
+        if (ImGui::MenuItem("Save BASIC...")) startDialog(ActiveDialog::SaveBasic, "Save BASIC");
+        ImGui::Separator();
+        if (ImGui::MenuItem("Load Binary...")) startDialog(ActiveDialog::LoadBinary, "Load Binary");
+        if (ImGui::MenuItem("Save Binary...")) startDialog(ActiveDialog::SaveBinary, "Save Binary");
+        ImGui::EndMenu();
+      }
+      if (ImGui::BeginMenu("Settings")) {
+        if (ImGui::BeginMenu("Extension RAM (4800H)")) {
+          size_t cur = bus.extRam4800Size();
+          // Real 1982 hardware options were 4K/8K; 10K (the window's full
+          // physical span) wasn't a real period-correct module, but is
+          // easy to emulate and physically possible with modern RAM.
+          if (ImGui::MenuItem("None", nullptr, cur == 0)) bus.setExtRam4800Size(0);
+          if (ImGui::MenuItem("4K", nullptr, cur == 0x1000)) bus.setExtRam4800Size(0x1000);
+          if (ImGui::MenuItem("8K", nullptr, cur == 0x2000)) bus.setExtRam4800Size(0x2000);
+          if (ImGui::MenuItem("10K (full window)", nullptr,
+                               cur == pc1500::Bus::kExtRam4800WindowSize)) {
+            bus.setExtRam4800Size(pc1500::Bus::kExtRam4800WindowSize);
+          }
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Extension RAM (0000H)")) {
+          size_t cur = bus.extRam0000Size();
+          // Not a real 1982-era option at all (nothing plugged in there
+          // back then), but physically possible now.
+          if (ImGui::MenuItem("None", nullptr, cur == 0)) bus.setExtRam0000Size(0);
+          if (ImGui::MenuItem("16K (full window)", nullptr,
+                               cur == pc1500::Bus::kExtRam0000WindowSize)) {
+            bus.setExtRam0000Size(pc1500::Bus::kExtRam0000WindowSize);
+          }
+          ImGui::EndMenu();
+        }
+        ImGui::EndMenu();
+      }
+      ImGui::EndMainMenuBar();
+    }
+
+    ImGui::Render();
+
+    // The dialog form renders in its own OS window/context (see
+    // openDialogWindow's comment) -- a fully separate NewFrame/Render/
+    // Present cycle, bound to dialogRenderer instead of the main window's
+    // renderer.
+    if (dialogWindow) {
+      ImGui::SetCurrentContext(dialogImguiCtx);
+      ImGui_ImplSDLRenderer2_NewFrame();
+      ImGui_ImplSDL2_NewFrame();
+      ImGui::NewFrame();
+
+      const char* actionLabel = "";
+      bool isBinary = false;
+      bool isLoad = false;
+      switch (activeDialog) {
+        case ActiveDialog::LoadBasic:
+          actionLabel = "Load";
+          isLoad = true;
+          break;
+        case ActiveDialog::SaveBasic:
+          actionLabel = "Save";
+          break;
+        case ActiveDialog::LoadBinary:
+          actionLabel = "Load";
+          isBinary = true;
+          isLoad = true;
+          break;
+        case ActiveDialog::SaveBinary:
+          actionLabel = "Save";
+          isBinary = true;
+          break;
+        case ActiveDialog::None:
+          break;
+      }
+      ImGuiIO& dialogIo = ImGui::GetIO();
+      ImGui::SetNextWindowPos(ImVec2(0, 0));
+      ImGui::SetNextWindowSize(dialogIo.DisplaySize);
+      bool closeRequested = false;
+      if (ImGui::Begin("##dialog", nullptr,
+                        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse)) {
+        ImGui::InputText("Filename", filenameBuf, sizeof(filenameBuf));
+        if (isBinary) {
+          bool addrChanged = ImGui::InputText("Address (hex)", addrBuf, sizeof(addrBuf),
+                                               ImGuiInputTextFlags_CharsHexadecimal);
+          if (addrChanged && !callAddrTouched) {
+            std::strncpy(callAddrBuf, addrBuf, sizeof(callAddrBuf));
+          }
+          if (!isLoad) {
+            ImGui::InputText("Length (hex)", lenBuf, sizeof(lenBuf),
+                              ImGuiInputTextFlags_CharsHexadecimal);
+          } else {
+            ImGui::Checkbox("Call after load", &autoCallOnLoad);
+            if (autoCallOnLoad) {
+              // Defaults to the load address (kept in sync until the user
+              // edits this field directly -- see callAddrTouched), but can
+              // be set independently: e.g. load a relocatable blob at one
+              // address and jump into an entry point partway through it.
+              if (ImGui::InputText("Call address (hex)", callAddrBuf, sizeof(callAddrBuf),
+                                    ImGuiInputTextFlags_CharsHexadecimal)) {
+                callAddrTouched = true;
+              }
+            }
+          }
+        }
+        if (!dialogError.empty()) {
+          ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", dialogError.c_str());
+        }
+        bool doAction = ImGui::Button(actionLabel);
+        ImGui::SameLine();
+        bool doCancel = ImGui::Button("Cancel");
+        if (doAction) {
+          bool ok = false;
+          switch (activeDialog) {
+            case ActiveDialog::LoadBinary: {
+              uint16_t addr = static_cast<uint16_t>(strtol(addrBuf, nullptr, 16));
+              ok = loadBinary(bus, addr, filenameBuf, &dialogError);
+              if (ok && autoCallOnLoad) {
+                uint16_t callAddr = static_cast<uint16_t>(strtol(callAddrBuf, nullptr, 16));
+                cpu.setP(callAddr);
+              }
+              break;
+            }
+            case ActiveDialog::SaveBinary: {
+              uint16_t addr = static_cast<uint16_t>(strtol(addrBuf, nullptr, 16));
+              uint32_t len = static_cast<uint32_t>(strtoul(lenBuf, nullptr, 16));
+              ok = saveBinary(bus, addr, len, filenameBuf, &dialogError);
+              break;
+            }
+            case ActiveDialog::LoadBasic:
+              ok = loadBasicProgram(bus, filenameBuf, &dialogError);
+              break;
+            case ActiveDialog::SaveBasic:
+              ok = saveBasicProgram(bus, filenameBuf, &dialogError);
+              break;
+            case ActiveDialog::None:
+              break;
+          }
+          if (ok) closeRequested = true;
+        }
+        if (doCancel) closeRequested = true;
+      }
+      ImGui::End();
+
+      ImGui::Render();
+      SDL_SetRenderDrawColor(dialogRenderer, 0x30, 0x30, 0x30, 255);
+      SDL_RenderClear(dialogRenderer);
+      ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), dialogRenderer);
+      SDL_RenderPresent(dialogRenderer);
+      ImGui::SetCurrentContext(mainImguiCtx);
+
+      if (closeRequested) {
+        activeDialog = ActiveDialog::None;
+        closeDialogWindow();
       }
     }
 
@@ -495,8 +1171,9 @@ int main(int argc, char** argv) {
     for (int col = 0; col < pc1500::Lcd::kColumns; col++) {
       for (int row = 0; row < pc1500::Lcd::kRows; row++) {
         if (lcd.dot(col, row, cpu.disp(), readByte)) {
-          SDL_Rect r{kMarginLeft + col * kScale, kIndicatorBarHeight + kMarginTop + row * kScale,
-                     kScale - 1, kScale - 1};
+          SDL_Rect r{kMarginLeft + col * kScale,
+                     kMenuBarHeight + kIndicatorBarHeight + kMarginTop + row * kScale, kScale - 1,
+                     kScale - 1};
           SDL_RenderFillRect(renderer, &r);
         }
       }
@@ -533,20 +1210,28 @@ int main(int argc, char** argv) {
       if (!tex) continue;
       int texW, texH;
       SDL_QueryTexture(tex, nullptr, nullptr, &texW, &texH);
-      SDL_Rect dst{slot * slotWidth + (slotWidth - texW) / 2, (kIndicatorBarHeight - texH) / 2,
-                   texW, texH};
+      SDL_Rect dst{slot * slotWidth + (slotWidth - texW) / 2,
+                   kMenuBarHeight + (kIndicatorBarHeight - texH) / 2, texW, texH};
       SDL_RenderCopy(renderer, tex, nullptr, &dst);
     }
+
+    ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
 
     SDL_RenderPresent(renderer);
 
     SDL_Delay(1000 / kFramesPerSecond);
   }
 
+  closeDialogWindow();
+  if (cmdFifoFd >= 0) close(cmdFifoFd);
+
   for (auto& [text, tex] : indicatorTextures) {
     (void)text;
     SDL_DestroyTexture(tex);
   }
+  ImGui_ImplSDLRenderer2_Shutdown();
+  ImGui_ImplSDL2_Shutdown();
+  ImGui::DestroyContext();
   TTF_CloseFont(indicatorFont);
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);

@@ -109,6 +109,58 @@ void testMe1MirrorsIoPortControllerWhereAd12Ad13BothSet() {
   CHECK(bus.readME1(0x1234) == 0xFF);  // write outside the decode is a no-op
 }
 
+void testExtensionRam4800WindowSizesGateMappedRange() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  // Off by default -- matches the no-module behavior every other test
+  // above already assumes.
+  CHECK(bus.extRam4800Size() == 0);
+  CHECK(bus.readME0(0x4800) == 0xFF);
+  bus.writeME0(0x4800, 0x42);
+  CHECK(bus.readME0(0x4800) == 0xFF);  // write ignored while disabled
+
+  // A partial (4K) module only maps the start of the window -- the rest
+  // stays unmapped, matching a physically smaller module not filling its
+  // whole socket.
+  bus.setExtRam4800Size(0x1000);
+  bus.writeME0(0x4800, 0x42);
+  CHECK(bus.readME0(0x4800) == 0x42);
+  bus.writeME0(0x57FF, 0x11);  // last byte of the 4K module (4800H + 1000H - 1)
+  CHECK(bus.readME0(0x57FF) == 0x11);
+  CHECK(bus.readME0(0x5800) == 0xFF);  // one past the 4K module -- still unmapped
+  bus.writeME0(0x5800, 0x99);
+  CHECK(bus.readME0(0x5800) == 0xFF);
+
+  // Growing to the full 10K window maps the rest too, without disturbing
+  // what was already there.
+  bus.setExtRam4800Size(pc1500::Bus::kExtRam4800WindowSize);
+  CHECK(bus.readME0(0x4800) == 0x42);  // preserved from the 4K-module write above
+  bus.writeME0(0x6FFF, 0x99);          // last byte of the full 10K window
+  CHECK(bus.readME0(0x6FFF) == 0x99);
+  CHECK(bus.readME0(0x7000) == 0xFF);  // one past the window -- untouched, still its own default
+
+  // Shrinking back to disabled doesn't clear the underlying bytes.
+  bus.setExtRam4800Size(0);
+  CHECK(bus.readME0(0x4800) == 0xFF);  // reads as unmapped again
+  bus.setExtRam4800Size(pc1500::Bus::kExtRam4800WindowSize);
+  CHECK(bus.readME0(0x4800) == 0x42);  // but the byte was preserved underneath
+}
+
+void testExtensionRam0000WindowSizeGatesMappedRange() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  CHECK(bus.extRam0000Size() == 0);
+  CHECK(bus.readME0(0x0000) == 0xFF);
+  bus.writeME0(0x0000, 0x77);
+  CHECK(bus.readME0(0x0000) == 0xFF);  // write ignored while disabled
+
+  bus.setExtRam0000Size(pc1500::Bus::kExtRam0000WindowSize);
+  bus.writeME0(0x0000, 0x77);
+  CHECK(bus.readME0(0x0000) == 0x77);
+  bus.writeME0(0x3FFF, 0x88);  // last byte of the 16K window
+  CHECK(bus.readME0(0x3FFF) == 0x88);
+}
+
 }  // namespace
 
 int main() {
@@ -118,6 +170,8 @@ int main() {
   testRamRegionsAreReadWrite();
   testIoPortControllerDdaGatesOpaReadback();
   testMe1MirrorsIoPortControllerWhereAd12Ad13BothSet();
+  testExtensionRam4800WindowSizesGateMappedRange();
+  testExtensionRam0000WindowSizeGatesMappedRange();
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

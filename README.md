@@ -18,7 +18,10 @@ compiler backend work begins.
 
 ## Building
 
-Requires SDL2 development packages (`libsdl2-dev` on Debian/Ubuntu).
+Requires SDL2 and SDL2_ttf development packages (`libsdl2-dev`,
+`libsdl2-ttf-dev` on Debian/Ubuntu). [Dear ImGui](https://github.com/ocornut/imgui)
+(the menu bar UI) is vendored directly in `third_party/imgui/` — nothing
+extra to install for that.
 
 ```sh
 cmake -B build
@@ -76,13 +79,75 @@ Shift+Right and Shift+Left.
 Interrupt delivery (MI/NMI/timer) is implemented, so `HLT` resumes normally
 when one fires.
 
+## Menu bar
+
+An in-window menu bar (Dear ImGui, rendered as an SDL2 overlay — not a
+native OS menu) sits above the display:
+
+- **File > Load/Save BASIC...** — a BASIC program (filename only). Finds
+  the program's bounds itself by walking the line structure from `40C5H`
+  to the `FFH` end marker (see `findBasicProgramEnd()` in `main.cpp` and
+  `docs/pc1500_hardware_reference.md`'s reserve-area note) — matches real
+  `CLOAD`/`CSAVE` (without `M`) semantics, no address/length needed.
+- **File > Load/Save Binary...** — a raw `[address, address+length)` ME0
+  byte range plus a filename, matching real `CLOAD M`/`CSAVE M` semantics.
+  Load has an optional "call after load" checkbox (sets the CPU's `P`
+  register to the loaded address, like a hand-triggered `CALL`). Useful
+  for loading `sdas`/SDCC-assembled output directly for testing.
+- **Settings > Extension RAM (4800H)** — None (default) / 4K / 8K / 10K of
+  emulated module RAM at `4800H`. 4K/8K were the real 1982-era hardware
+  options; 10K is the window's full physical span (`4800H`-`6FFFH`) --
+  not a real period-correct module, but easy to emulate.
+- **Settings > Extension RAM (0000H)** — None (default) / 16K of emulated
+  module RAM at `0000H`-`3FFFH`. Not a real 1982-era option at all (nothing
+  plugged in there back then), but physically possible now.
+
+While a menu dialog has keyboard focus, keystrokes go to the dialog's text
+fields, not the emulated PC-1500 keyboard.
+
+## Scriptable command interface
+
+A running instance also reads commands from a named pipe at
+`/tmp/pc1500emu.cmd`, one per line, letting an external process (or a
+script) drive it directly instead of relaying everything through the GUI
+by hand. Query commands write their result to `/tmp/pc1500emu.response`.
+
+```sh
+echo 'type 10 PRINT "HELLO"' > /tmp/pc1500emu.cmd
+echo 'key enter' > /tmp/pc1500emu.cmd
+echo 'display' > /tmp/pc1500emu.cmd; cat /tmp/pc1500emu.response   # ASCII-art dump of the LCD
+echo 'status' > /tmp/pc1500emu.cmd; cat /tmp/pc1500emu.response    # registers, flags, indicator bits
+echo 'peek 4000' > /tmp/pc1500emu.cmd; cat /tmp/pc1500emu.response
+echo 'poke 4000 ff' > /tmp/pc1500emu.cmd
+echo 'dump 4000 40ff' > /tmp/pc1500emu.cmd; cat /tmp/pc1500emu.response
+```
+
+Commands:
+- `type <text>` — queues each character as a keypress (letters, digits,
+  space, and a handful of symbols needing a PC-1500 Shift-tap: `" : < >`).
+  Unmapped characters are skipped with a stderr warning — use `key` instead.
+- `key <name>` — a named key with no natural printable form: `enter`, `cl`,
+  `mode`, `def`, `sml`, `rcl`, `shift`, `off`, `up`/`down`/`left`/`right`,
+  `f1`-`f6`, `space`.
+- `peek <addr>` / `poke <addr> <val>` — addresses and values in hex.
+- `dump <start> <end>` — hex bytes, 16 per line, address-prefixed.
+- `status` — CPU registers/flags and the fixed-segment indicator bits.
+- `display` — the 156x7 dot matrix as ASCII art (`#`/`.`).
+- `savebasic <path>` / `loadbasic <path>` / `savebinary <addr> <len> <path>`
+  / `loadbinary <addr> <path>` — the same functions the File menu's dialogs
+  call, invokable directly without going through the GUI.
+
+`type`/`key` commands queue onto the same mechanism real typing uses, so
+scripted and live keyboard input interleave safely rather than racing.
+
 ## Layout
 
 - `src/cpu/` — LH5801 CPU core
 - `src/bus/` — memory map, bus I/O dispatch
 - `src/keyboard/` — keyboard matrix emulation
 - `src/lcd/` — dot-matrix LCD controller emulation
-- `src/host/` — host-side glue (windowing, input, main loop)
+- `src/host/` — host-side glue (windowing, input, main loop, menu bar)
+- `third_party/imgui/` — vendored Dear ImGui (menu bar UI), MIT licensed
 - `tests/` — unit tests
 - `docs/` — technical reference notes (ISA, hardware) backing the implementation
 

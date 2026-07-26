@@ -9,6 +9,16 @@ section 5-4-5 "Display" (labeled pages 131-134 / PDF 135-138).
 Cassette interface is intentionally excluded (out of scope for this
 emulator) — pin/register facts that only pertain to cassette are omitted
 even where the manual documents them (e.g. CE-150's built-in cassette port).
+Cassette *system-subroutine entry points/RAM layout* (section 5-4-7) were
+still useful as a cross-check when debugging BASIC save/load's memory
+layout — see the program-end-pointer note below.
+
+Other primary sources on disk, also from Paul: `PC-2_Service_Manual.pdf`
+(easier to read than the Technical Reference Manual for some topics, e.g.
+the keyboard matrix) and `PC1500/CE-150.ROM` (a real CE-150 expansion ROM
+dump — cassette/printer commands live here, mapped at `A000H`-`BFFFH`,
+confirmed by its documented entry points, e.g. `BD3CH` "file transfer",
+only falling in range at that base).
 
 ## Memory model: ME0 and ME1
 
@@ -40,15 +50,60 @@ forms access ME1 (see `lh5801_opcode_reference.md`). On the PC-1500:
 **Gotcha, learned the hard way**: `4000H`-`47FFH` being "standard user RAM"
 at the chip-select level does *not* mean all of it is free scratch space.
 On a bare PC-1500 (no CE-151/CE-155/CE-159 module), the BASIC ROM firmware
-uses `4000H`-`40C4H` as its "reserve area" (section 5-3-6 of the manual) —
-a status marker, a pointer to the BASIC program, and the F1-F6
-key-reassignment table live there, and the actual BASIC program only
-starts at `40C5H`. Overwriting that range (e.g. with a hand-POKEd ML
-routine) doesn't fail the POKE — it's still plain RAM — but corrupts state
-the interpreter depends on. See `pc1500_keyscan_probe.md` for how this bit
-us in practice. Safe scratch space for small ML routines is somewhere
-comfortably above `40C5H` + whatever the current BASIC program/variables
-occupy.
+uses `4000H`-`40C4H` as its "reserve area" (section 5-3-6 of the manual),
+and the actual BASIC program only starts at `40C5H`. Overwriting that range
+(e.g. with a hand-POKEd ML routine) doesn't fail the POKE — it's still
+plain RAM — but corrupts state the interpreter depends on. See
+`pc1500_keyscan_probe.md` for how this bit us in practice. Safe scratch
+space for small ML routines is somewhere comfortably above `40C5H` +
+whatever the current BASIC program/variables occupy.
+
+**Correction (2026-07-26)**: an earlier version of this note described the
+reserve area as containing "a pointer to the BASIC program" — that's
+wrong. Per the manual's own section 5-3-6 tables, `4000H`-`4007H` is an
+8-byte "ROM status information" block (a `55H` signature byte, a plugged
+-in module ROM's own top address/size/confidentiality bookkeeping — not
+the live user program's bounds) and `4008H`-`40C4H` (189 bytes) holds the
+F1-F6 reserve-key reassignment shortcuts (each key's registered BASIC
+text, stored as a mix of ASCII characters and 2-byte tokenized command
+codes per the section 5-2 internal code chart, `00H`-terminated per key).
+Neither part is a "pointer to the BASIC program". CLOAD/CSAVE instead
+find the program's end by walking its own line structure (section 5-3-5:
+each line is `[2-byte line#][1-byte size][size bytes, which already
+*include* the trailing 0DH terminator -- confirmed against the manual's
+own worked example, "10 PRINT A" 's size byte is `04H` covering exactly
+`F0 97 41 0D`, not just the 3 content bytes]`) from `40C5H` until hitting
+the single `FFH` end-of-program marker byte that follows the last line —
+see `pc1500emu`'s own `findBasicProgramEnd()` in `src/host/main.cpp`,
+which does exactly this walk (not a naive "scan for
+the first `FF` byte", since one could legitimately appear inside a line's
+own tokenized content or a string literal).
+
+**Program-end pointer, found empirically (2026-07-26)**: the ROM does not
+rely solely on scanning for the `FFH` terminator at runtime -- it also
+caches the terminator's own address as a 2-byte big-endian pointer at
+**`7867H`/`7868H`** (system RAM), updated as a side effect of normal
+line-editing. Confirmed by direct experiment: writing a byte-for-byte
+correct tokenized program into `40C5H`+ (verified via memory dump) was
+*not* sufficient for `LIST`/`RUN` to recognize it -- both showed nothing
+until `7867H`/`7868H` was also poked to the terminator's address, at which
+point `LIST` immediately worked. `pc1500emu`'s `loadBasicProgram()`
+(`src/host/main.cpp`) writes this pointer after loading the raw bytes, for
+exactly this reason. Other transient editing state was also observed to
+differ (e.g. a raw-text redisplay/input-line buffer around `7A08H`, an
+edit-cursor-like pointer at `78A6H`/`78A7H`) but wasn't needed to make
+`LIST`/`RUN` work correctly -- only `7867H`/`7868H` was confirmed
+necessary and sufficient for that.
+
+**Reserve-area leading address is configuration-dependent** (confirmed
+against real hardware): a bare 2K-RAM PC-1500 uses `4000H` (program at
+`40C5H`, as above), but a unit with extra RAM installed uses a different
+base per the manual's own table (`4000H`/`3800H`/`2000H` depending on
+which module) -- shifting the program-start address correspondingly.
+`pc1500emu` currently only models the bare-2K case (`kBasicProgramStart`
+is a fixed `0x40C5` in `main.cpp`); this would need to become configurable
+(likely tied to the emulator's own extension-RAM settings) to correctly
+support BASIC save/load with extension RAM enabled.
 
 Chip-select is built from two decoders (TC40H139F, TC40H138F) gated by CPU
 signals `BFO`/`AD14`/`AD15` (top-level 16KB-region select `1Y0`-`1Y3`) and

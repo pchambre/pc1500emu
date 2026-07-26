@@ -73,6 +73,30 @@ class Bus : public lh5801::MemoryBus {
 
   IoPortController& ioPort() { return io_; }
 
+  // Emulated module RAM, two independent regions/windows -- see
+  // docs/pc1500_hardware_reference.md's memory map. Both off (size 0) by
+  // default, matching stock hardware with no module installed. Size is in
+  // bytes, backed starting at the window's low address; the rest of the
+  // window (if size is less than the window's full span) stays unmapped,
+  // matching a physically smaller module not filling its whole socket.
+  // Changing the size doesn't clear underlying bytes, so shrinking and
+  // growing back preserves whatever was there.
+  //
+  // 4800H-6FFFH window (2K module RAM slot, up to 10K span): real 1982
+  // hardware options were 4K or 8K here; 10K (the window's full physical
+  // span) wasn't a real period-correct module but is easy to emulate and
+  // physically possible with denser modern RAM.
+  static constexpr size_t kExtRam4800WindowSize = 0x2800;  // 10K
+  void setExtRam4800Size(size_t bytes) { extRam4800Size_ = bytes; }
+  size_t extRam4800Size() const { return extRam4800Size_; }
+
+  // 0000H-3FFFH window (option user memory slot, up to 16K span): not a
+  // real 1982-era option at all (nothing plugged in there back then), but
+  // physically possible now and worth emulating for headroom.
+  static constexpr size_t kExtRam0000WindowSize = 0x4000;  // 16K
+  void setExtRam0000Size(size_t bytes) { extRam0000Size_ = bytes; }
+  size_t extRam0000Size() const { return extRam0000Size_; }
+
   // Wraps Keyboard::setKeyState with two hardware-behavior fixes confirmed
   // on real PC-1500 hardware (extensive testing this session):
   //
@@ -117,10 +141,12 @@ class Bus : public lh5801::MemoryBus {
 
 
   static bool isRom(uint16_t addr) { return addr >= 0xC000; }
-  static bool isUnmapped(uint16_t addr) {
-    return (addr <= 0x3FFF) ||                    // option user memory (no module)
-           (addr >= 0x4800 && addr <= 0x6FFF) ||   // module RAM (no module installed)
-           (addr >= 0x8000 && addr <= 0xBFFF);     // CE-150/153/158 (not connected)
+  bool isUnmapped(uint16_t addr) const {
+    bool in0000Window = addr <= 0x3FFF;
+    bool in4800Window = addr >= 0x4800 && addr <= 0x6FFF;
+    return (in0000Window && addr >= extRam0000Size_) ||       // beyond configured 0000H module RAM
+           (in4800Window && (addr - 0x4800) >= extRam4800Size_) ||  // beyond configured 4800H module RAM
+           (addr >= 0x8000 && addr <= 0xBFFF);                // CE-150/153/158 (not connected)
   }
   // 7C00H-7FFFH is a duplicate of 7800H-7BFFH (the 1K system RAM) -- a
   // half-decoded chip-select block, confirmed directly on real hardware.
@@ -146,6 +172,8 @@ class Bus : public lh5801::MemoryBus {
   std::array<uint8_t, 65536> me0_{};
   IoPortController io_;
   Keyboard& keyboard_;
+  size_t extRam4800Size_ = 0;
+  size_t extRam0000Size_ = 0;
 
   // Cursor-key rollover state (see advanceCycles).
   bool cursorKeyHeld_ = false;
