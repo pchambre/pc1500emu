@@ -3,6 +3,8 @@
 A from-scratch emulator for the Sharp PC-1500 pocket computer, built around
 the Sharp/Sanyo LH5801 CPU.
 
+Author: Paul Chambre using Claude Code and CLion
+
 Scope for the initial version:
 - LH5801 CPU core (full instruction set)
 - PC-1500 memory map and bus I/O

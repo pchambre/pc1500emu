@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Paul Chambre. Licensed under the Apache License,
+// Version 2.0 -- see LICENSE.
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 
@@ -83,6 +85,36 @@ constexpr int kIndicatorSlotCount = 9;  // left-to-right positions for the other
 constexpr int kCyclesPerSecond = 1300000;
 constexpr int kFramesPerSecond = 60;
 constexpr int kCyclesPerFrame = kCyclesPerSecond / kFramesPerSecond;
+
+// Buzzer (BASIC BEEP): there's no tone/frequency register on real
+// hardware (see bus.h's IoPortController::buzzerOn() comment) -- the
+// audible pitch comes entirely from the ROM toggling OPC bit 6 in a
+// timed software loop, so emulating it correctly just means sampling
+// that bit's live level at audio rate and outputting it directly as a
+// square wave. Sampling is done cycle-accurately within each frame's
+// CPU-stepping loop (not from a separate SDL audio callback thread)
+// specifically to avoid the mismatch between real wall-clock audio
+// timing and this emulator's per-frame-batched CPU stepping: an audio
+// callback sampling asynchronously would only see whatever the buzzer
+// bit happened to be at the moment it ran, missing essentially all of
+// a frame's worth of toggling.
+//
+// How many samples a *given* frame contributes is a separate, dynamic
+// question decided at runtime from real elapsed wall-clock time (see
+// audioSampleAccumulator in main()) -- kMaxAudioSamplesPerFrame here is
+// only a safety cap (covers a ~200ms stall, e.g. a slow startup frame
+// or a breakpoint) sizing the per-frame scratch buffer, not the normal
+// per-frame sample count.
+constexpr int kAudioSampleRate = 48000;
+constexpr int kMaxAudioSamplesPerFrame = kAudioSampleRate / 5;
+constexpr int16_t kBuzzerAmplitude = 8000;
+
+// DC-blocking (one-pole high-pass) cutoff for the buzzer signal -- see
+// buzzerDcEstimate's comment in main(). 20Hz is comfortably below the
+// lowest documented BEEP tone (~230Hz, PC1500 Owner's Manual F.1) so real
+// tones pass through essentially unaffected, while a level that just sits
+// at one static value decays to silence within ~50ms.
+constexpr double kBuzzerDcBlockAlpha = 2.0 * 3.14159265358979323846 * 20.0 / kAudioSampleRate;
 
 // Timer tick rate: approximated as machine-cycle/64, by analogy with the
 // PC-2's documented crystal/128 divider (see lh5801::CPU::tickTimer's
@@ -568,9 +600,25 @@ int main(int argc, char** argv) {
   // from HLT via interrupt, but this core doesn't implement interrupt
   // delivery yet (only the SIE/RIE/IE flag bookkeeping), so a HLT'd
   // program will not resume in this emulator.
-  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
     std::fprintf(stderr, "pc1500emu: SDL_Init failed: %s\n", SDL_GetError());
     return 1;
+  }
+
+  // Buzzer output. Not fatal if unavailable -- run silently rather than
+  // refusing to start over something as inessential as sound.
+  SDL_AudioSpec desiredAudioSpec{};
+  desiredAudioSpec.freq = kAudioSampleRate;
+  desiredAudioSpec.format = AUDIO_S16SYS;
+  desiredAudioSpec.channels = 1;
+  desiredAudioSpec.samples = 1024;
+  desiredAudioSpec.callback = nullptr;  // pushed via SDL_QueueAudio instead
+  SDL_AudioDeviceID audioDevice = SDL_OpenAudioDevice(nullptr, 0, &desiredAudioSpec, nullptr, 0);
+  if (audioDevice == 0) {
+    std::fprintf(stderr, "pc1500emu: SDL_OpenAudioDevice failed (running without sound): %s\n",
+                 SDL_GetError());
+  } else {
+    SDL_PauseAudioDevice(audioDevice, 0);
   }
   if (TTF_Init() != 0) {
     std::fprintf(stderr, "pc1500emu: TTF_Init failed: %s\n", TTF_GetError());
@@ -893,6 +941,38 @@ int main(int argc, char** argv) {
   // as typed (see /tmp/pc1500emu_keycapture.log).
   std::ofstream keyCaptureLog("/tmp/pc1500emu_keycapture.log", std::ios::app);
   auto captureStart = std::chrono::steady_clock::now();
+
+  // Audio sample budget is tracked against real elapsed wall-clock time,
+  // not a fixed kAudioSamplesPerFrame assumption -- SDL_Delay is
+  // imprecise and per-frame rendering cost varies, so a frame is never
+  // exactly 1/kFramesPerSecond seconds of real time. Generating a fixed
+  // sample count every frame regardless drifts out of sync with the
+  // audio device's actual real-time consumption rate, which is exactly
+  // what produced the crackling/stuttering Paul heard (2026-07-27): the
+  // queue alternately starved and overflowed instead of tracking real
+  // time. audioSampleAccumulator carries the fractional sample count
+  // across frames so no time is lost to rounding.
+  double audioSampleAccumulator = 0.0;
+  auto lastAudioTime = std::chrono::steady_clock::now();
+
+  // Tracks the buzzer signal's running DC level so it can be subtracted
+  // out before playback (see kBuzzerDcBlockAlpha) -- confirmed necessary
+  // by a real boot-noise investigation (2026-07-27): OPC's buzzer bit is a
+  // real, disassembly-confirmed 0->1 write during ROM1.BIN's own boot-time
+  // register-init table (E159-E167 writes OPC=0xC0), and it then stays at
+  // a *static* 1 indefinitely (traced 20M+ cycles with no further OPC
+  // writes while idling at the boot prompt). A real buzzer/speaker is
+  // AC-coupled -- it only responds to the *changing* signal from actual
+  // BEEP tone generation, not a level that's simply held constant -- but
+  // this emulator's naive raw-level-to-signed-PCM mapping treated that one
+  // static level change as a permanent DC offset, producing an audible
+  // "click" at the transition and (on some audio backends) a sustained
+  // hum from the DC offset itself, for a ROM write that should have been
+  // inaudible. Initialized to -1.0 (buzzerOn()'s default-off level) rather
+  // than 0.0 so there's no spurious transient before the ROM ever touches
+  // OPC at all.
+  double buzzerDcEstimate = -1.0;
+
   while (running) {
     if (cmdFifoFd >= 0) {
       char buf[4096];
@@ -1246,7 +1326,18 @@ int main(int argc, char** argv) {
     // frame (~9 minutes of real time to accumulate one interrupt period,
     // instead of ~25ms) -- exactly the kind of thing that makes keyboard
     // input look almost entirely unresponsive.
+    auto audioNow = std::chrono::steady_clock::now();
+    double elapsedSeconds = std::chrono::duration<double>(audioNow - lastAudioTime).count();
+    lastAudioTime = audioNow;
+    bus.advanceRealTime(elapsedSeconds);
+    audioSampleAccumulator += elapsedSeconds * kAudioSampleRate;
+    int samplesThisFrame = static_cast<int>(audioSampleAccumulator);
+    if (samplesThisFrame > kMaxAudioSamplesPerFrame) samplesThisFrame = kMaxAudioSamplesPerFrame;
+    audioSampleAccumulator -= samplesThisFrame;
+
     int cyclesRun = 0;
+    int16_t audioSamples[kMaxAudioSamplesPerFrame];
+    int audioSamplesEmitted = 0;
     while (cyclesRun < kCyclesPerFrame) {
       int c = cpu.step();
       int used = (c > 0) ? c : 1;
@@ -1257,6 +1348,28 @@ int main(int argc, char** argv) {
         cpu.tickTimer();
         cyclesSinceTimerTick -= kCyclesPerTimerTick;
       }
+
+      // Sample the buzzer bit cycle-accurately (not from an SDL audio
+      // callback thread -- see the buzzer comment above) so this frame's
+      // rendered CPU execution maps proportionally across however many
+      // samples this frame actually gets (samplesThisFrame, decided from
+      // real elapsed time above).
+      int targetSamples =
+          static_cast<int>((static_cast<int64_t>(cyclesRun) * samplesThisFrame) / kCyclesPerFrame);
+      if (targetSamples > samplesThisFrame) targetSamples = samplesThisFrame;
+      double rawLevel = bus.ioPort().buzzerOn() ? 1.0 : -1.0;
+      while (audioSamplesEmitted < targetSamples) {
+        // DC-blocking high-pass filter -- see buzzerDcEstimate's comment
+        // above. Applied per emitted sample (not per CPU step) since the
+        // filter's time constant is defined in real sample-rate terms.
+        buzzerDcEstimate += (rawLevel - buzzerDcEstimate) * kBuzzerDcBlockAlpha;
+        double filtered = rawLevel - buzzerDcEstimate;
+        audioSamples[audioSamplesEmitted++] =
+            static_cast<int16_t>(filtered * kBuzzerAmplitude);
+      }
+    }
+    if (audioDevice != 0) {
+      SDL_QueueAudio(audioDevice, audioSamples, static_cast<Uint32>(audioSamplesEmitted * sizeof(int16_t)));
     }
 
     SDL_SetRenderDrawColor(renderer, 0xC8, 0xD8, 0xC0, 255);  // unlit LCD background
@@ -1350,6 +1463,7 @@ int main(int argc, char** argv) {
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);
   TTF_Quit();
+  if (audioDevice != 0) SDL_CloseAudioDevice(audioDevice);
   SDL_Quit();
   return 0;
 }

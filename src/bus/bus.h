@@ -1,15 +1,118 @@
+// Copyright (c) 2026 Paul Chambre. Licensed under the Apache License,
+// Version 2.0 -- see LICENSE.
 #pragma once
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <ctime>
 #include <vector>
 
 #include "keyboard.h"
 #include "lh5801.h"
 
 namespace pc1500 {
+
+// NEC uPD1990AC real-time clock chip, wired to the LH5811 I/O port
+// controller's PC0-PC5 (control) and PB5/PB6 (status input) pins -- see
+// docs/pc1500_hardware_reference.md and Documents/PC1500/UPD1990AC.pdf
+// (the real datasheet). A 40-bit BCD shift register holds
+// month/day-of-week/day/hour/minute/second; C0-C2 (latched by STB) select
+// one of Register Hold/Shift/Time-Set/Time-Read (C2=0) or a TP output rate
+// of 64/256/2048 Hz (C2=1) -- two independently-latched command groups,
+// per the datasheet's own wording.
+//
+// Confirmed wired exactly this way via direct ROM1.BIN disassembly: BASIC
+// BEEP's repeat-gap wait (E890-E8B4) issues value 0x20 through the shared
+// "set OPC low 6 bits + pulse STB" helper at E573 -- i.e. C2=1,C1=0,C0=0 on
+// PC5/PC4/PC3 -- which is exactly the datasheet's "TP=64Hz Set" command,
+// before polling PB5 (TP's live level) and IF bit 1 (latched from TP's
+// rising edge, see IoPortController::advanceRealTime()). That's what
+// resolved the mystery of what BEEP's gap timer actually depends on.
+//
+// TP is driven by real elapsed wall-clock time (advanceRealTime()), not
+// CPU cycles: this chip has its own independent 32.768kHz crystal (per the
+// Service Manual's block diagram), so its rate is correct regardless of
+// how fast the emulated CPU itself is running -- same reasoning as
+// main.cpp's audio sample accumulator, just for a different signal.
+class Upd1990ac {
+ public:
+  // Forward every OPC write here with its six control-line levels
+  // (PC0=DATA IN, PC1=STB, PC2=CLK, PC3=C0, PC4=C1, PC5=C2 -- confirmed via
+  // the E573 ROM helper toggling bit 1 for STB pulses). Real behavior only
+  // happens on STB/CLK rising edges, detected internally, so callers don't
+  // need to track state themselves.
+  void setControlPins(bool dataIn, bool stb, bool clk, bool c0, bool c1, bool c2);
+
+  // PB5 (TP) / PB6 (DATA OUT) live levels -- see IoPortController::read()'s
+  // OPB case, which reads these unconditionally regardless of DDB (same
+  // treatment as PB7/onKeyLine_, since these are fixed hardwired
+  // connections on a stock PC-1500, not general-purpose I/O).
+  bool tp() const { return tpLevel_; }
+  bool dataOut() const;
+
+  // Advances TP's phase by elapsedSeconds of real time. Returns true if at
+  // least one rising edge occurred since the last call (multiple edges
+  // within one call collapse to a single "true" -- IF is a level flag, not
+  // a counter, so software polling it can't tell the difference anyway).
+  //
+  // Returns false unconditionally until the ROM has issued at least one
+  // TP-rate-select command (see latchCommand) -- confirmed necessary by a
+  // real regression: without this gate, TP started toggling from process
+  // launch using a guessed default rate, which spuriously set IF bit 1
+  // during the boot ROM's own "NEW0?:CHECK" prompt sequence (well before
+  // BEEP or anything else ever issues a real TP command), skipping past a
+  // prompt that real hardware correctly stops at. The datasheet doesn't
+  // document TP's power-on-reset mux state, but real hardware clearly
+  // doesn't have this problem despite the RTC's divider presumably having
+  // been free-running for years off a backup battery -- so a raw,
+  // ungated TP-to-IF-bit-1 mirror can't be the whole story; not letting
+  // TP mean anything before it's actually configured is the simplest fix
+  // that resolves the regression while keeping BEEP working (it always
+  // configures TP=64Hz before ever polling).
+  bool advanceRealTime(double elapsedSeconds);
+
+ private:
+  // Per the datasheet's command table: Group 0 (C2=0) selects one of these
+  // four register-control modes; Group 1 (C2=1, handled separately via
+  // tpRateHz_) selects the TP output rate instead.
+  enum class Mode { RegisterHold, RegisterShift, TimeSet, TimeRead };
+
+  void latchCommand(bool c0, bool c1, bool c2);
+  uint64_t liveTimeAsBcd40() const;
+  void commitShiftRegisterToTime();
+
+  bool prevStb_ = false;
+  bool prevClk_ = false;
+  bool dataIn_ = false;
+
+  Mode mode_ = Mode::RegisterHold;
+  int tpRateHz_ = 64;
+  bool tpConfigured_ = false;  // see advanceRealTime()
+  // 40 bits used: bits [3:0]=units-of-seconds ... bits [39:36]=month (see
+  // liveTimeAsBcd40()). Shifts right on each CLK edge while mode_ is
+  // RegisterShift or TimeSet (the two modes the datasheet lists as
+  // "DATA OUT=[LSB]"); bit 0 is what falls out to DATA OUT (Fig. 1: "DATA
+  // ... appears on DATA OUT terminal from LSB of Second"), and the new bit
+  // from DATA IN enters at bit 39.
+  uint64_t shiftRegister_ = 0;
+
+  bool tpLevel_ = false;
+  double tpPhaseSeconds_ = 0.0;
+
+  // now() + timeOffset_ is this chip's notion of "now". Starts at 0 (i.e.
+  // matches host wall-clock time) rather than an arbitrary epoch, so
+  // BASIC's TIME$/DATE$ show something sensible even before any Time-Set
+  // command -- like a real battery-backed clock that happens to already
+  // read correctly. Time-Set commits a new value here (see
+  // commitShiftRegisterToTime()); the chip has no year field at all (per
+  // the datasheet's 40-bit layout), so the host's current year is always
+  // used for that part.
+  std::chrono::seconds timeOffset_{0};
+};
 
 // LH5810/LH5811 I/O port controller, mapped into ME1 at F000H-F00FH (see
 // docs/pc1500_hardware_reference.md). Register selected by the low 4 bits
@@ -32,6 +135,29 @@ class IoPortController {
   // tracks the physical key state directly.
   void setOnKeyLine(bool pressed) { onKeyLine_ = pressed; }
 
+  // OPC bit 6 (PC6) is the buzzer on/off control -- there's no separate
+  // tone/frequency register on real hardware; BASIC's BEEP works by
+  // having the ROM toggle this bit in a timed software loop, and the
+  // resulting square wave *is* the tone. Emulating it is therefore just
+  // exposing the bit's live level for the host audio callback to sample
+  // directly (see main.cpp) -- std::atomic since that callback runs on
+  // SDL's own audio thread, not the emulator's main thread that calls
+  // write().
+  bool buzzerOn() const { return buzzerOn_.load(std::memory_order_relaxed); }
+
+  // Drives serial-transmit timing (see write()'s 0x06 case): call once per
+  // emulated cycle batch, same as Bus::advanceCycles (which forwards to
+  // this). Counts down txCyclesRemaining_ and sets the TD flag (IF bit 3)
+  // when a transmission completes.
+  void advanceCycles(int cycles);
+
+  // Drives the RTC's TP output (see Upd1990ac and rtc_ below): call once
+  // per rendered frame, same as Bus::advanceRealTime (which forwards to
+  // this), with real elapsed wall-clock seconds. Latches IF bit 1 on each
+  // TP rising edge -- see rtc_'s class comment for why BASIC's BEEP
+  // actually depends on this.
+  void advanceRealTime(double elapsedSeconds);
+
  private:
   uint8_t dda_ = 0;
   uint8_t ddb_ = 0;
@@ -41,8 +167,56 @@ class IoPortController {
   uint8_t f_ = 0;
   uint8_t g_ = 0;
   uint8_t msk_ = 0;
-  uint8_t if_ = 0;
+  // mutable: reading U (register 0x05) clears the RD flag here as a real
+  // hardware side effect (see below) even though read() is logically const
+  // from the CPU's point of view (a memory-mapped register read, not a
+  // write instruction).
+  mutable uint8_t if_ = 0;
   bool onKeyLine_ = false;
+  std::atomic<bool> buzzerOn_{false};
+
+  // LH5811 serial transmission (RS=0110, "send data" trigger register --
+  // called L in the PC-2 Service Manual's I/O port controller block
+  // diagram) and reception (RS=0101, U register). Confirmed real usage via
+  // CE-150 (printer/cassette interface) ROM disassembly: it polls IF bit 3
+  // (0x08) clear before writing a new byte to 0x06, and the byte written
+  // there is never itself readable back (register is write-only/trigger,
+  // per the Service Manual's register table) -- i.e. bit 3 is TD
+  // (transmit done), set by hardware when a transmission finishes, and
+  // implicitly clear while one is in progress. Confirmed BASIC's BEEP does
+  // NOT use this path at all (it bit-bangs OPC directly and waits on IF
+  // bit 1, which tracks something else entirely -- see docs/pc1500_hardware_reference.md).
+  //
+  // RD (receive done) bit position is *not* confirmed against any ROM
+  // disassembly (no PC-1500 ROM code path exercising CLOAD-style serial
+  // reception has been traced yet) -- bit 2 here is a best guess based on
+  // typical IRQ/PB7/RD/TD bit ordering, not a verified hardware fact.
+  static constexpr uint8_t kTdFlagBit = 0x08;
+  static constexpr uint8_t kRdFlagBit = 0x04;  // unconfirmed -- see above
+
+  // Transmission format is start bit + 8 data bits + 2 stop bits (11 bit
+  // periods total, per the Service Manual), each bit period lasting
+  // divisor() cycles of the CPU's own clock (the "basic clock" the divisor
+  // list is stated relative to). The 3-bit divisor selector packed into F
+  // bits 2-0 and this ascending-rate ordering are also not confirmed
+  // against a real bit-encoding table (none survived OCR from either
+  // manual) -- best guess from the Service Manual's listed rate order,
+  // refinable later against real CE-150 ROM timing if it matters.
+  uint8_t transmitClockDivisor() const {
+    static constexpr int kDivisors[8] = {1, 2, 128, 256, 512, 1024, 2048, 4096};
+    return kDivisors[f_ & 0x07];
+  }
+
+  uint8_t serialTxByte_ = 0;
+  uint8_t serialRxByte_ = 0;
+  int txCyclesRemaining_ = 0;
+
+  // IF bit 1: latched from the RTC's TP rising edge -- see
+  // advanceRealTime() and Upd1990ac's class comment. Unlike TD/RD (bits
+  // 3/2), this one *is* ROM-confirmed (BASIC BEEP's repeat-gap wait polls
+  // exactly this bit after commanding TP=64Hz).
+  static constexpr uint8_t kTpFlagBit = 0x02;
+  Upd1990ac rtc_;
 };
 
 // PC-1500 memory map (see docs/pc1500_hardware_reference.md). ME0 holds
@@ -147,6 +321,12 @@ class Bus : public lh5801::MemoryBus {
   // periodically at the ~5/sec rate confirmed on real hardware, letting
   // the ROM's own dispatch logic re-trigger a repeat.
   void advanceCycles(int cycles);
+
+  // Forwards to the I/O port controller's RTC -- see
+  // IoPortController::advanceRealTime(). Call once per rendered frame with
+  // real elapsed wall-clock seconds (main.cpp already computes this for
+  // its audio sample accumulator).
+  void advanceRealTime(double elapsedSeconds) { io_.advanceRealTime(elapsedSeconds); }
 
  private:
   // Applies a release that setKeyState deferred: updates Keyboard, and (for

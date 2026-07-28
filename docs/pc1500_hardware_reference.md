@@ -150,7 +150,9 @@ PC-1500 itself). Provides:
 - One 8-bit **output-only** port, **PC0-7**, latched on the falling edge of
   external clock `PΦ`.
 - Interrupt request handling (IRQ input, PB7 input, receive/transmit flags).
-- Serial data transfer control (cassette-related on PC-1500 — out of scope).
+- Serial data transfer control (cassette-related on PC-1500 -- modeled for
+  transmit only, see below; nothing on a stock PC-1500 exercises reception
+  without a cassette/CE-150 physically attached).
 - CPU wait-state generation for slow memory (not needed for an emulator,
   since it only affects real-hardware timing, not observable behavior).
 
@@ -171,6 +173,88 @@ PC-1500 itself). Provides:
 | `1110` | OPA | store (drives PA when DDA bit=1) | send (reads PA when DDA bit=0) |
 | `1111` | OPB | store (drives PB when DDB bit=1) | send (reads PB when DDB bit=0) |
 
+### Serial transmit/receive (registers `0101`/`0110`, F/G clock dividers)
+
+Confirmed **not** used by BASIC's BEEP (it bit-bangs OPC/PC6 directly in a
+software delay loop -- see the OPC row above and BEEP's actual repeat-gap
+wait, which polls IF bit 1 alongside PB5 -- see "uPD1990AC real-time
+clock" below for what that actually is). Confirmed **is** used by the
+CE-150 printer/cassette interface ROM (`CE-150.ROM`, disassembled
+directly): it polls IF bit 3 clear, then writes the next byte to register
+`0110` to start transmission, i.e. bit 3 is TD (transmit done).
+
+Per the PC-2 Service Manual (chapter 3, "LH5811 I/O PORT"): format is
+start bit + 8 data bits + 2 stop bits (11 bit periods total), clock rate
+selectable from `{1/1, 1/2, 1/128, 1/256, 1/512, 1/1024, 1/2048, 1/4096}`
+of the CPU's own clock. `pc1500emu`'s `IoPortController` models this as
+`11 * divisor` cycles from write to TD-set, with F's low 3 bits selecting
+the divisor in that same ascending order (`f_ & 0x07` indexes
+`{1,2,128,256,512,1024,2048,4096}`).
+
+**Not hardware-confirmed** (no bit-level register table survived either
+manual's text extraction -- neither `pdftotext` nor visual PDF reading of
+the Service Manual's page 11 block diagram recovered one): the F-bits-to-
+divisor mapping above is a best guess from the *listed order* of rates,
+not a verified bit encoding; likewise the RD (receive-done) flag's bit
+position (bit 2, by analogy to TD's bit 3 -- no ROM code path exercising
+real reception has been traced). Refine both against real CE-150 ROM
+timing/behavior if serial reception, or exact transmit timing, ever
+matters for a specific feature (e.g. cassette SAVE/LOAD).
+
+### uPD1990AC real-time clock (PC0-PC5, PB5/PB6)
+
+A third chip entirely, separate from both the LH5801 CPU's own internal
+timer (crystal/128 divider, vector `FFFAH`, see `lh5801::CPU::tickTimer`)
+and the LH5811's own serial-transmit hardware above. Confirmed via the
+PC-2 Service Manual's LH5811 pin table (page 9) plus the real NEC
+uPD1990AC datasheet (`Documents/PC1500/UPD1990AC.pdf`), and cross-checked
+against real ROM1.BIN disassembly:
+
+- **PC0** = DATA IN, **PC1** = STB, **PC2** = CLK, **PC3/PC4/PC5** =
+  C0/C1/C2 (command bits) -- all six bit-banged from OPC. **PB5** = TP
+  (the chip's timer-pulse output), **PB6** = DATA OUT (serial read-back)
+  -- both live input levels, read unconditionally regardless of DDB (same
+  treatment as PB7/ON-key).
+- STB latches C0-C2 (independently for each of two groups, selected by
+  C2) into a 3-bit command: C2=0 selects one of Register
+  Hold/Shift/Time-Set&Hold/Time-Read; C2=1 selects TP's rate (64/256/2048
+  Hz) or a test mode. Exact table: NEC uPD1990AC datasheet, "COMMAND
+  SPECIFICATIONS".
+- CLK shifts a 40-bit BCD register (month as a raw 4-bit binary
+  1-12/day-of-week 0-6/BCD tens+units of day, hour, minute, second) one
+  bit per edge, while in Register-Shift or Time-Set mode; bit 0 (LSB of
+  seconds) is what appears on DATA OUT, matching the datasheet's Fig. 1
+  note. Time-Read snapshots the live clock into this register; leaving
+  Time-Set commits whatever's in the register back to the live clock.
+- **This is what BASIC's BEEP actually depends on for its repeat-gap
+  timing** -- confirmed by disassembling ROM1.BIN directly (E890-E8B4):
+  before polling PB5 and IF bit 1, it issues exactly the "TP=64Hz Set"
+  command (C2=1,C1=0,C0=0, i.e. value `0x20` through the shared "set OPC
+  low 6 bits + pulse STB" ROM helper at E573). IF bit 1 is latched from
+  TP's rising edge -- confirmed only for that bit; no ROM code path
+  exercising the RTC's own IRQ/PB7-style latching (separate from this
+  bit) has been traced.
+- `pc1500emu`'s `Upd1990ac` (in `src/bus/bus.h`/`bus.cpp`) drives TP off
+  real elapsed wall-clock time, not CPU cycles -- this chip has its own
+  independent 32.768kHz crystal, so its rate is correct regardless of
+  emulated CPU speed. The live clock itself defaults to matching host
+  wall-clock time (no year field exists in the 40-bit register at all, so
+  the host's current year is always used after a Time-Set).
+- **TP produces no edges at all (and IF bit 1 never sets) until the ROM
+  has issued at least one TP-rate-select command.** Found the hard way:
+  an earlier version let TP start toggling from process launch using a
+  guessed default rate, which spuriously set IF bit 1 during the boot
+  ROM's own "NEW0?:CHECK" prompt sequence -- well before BEEP or anything
+  else ever configures TP -- skipping straight past a prompt real
+  hardware correctly stops at. The datasheet doesn't document TP's
+  power-on-reset mux state, but real hardware clearly doesn't have this
+  problem despite the RTC's divider presumably having run continuously
+  for years off a backup battery, so a raw always-on TP-to-IF-bit-1
+  mirror can't be the whole story. Gating on "has TP ever been
+  configured" is the simplest fix that resolves the regression while
+  keeping BEEP working (it always configures TP=64Hz before ever
+  polling).
+
 Registers relevant to a PC-1500 emulator (ignoring serial/cassette-only
 ones — G, F, MSK/IF beyond basic IRQ, serial U/transmit):
 - **DDA / DDB**: per-bit direction for PA/PB (`0`=input, `1`=output).
@@ -190,9 +274,9 @@ ones — G, F, MSK/IF beyond basic IRQ, serial U/transmit):
 | PB2 | — | cassette serial in (out of scope) |
 | PB3 | — | VCC (export) / GND (domestic) — no logical function |
 | PB4 | — | GND |
-| PB5, PB6 | — | timer control |
+| PB5, PB6 | — | uPD1990AC RTC: TP (timer pulse) / DATA OUT -- see "uPD1990AC real-time clock" below |
 | PB7 | ON key input | dedicated ON-key read (see Keyboard) |
-| PC0-PC5 | — | timer control |
+| PC0-PC5 | — | uPD1990AC RTC: DATA IN/STB/CLK/C0/C1/C2 -- see "uPD1990AC real-time clock" below |
 | PC6 | — | buzzer on/off control |
 | PC7 | — | not used |
 | CS0/CS1/CS2 | chip select | tied to AD12/AD13/(fixed) -- confirmed on real hardware (`F00AH`/`F00BH` and `B00AH`/`B00BH` read back identical, live values) that AD14/AD15 aren't part of the decode: `F000H` and `B000H` agree on bits 12-13 (`0011...`) and differ only in bit 14, so the controller mirrors to *any* address with bits 12-13 both set, regardless of bits 4-15 elsewhere. `F000H-F00FH` is just the conventional address the ROM uses, not the only one that works. |
@@ -344,12 +428,7 @@ ever needs to be modeled.
 
 ## Other hardware noted but out of scope / deferred
 
-- Timer IC **µPD1990AC** (32.768kHz crystal) — drives real-time clock and
-  timer interrupts. Controlled via I/O-PC pins PB5/PB6/PC0-5. Not detailed
-  further here; revisit when implementing interrupts/timer if BASIC-level
-  timer behavior needs to be accurate.
-- Buzzer: single on/off control bit, I/O-PC pin PC6. Trivial to add once
-  the I/O port controller's OPC register is emulated — no separate research
-  needed.
 - Cassette tape interface (SD0/SD1/CL0/CL1, PB2 on I/O-PC): explicitly out
-  of scope per project direction.
+  of scope per project direction. (The uPD1990AC RTC, previously listed
+  here as deferred, is now implemented -- see "uPD1990AC real-time clock"
+  above.)
