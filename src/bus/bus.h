@@ -75,6 +75,17 @@ class Upd1990ac {
   // configures TP=64Hz before ever polling).
   bool advanceRealTime(double elapsedSeconds);
 
+  // Explicitly (re-)syncs this chip's notion of "now" to the host's
+  // current wall-clock time -- the same effect BASIC's own TIME command
+  // has (see commitShiftRegisterToTime()), without needing the CPU to
+  // actually run any ROM code to get there. Already the default at
+  // construction (timeOffset_ starts at 0, see its own comment), so
+  // this mostly exists to make that intent explicit and give a caller
+  // (see main.cpp) an obvious hook to call at startup, rather than
+  // relying on nobody having reset timeOffset_ away from its default in
+  // the meantime.
+  void syncToHostClock() { timeOffset_ = std::chrono::seconds{0}; }
+
  private:
   // Per the datasheet's command table: Group 0 (C2=0) selects one of these
   // four register-control modes; Group 1 (C2=1, handled separately via
@@ -157,6 +168,9 @@ class IoPortController {
   // TP rising edge -- see rtc_'s class comment for why BASIC's BEEP
   // actually depends on this.
   void advanceRealTime(double elapsedSeconds);
+
+  // Forwards to the RTC -- see Upd1990ac::syncToHostClock().
+  void syncRtcToHostClock() { rtc_.syncToHostClock(); }
 
  private:
   uint8_t dda_ = 0;

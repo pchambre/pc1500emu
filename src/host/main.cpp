@@ -597,6 +597,13 @@ int main(int argc, char** argv) {
   lh5801::CPU cpu(bus);
   pc1500::Lcd lcd;
 
+  // Sync the uPD1990AC RTC to the host's current time up front, the same
+  // effect BASIC's own TIME command would have, so TIME$/DATE$ read
+  // correctly from the very first ROM boot without the user needing to
+  // run TIME by hand -- matching a real PC-1500's battery-backed RTC,
+  // which would already show correct time on power-up.
+  bus.ioPort().syncRtcToHostClock();
+
   if (argc > 1) {
     std::vector<uint8_t> rom = readFile(argv[1]);
     if (rom.empty()) {
