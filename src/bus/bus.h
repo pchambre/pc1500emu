@@ -262,6 +262,55 @@ class Bus : public lh5801::MemoryBus {
 
   IoPortController& ioPort() { return io_; }
 
+  // CE-150/153/158-style plug-in ROM module at 0x8000-0xBFFF, selected by
+  // the CPU's PV flip-flop (and, for modules whose ROM is bigger than the
+  // 16K window, banked by PU) -- see PU/PV's own class comment in
+  // lh5801.h. PV/PU only affect this region; everything else (SPU/RPU/
+  // SPV/RPV's other historical uses, if any) is out of scope here.
+  //
+  // `data` is the module's raw ROM dump, `base` is where it appears in
+  // the address space, `requirePv` is the PV level the CPU must have set
+  // for the module to respond at all (CE-150 defaults to PV=0/low,
+  // CE-158 to PV=1/high -- i.e. the two module *families* are
+  // distinguished by which PV level they answer to), and `usePuBank`
+  // splits `data` into two equal halves (PU=0 selects the first,
+  // PU=1 the second) for modules whose real ROM exceeds the 16K window
+  // (CE-158) -- false for modules that fit in one 16K bank regardless of
+  // PU (CE-150).
+  struct RomModule {
+    std::vector<uint8_t> data;
+    uint16_t base = 0xA000;
+    bool requirePv = false;
+    bool usePuBank = false;
+
+    bool tryRead(uint16_t addr, bool pv, bool pu, uint8_t& out) const {
+      if (data.empty() || pv != requirePv) return false;
+      size_t bankSize = usePuBank ? data.size() / 2 : data.size();
+      if (bankSize == 0 || addr < base || addr >= base + bankSize) return false;
+      size_t bank = (usePuBank && pu) ? 1 : 0;
+      size_t offset = bank * bankSize + (addr - base);
+      if (offset >= data.size()) return false;
+      out = data[offset];
+      return true;
+    }
+  };
+  void loadRomModule(const uint8_t* data, size_t size, uint16_t base, bool requirePv,
+                      bool usePuBank) {
+    module_.data.assign(data, data + size);
+    module_.base = base;
+    module_.requirePv = requirePv;
+    module_.usePuBank = usePuBank;
+  }
+  void unloadRomModule() { module_ = RomModule{}; }
+  bool romModuleLoaded() const { return !module_.data.empty(); }
+
+  // Forwarded from the CPU's own SPU/RPU/SPV/RPV opcode handlers (see
+  // lh5801.cpp) -- Bus is the single source of truth for the *current*
+  // pin level a module ROM read sees, since the CPU has no other reason
+  // to know the bus exists on this side of the interface.
+  void setPv(bool v) override { pv_ = v; }
+  void setPu(bool v) override { pu_ = v; }
+
   // Emulated module RAM, two independent regions/windows -- see
   // docs/pc1500_hardware_reference.md's memory map. Both off (size 0) by
   // default, matching stock hardware with no module installed. Size is in
@@ -369,6 +418,9 @@ class Bus : public lh5801::MemoryBus {
   Keyboard& keyboard_;
   size_t extRam4800Size_ = 0;
   size_t extRam0000Size_ = 0;
+  RomModule module_;
+  bool pv_ = false;  // matches CPU::reset()'s own pv_/pu_ default
+  bool pu_ = false;
 
   // Cursor-key rollover state (see advanceCycles).
   bool cursorKeyHeld_ = false;

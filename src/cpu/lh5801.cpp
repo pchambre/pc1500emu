@@ -27,6 +27,8 @@ void CPU::reset() {
   flags_ = Flags();
   halted_ = false;
   bf_ = disp_ = pu_ = pv_ = false;
+  bus_.setPu(false);
+  bus_.setPv(false);
   miPending_ = nmiPending_ = timerInterruptPending_ = false;
   timerCounter_ = 0;
   // "The contents of the address FFFEH are transferred to the PH register
@@ -417,10 +419,10 @@ void CPU::execPrimary(uint8_t opcode, int& cycles) {
     }
 
     // ---- Flip-flops / CPU control ----
-    case 0xE3: pu_ = false; cycles = 4; break;
-    case 0xE1: pu_ = true; cycles = 4; break;
-    case 0xB8: pv_ = false; cycles = 4; break;
-    case 0xA8: pv_ = true; cycles = 4; break;
+    case 0xE3: pu_ = false; bus_.setPu(pu_); cycles = 4; break;
+    case 0xE1: pu_ = true; bus_.setPu(pu_); cycles = 4; break;
+    case 0xB8: pv_ = false; bus_.setPv(pv_); cycles = 4; break;
+    case 0xA8: pv_ = true; bus_.setPv(pv_); cycles = 4; break;
     case 0xFB: flags_.c = true; cycles = 4; break;
     case 0xF9: flags_.c = false; cycles = 4; break;
     case 0x38: cycles = 5; break;  // NOP

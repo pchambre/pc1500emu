@@ -22,6 +22,13 @@ class MemoryBus {
   // IN0-IN7: CPU-direct key input pins (not part of either memory space,
   // read only via the ITA instruction). Bit i = INi.
   virtual uint8_t readInputPort() { return 0xFF; }
+
+  // PU/PV flip-flop levels (SPU/RPU/SPV/RPV), forwarded here every time
+  // they change -- only meaningful to a bus that models a bank-switched
+  // plug-in ROM module at 0x8000H-0xBFFFH (see pc1500::Bus::RomModule);
+  // default no-op so other MemoryBus implementations don't need to care.
+  virtual void setPu(bool) {}
+  virtual void setPv(bool) {}
 };
 
 struct Flags {

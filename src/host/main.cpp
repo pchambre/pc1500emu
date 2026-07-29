@@ -466,6 +466,23 @@ bool loadBinary(pc1500::Bus& bus, uint16_t addr, const char* path, std::string* 
   return true;
 }
 
+// CE-150/153/158-style plug-in ROM module at 0x8000H-0xBFFFH -- see
+// Bus::RomModule's own comment for what base/requirePv/usePuBank mean.
+bool loadRomModule(pc1500::Bus& bus, uint16_t base, bool requirePv, bool usePuBank,
+                    const char* path, std::string* error) {
+  std::vector<uint8_t> data = readFile(path);
+  if (data.empty()) {
+    *error = "Could not read file (or file is empty).";
+    return false;
+  }
+  if (usePuBank && (data.size() % 2) != 0) {
+    *error = "PU-banked module ROM must have an even size (split into two equal banks).";
+    return false;
+  }
+  bus.loadRomModule(data.data(), data.size(), base, requirePv, usePuBank);
+  return true;
+}
+
 bool saveBinary(pc1500::Bus& bus, uint16_t addr, uint32_t len, const char* path, std::string* error) {
   if (len == 0) {
     *error = "Length must be greater than 0.";
@@ -898,7 +915,7 @@ int main(int argc, char** argv) {
   // contexts' ImGui_ImplSDL2_ProcessEvent (switching ImGui::SetCurrentContext
   // first) is safe -- whichever context wasn't bound to that event's window
   // just ignores it.
-  enum class ActiveDialog { None, LoadBasic, SaveBasic, LoadBinary, SaveBinary };
+  enum class ActiveDialog { None, LoadBasic, SaveBasic, LoadBinary, SaveBinary, LoadRomModule };
   ActiveDialog activeDialog = ActiveDialog::None;
   char filenameBuf[512] = "";
   char addrBuf[8] = "4600";
@@ -906,6 +923,11 @@ int main(int argc, char** argv) {
   char callAddrBuf[8] = "4000";
   bool callAddrTouched = false;  // stops callAddrBuf auto-tracking addrBuf once the user edits it directly
   bool autoCallOnLoad = false;
+  // ROM module (CE-150/153/158) dialog fields -- see Bus::RomModule.
+  // Defaults match CE-150 (the more common/simpler of the two presets).
+  char romBaseBuf[8] = "A000";
+  bool romRequirePv = false;
+  bool romUsePuBank = false;
   std::string dialogError;
   SDL_Window* dialogWindow = nullptr;
   SDL_Renderer* dialogRenderer = nullptr;
@@ -1157,6 +1179,16 @@ int main(int argc, char** argv) {
         ImGui::Separator();
         if (ImGui::MenuItem("Load Binary...")) startDialog(ActiveDialog::LoadBinary, "Load Binary");
         if (ImGui::MenuItem("Save Binary...")) startDialog(ActiveDialog::SaveBinary, "Save Binary");
+        ImGui::Separator();
+        if (ImGui::MenuItem("Load ROM Module...")) {
+          startDialog(ActiveDialog::LoadRomModule, "Load ROM Module");
+          std::strncpy(romBaseBuf, "A000", sizeof(romBaseBuf));
+          romRequirePv = false;
+          romUsePuBank = false;
+        }
+        if (ImGui::MenuItem("Eject ROM Module", nullptr, false, bus.romModuleLoaded())) {
+          bus.unloadRomModule();
+        }
         ImGui::EndMenu();
       }
       if (ImGui::BeginMenu("Settings")) {
@@ -1205,6 +1237,7 @@ int main(int argc, char** argv) {
       const char* actionLabel = "";
       bool isBinary = false;
       bool isLoad = false;
+      bool isRomModule = false;
       switch (activeDialog) {
         case ActiveDialog::LoadBasic:
           actionLabel = "Load";
@@ -1221,6 +1254,10 @@ int main(int argc, char** argv) {
         case ActiveDialog::SaveBinary:
           actionLabel = "Save";
           isBinary = true;
+          break;
+        case ActiveDialog::LoadRomModule:
+          actionLabel = "Load";
+          isRomModule = true;
           break;
         case ActiveDialog::None:
           break;
@@ -1256,6 +1293,31 @@ int main(int argc, char** argv) {
             }
           }
         }
+        if (isRomModule) {
+          ImGui::InputText("Base address (hex)", romBaseBuf, sizeof(romBaseBuf),
+                            ImGuiInputTextFlags_CharsHexadecimal);
+          ImGui::Text("PV level required:");
+          ImGui::SameLine();
+          if (ImGui::RadioButton("Low", !romRequirePv)) romRequirePv = false;
+          ImGui::SameLine();
+          if (ImGui::RadioButton("High", romRequirePv)) romRequirePv = true;
+          ImGui::Checkbox("Bank-switch via PU (file must be twice the visible window)",
+                           &romUsePuBank);
+          ImGui::Separator();
+          ImGui::TextDisabled("Presets:");
+          ImGui::SameLine();
+          if (ImGui::Button("CE-150")) {
+            std::strncpy(romBaseBuf, "A000", sizeof(romBaseBuf));
+            romRequirePv = false;
+            romUsePuBank = false;
+          }
+          ImGui::SameLine();
+          if (ImGui::Button("CE-158")) {
+            std::strncpy(romBaseBuf, "8000", sizeof(romBaseBuf));
+            romRequirePv = true;
+            romUsePuBank = true;
+          }
+        }
         if (!dialogError.empty()) {
           ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", dialogError.c_str());
         }
@@ -1286,6 +1348,11 @@ int main(int argc, char** argv) {
             case ActiveDialog::SaveBasic:
               ok = saveBasicProgram(bus, filenameBuf, &dialogError);
               break;
+            case ActiveDialog::LoadRomModule: {
+              uint16_t base = static_cast<uint16_t>(strtol(romBaseBuf, nullptr, 16));
+              ok = loadRomModule(bus, base, romRequirePv, romUsePuBank, filenameBuf, &dialogError);
+              break;
+            }
             case ActiveDialog::None:
               break;
           }

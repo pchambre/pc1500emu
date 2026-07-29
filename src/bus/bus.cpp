@@ -210,6 +210,11 @@ uint8_t IoPortController::opaOutput() const {
 }
 
 uint8_t Bus::readME0(uint16_t addr) {
+  if (addr >= 0x8000 && addr <= 0xBFFF) {
+    uint8_t v;
+    if (module_.tryRead(addr, pv_, pu_, v)) return v;
+    return 0xFF;  // empty socket, or a module present but not selected by the current PV level
+  }
   if (isUnmapped(addr)) return 0xFF;
   return me0_[effectiveAddr(addr)];
 }
