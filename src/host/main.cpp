@@ -19,11 +19,14 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "basic_text.h"
+#include "basic_tokens.h"
 #include "bus.h"
 #include "keyboard.h"
 #include "lcd.h"
@@ -385,6 +388,20 @@ bool charToTapActions(char c, std::deque<QueuedKeyAction>* out) {
     direct = pc1500::Key::Minus;
   } else if (c == '=') {
     direct = pc1500::Key::Equals;
+  } else if (c == '(') {
+    // LeftParen/RightParen are dedicated, unshifted PC-1500 keys (see
+    // kShiftedDirectMap's comment) -- '(' and ')' need no PC-1500 Shift at
+    // all, unlike '<'/'>' below which are the *shifted* meaning of the
+    // same two physical keys.
+    direct = pc1500::Key::LeftParen;
+  } else if (c == ')') {
+    direct = pc1500::Key::RightParen;
+  } else if (c == '*') {
+    // Asterisk is the PC-1500's dedicated multiply key; unshifted it
+    // types '*' (see kKeyMap's SDLK_KP_MULTIPLY entry) -- shifted, it
+    // types ':' (handled below, matching kSymbolMap's SDLK_SEMICOLON
+    // entry).
+    direct = pc1500::Key::Asterisk;
   } else {
     hasDirect = false;
   }
@@ -393,18 +410,42 @@ bool charToTapActions(char c, std::deque<QueuedKeyAction>* out) {
     out->push_back({direct, false, kIdleFrames});
     return true;
   }
-  // Symbols needing a PC-1500 Shift-tap sequence (see kSymbolMap above) --
-  // only the ones actually needed for BASIC program text so far.
+  // Symbols needing a PC-1500 Shift-tap sequence -- target keys taken
+  // directly from kSymbolMap above (F1-F6/Equals/Space/Slash/LeftParen/
+  // RightParen/Asterisk/Plus/Minus, each PC-1500-Shifted, already
+  // confirmed on real hardware to produce these symbols), just re-indexed
+  // here by the character a BASIC listing actually contains rather than
+  // by host keycode.
   pc1500::Key shiftedTarget{};
   bool hasShifted = true;
-  if (c == '"') {
+  if (c == '!') {
+    shiftedTarget = pc1500::Key::F1;
+  } else if (c == '"') {
     shiftedTarget = pc1500::Key::F2;
+  } else if (c == '#') {
+    shiftedTarget = pc1500::Key::F3;
+  } else if (c == '$') {
+    shiftedTarget = pc1500::Key::F4;
+  } else if (c == '%') {
+    shiftedTarget = pc1500::Key::F5;
+  } else if (c == '&') {
+    shiftedTarget = pc1500::Key::F6;
+  } else if (c == '@') {
+    shiftedTarget = pc1500::Key::Equals;
+  } else if (c == '^') {
+    shiftedTarget = pc1500::Key::Space;
+  } else if (c == '?') {
+    shiftedTarget = pc1500::Key::Slash;
   } else if (c == ':') {
     shiftedTarget = pc1500::Key::Asterisk;
   } else if (c == '<') {
     shiftedTarget = pc1500::Key::LeftParen;
   } else if (c == '>') {
     shiftedTarget = pc1500::Key::RightParen;
+  } else if (c == ';') {
+    shiftedTarget = pc1500::Key::Plus;
+  } else if (c == ',') {
+    shiftedTarget = pc1500::Key::Minus;
   } else {
     hasShifted = false;
   }
@@ -543,20 +584,47 @@ uint32_t findBasicProgramEnd(pc1500::Bus& bus) {
   return 0;
 }
 
-bool saveBasicProgram(pc1500::Bus& bus, const char* path, std::string* error) {
+// Reads the current BASIC program's raw tokenized bytes (kBasicProgramStart
+// through the trailing 0xFFH, inclusive) -- shared by the binary and text
+// save paths. Returns an empty vector and sets *error if the program area
+// looks corrupt.
+std::vector<uint8_t> readBasicProgramBytes(pc1500::Bus& bus, std::string* error) {
   uint32_t endAddr = findBasicProgramEnd(bus);
   if (endAddr == 0) {
     *error = "Could not find end of BASIC program (corrupt program area?).";
-    return false;
+    return {};
   }
+  std::vector<uint8_t> data;
+  data.reserve(endAddr - kBasicProgramStart + 1);
+  for (uint32_t a = kBasicProgramStart; a <= endAddr; a++) {
+    data.push_back(bus.readME0(static_cast<uint16_t>(a)));
+  }
+  return data;
+}
+
+bool saveBasicProgram(pc1500::Bus& bus, const char* path, std::string* error) {
+  std::vector<uint8_t> data = readBasicProgramBytes(bus, error);
+  if (data.empty()) return false;
   std::ofstream f(path, std::ios::binary);
   if (!f) {
     *error = "Could not open file for writing.";
     return false;
   }
-  for (uint32_t a = kBasicProgramStart; a <= endAddr; a++) {
-    f.put(static_cast<char>(bus.readME0(static_cast<uint16_t>(a))));
+  f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  return true;
+}
+
+bool saveBasicTextFile(pc1500::Bus& bus, const char* path, std::string* error) {
+  std::vector<uint8_t> data = readBasicProgramBytes(bus, error);
+  if (data.empty()) return false;
+  std::string text;
+  if (!pc1500::basic::detokenizeBasicProgram(data, &text, error)) return false;
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    *error = "Could not open file for writing.";
+    return false;
   }
+  f.write(text.data(), static_cast<std::streamsize>(text.size()));
   return true;
 }
 
@@ -586,6 +654,120 @@ bool loadBasicProgram(pc1500::Bus& bus, const char* path, std::string* error) {
   uint32_t endAddr = kBasicProgramStart + data.size() - 1;
   bus.writeME0(kProgramEndPointerAddr, static_cast<uint8_t>(endAddr >> 8));
   bus.writeME0(kProgramEndPointerAddr + 1, static_cast<uint8_t>(endAddr & 0xFF));
+  return true;
+}
+
+// Loads `text` (one BASIC program line per input line, e.g. a listing
+// pasted from a magazine transcription) by driving the ROM's own PRO-mode
+// line editor via simulated keystrokes -- see the design note above
+// charToTapActions. This is authoritative rather than a reimplementation:
+// the ROM itself tokenizes each line exactly as it would for a human
+// typing it in, including quirks (like the "GOSUB \"label\"" idiom) a
+// hand-written parser would have to special-case.
+//
+// Not tied to real GUI frames: advances cpu/bus cycles directly (the same
+// stepping shape as the FIFO `run` command) rather than pacing one key
+// action per real frame the way the interactive symbolActionQueue does,
+// so a whole listing loads in well under a second of host time regardless
+// of how many characters it "types".
+bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& text,
+                          std::string* error) {
+  int cyclesSinceTimerTick = 0;
+  auto stepCycles = [&](long cycles) {
+    for (long i = 0; i < cycles;) {
+      int c = cpu.step();
+      int used = (c > 0) ? c : 1;
+      i += used;
+      cyclesSinceTimerTick += used;
+      bus.advanceCycles(used);
+      while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+        cpu.tickTimer();
+        cyclesSinceTimerTick -= kCyclesPerTimerTick;
+      }
+    }
+  };
+  auto runKeyAction = [&](const QueuedKeyAction& action) {
+    bus.setKeyState(action.key, action.pressed);
+    stepCycles(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
+  };
+  auto typeChar = [&](char c) {
+    std::deque<QueuedKeyAction> actions;
+    if (!charToTapActions(c, &actions)) return false;
+    for (const QueuedKeyAction& action : actions) runKeyAction(action);
+    return true;
+  };
+  auto pressEnter = [&]() {
+    runKeyAction({pc1500::Key::Ent, true, kTapFrames});
+    runKeyAction({pc1500::Key::Ent, false, kIdleFrames});
+  };
+  auto pressCl = [&]() {
+    runKeyAction({pc1500::Key::Cl, true, kTapFrames});
+    runKeyAction({pc1500::Key::Cl, false, kIdleFrames});
+  };
+
+  // The ROM boots (and returns after certain operations) to a state that
+  // doesn't respond to typed characters until CL is pressed once --
+  // confirmed empirically via the FIFO (`key cl` before typing was the
+  // difference between every line being silently ignored and a line
+  // typing and storing correctly). One press here, not per-line: once the
+  // first line is accepted, the ROM's own line editor returns to a fresh
+  // prompt ready for the next line on its own.
+  pressCl();
+
+  // Full replace, not merge: clear the program through the ROM's own NEW
+  // command (typed, like everything else here) rather than poking
+  // kBasicProgramStart/kProgramEndPointerAddr directly -- confirmed
+  // empirically that a direct poke leaves the program area in a state the
+  // ROM's own periodic memory-validity pass doesn't recognize as either
+  // "freshly typed" or "properly cleared", and it quietly re-zeroes
+  // 4000H-47FFH (including whatever we'd just typed) within the next
+  // several hundred thousand cycles -- invisible to a check done right
+  // after each line, but very visible by the time the whole load
+  // finishes. Driving NEW the same way a human would avoids relying on
+  // any of that internal bookkeeping being right.
+  for (char c : std::string("NEW0")) typeChar(c);
+  pressEnter();
+  // NEW's own memory-clear work isn't done the instant Enter is processed
+  // -- give it extra settling time beyond the usual per-key idle gap
+  // before typing the first program line, confirmed empirically necessary
+  // (without this, the very first line -- sometimes several -- was
+  // silently rejected as if the ROM wasn't listening yet).
+  stepCycles(4L * kIdleFrames * kCyclesPerFrame);
+
+  std::vector<std::string> rejectedLines;
+  std::istringstream lineStream(text);
+  std::string line;
+  while (std::getline(lineStream, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.find_first_not_of(" \t") == std::string::npos) continue;  // blank line
+
+    uint32_t beforeEnd = findBasicProgramEnd(bus);
+    for (char c : line) {
+      if (!typeChar(c)) {
+        *error = "no keystroke mapping for character '" + std::string(1, c) + "' in line: " + line;
+        return false;
+      }
+    }
+    pressEnter();
+    if (findBasicProgramEnd(bus) == beforeEnd) {
+      // The ROM didn't grow the program area at all -- it rejected this
+      // line (most likely a syntax error). We can't recover its specific
+      // error text without decoding LCD pixels, but we can at least
+      // surface which line didn't take instead of silently dropping it.
+      rejectedLines.push_back(line);
+    }
+  }
+
+  if (!rejectedLines.empty()) {
+    std::string msg =
+        std::to_string(rejectedLines.size()) + " line(s) rejected by the ROM (syntax error?): ";
+    for (size_t i = 0; i < rejectedLines.size(); i++) {
+      if (i > 0) msg += " | ";
+      msg += rejectedLines[i];
+    }
+    *error = msg;
+    return false;
+  }
   return true;
 }
 
@@ -835,6 +1017,24 @@ int main(int argc, char** argv) {
       std::string error;
       bool ok = loadBasicProgram(bus, path.c_str(), &error);
       writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "savebasictext") {
+      std::string path;
+      iss >> path;
+      std::string error;
+      bool ok = saveBasicTextFile(bus, path.c_str(), &error);
+      writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "loadbasictext") {
+      std::string path;
+      iss >> path;
+      std::vector<uint8_t> fileData = readFile(path.c_str());
+      std::string error;
+      if (fileData.empty()) {
+        writeResponse("ERROR: Could not read file (or file is empty).");
+      } else {
+        std::string text(fileData.begin(), fileData.end());
+        bool ok = typeBasicProgramText(bus, cpu, text, &error);
+        writeResponse(ok ? "OK" : ("ERROR: " + error));
+      }
     } else if (cmd == "savebinary") {
       long addr = 0, len = 0;
       std::string path;
@@ -922,9 +1122,24 @@ int main(int argc, char** argv) {
   // contexts' ImGui_ImplSDL2_ProcessEvent (switching ImGui::SetCurrentContext
   // first) is safe -- whichever context wasn't bound to that event's window
   // just ignores it.
-  enum class ActiveDialog { None, LoadBasic, SaveBasic, LoadBinary, SaveBinary, LoadRomModule };
+  enum class ActiveDialog {
+    None,
+    LoadBasic,
+    SaveBasic,
+    LoadBinary,
+    SaveBinary,
+    LoadRomModule,
+    LoadBasicText,
+    SaveBasicText
+  };
   ActiveDialog activeDialog = ActiveDialog::None;
   char filenameBuf[512] = "";
+  // BASIC-text dialogs' multi-line editor -- fixed-size like every other
+  // dialog field here (see kSymbolMap-adjacent style), sized generously
+  // above any realistic PC-1500 program's text-listing length.
+  static constexpr size_t kBasicTextBufSize = 32768;
+  auto basicTextBuf = std::make_unique<char[]>(kBasicTextBufSize);
+  basicTextBuf[0] = '\0';
   char addrBuf[8] = "4600";
   char lenBuf[8] = "100";
   char callAddrBuf[8] = "4000";
@@ -953,10 +1168,10 @@ int main(int argc, char** argv) {
     dialogRenderer = nullptr;
     dialogImguiCtx = nullptr;
   };
-  auto openDialogWindow = [&](const char* title) {
+  auto openDialogWindow = [&](const char* title, int width = 440, int height = 260) {
     closeDialogWindow();  // in case a different dialog was already open
-    dialogWindow = SDL_CreateWindow(title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 440,
-                                     260, SDL_WINDOW_SHOWN);
+    dialogWindow = SDL_CreateWindow(title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, width,
+                                     height, SDL_WINDOW_SHOWN);
     dialogRenderer = SDL_CreateRenderer(dialogWindow, -1, SDL_RENDERER_ACCELERATED);
     dialogImguiCtx = ImGui::CreateContext();
     ImGui::SetCurrentContext(dialogImguiCtx);
@@ -1173,16 +1388,34 @@ int main(int argc, char** argv) {
 
     if (ImGui::BeginMainMenuBar()) {
       if (ImGui::BeginMenu("File")) {
-        auto startDialog = [&](ActiveDialog which, const char* title) {
+        auto startDialog = [&](ActiveDialog which, const char* title, int width = 440,
+                                int height = 260) {
           activeDialog = which;
           filenameBuf[0] = '\0';
           dialogError.clear();
           callAddrTouched = false;
           std::strncpy(callAddrBuf, addrBuf, sizeof(callAddrBuf));
-          openDialogWindow(title);
+          openDialogWindow(title, width, height);
         };
         if (ImGui::MenuItem("Load BASIC...")) startDialog(ActiveDialog::LoadBasic, "Load BASIC");
         if (ImGui::MenuItem("Save BASIC...")) startDialog(ActiveDialog::SaveBasic, "Save BASIC");
+        ImGui::Separator();
+        if (ImGui::MenuItem("Load BASIC Text...")) {
+          startDialog(ActiveDialog::LoadBasicText, "Load BASIC Text", 700, 500);
+          basicTextBuf[0] = '\0';
+        }
+        if (ImGui::MenuItem("Save BASIC Text...")) {
+          startDialog(ActiveDialog::SaveBasicText, "Save BASIC Text", 700, 500);
+          std::string text, saveErr;
+          if (pc1500::basic::detokenizeBasicProgram(readBasicProgramBytes(bus, &saveErr), &text,
+                                                      &saveErr)) {
+            std::strncpy(basicTextBuf.get(), text.c_str(), kBasicTextBufSize - 1);
+            basicTextBuf[kBasicTextBufSize - 1] = '\0';
+          } else {
+            basicTextBuf[0] = '\0';
+            dialogError = saveErr;
+          }
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Load Binary...")) startDialog(ActiveDialog::LoadBinary, "Load Binary");
         if (ImGui::MenuItem("Save Binary...")) startDialog(ActiveDialog::SaveBinary, "Save Binary");
@@ -1245,6 +1478,7 @@ int main(int argc, char** argv) {
       bool isBinary = false;
       bool isLoad = false;
       bool isRomModule = false;
+      bool isBasicText = false;
       switch (activeDialog) {
         case ActiveDialog::LoadBasic:
           actionLabel = "Load";
@@ -1265,6 +1499,15 @@ int main(int argc, char** argv) {
         case ActiveDialog::LoadRomModule:
           actionLabel = "Load";
           isRomModule = true;
+          break;
+        case ActiveDialog::LoadBasicText:
+          actionLabel = "Load";
+          isLoad = true;
+          isBasicText = true;
+          break;
+        case ActiveDialog::SaveBasicText:
+          actionLabel = "Save";
+          isBasicText = true;
           break;
         case ActiveDialog::None:
           break;
@@ -1325,6 +1568,35 @@ int main(int argc, char** argv) {
             romUsePuBank = true;
           }
         }
+        if (isBasicText) {
+          if (isLoad) {
+            ImGui::SameLine();
+            if (ImGui::Button("Load File into Text")) {
+              std::vector<uint8_t> fileData = readFile(filenameBuf);
+              if (fileData.empty()) {
+                dialogError = "Could not read file (or file is empty).";
+              } else {
+                size_t n = std::min(fileData.size(), kBasicTextBufSize - 1);
+                std::memcpy(basicTextBuf.get(), fileData.data(), n);
+                basicTextBuf[n] = '\0';
+              }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Paste from Clipboard")) {
+              const char* clip = ImGui::GetClipboardText();
+              if (clip) {
+                std::strncpy(basicTextBuf.get(), clip, kBasicTextBufSize - 1);
+                basicTextBuf[kBasicTextBufSize - 1] = '\0';
+              }
+            }
+          } else {
+            if (ImGui::Button("Copy to Clipboard")) {
+              ImGui::SetClipboardText(basicTextBuf.get());
+            }
+          }
+          ImGui::InputTextMultiline("##basicText", basicTextBuf.get(), kBasicTextBufSize,
+                                     ImVec2(-1, -60));
+        }
         if (!dialogError.empty()) {
           ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", dialogError.c_str());
         }
@@ -1358,6 +1630,20 @@ int main(int argc, char** argv) {
             case ActiveDialog::LoadRomModule: {
               uint16_t base = static_cast<uint16_t>(strtol(romBaseBuf, nullptr, 16));
               ok = loadRomModule(bus, base, romRequirePv, romUsePuBank, filenameBuf, &dialogError);
+              break;
+            }
+            case ActiveDialog::LoadBasicText:
+              ok = typeBasicProgramText(bus, cpu, basicTextBuf.get(), &dialogError);
+              break;
+            case ActiveDialog::SaveBasicText: {
+              std::ofstream f(filenameBuf, std::ios::binary);
+              if (!f) {
+                dialogError = "Could not open file for writing.";
+                break;
+              }
+              size_t len = std::strlen(basicTextBuf.get());
+              f.write(basicTextBuf.get(), static_cast<std::streamsize>(len));
+              ok = true;
               break;
             }
             case ActiveDialog::None:

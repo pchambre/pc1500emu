@@ -18,4 +18,4 @@ target_include_directories(pc1500emu PRIVATE
   ${IMGUI_DIR} ${IMGUI_DIR}/backends
 )
 target_compile_options(pc1500emu PRIVATE ${SDL2_CFLAGS_OTHER} ${SDL2_TTF_CFLAGS_OTHER})
-target_link_libraries(pc1500emu PRIVATE lh5801cpu pc1500bus pc1500keyboard pc1500lcd ${SDL2_LIBRARIES} ${SDL2_TTF_LIBRARIES})
+target_link_libraries(pc1500emu PRIVATE lh5801cpu pc1500bus pc1500keyboard pc1500lcd pc1500basic ${SDL2_LIBRARIES} ${SDL2_TTF_LIBRARIES})

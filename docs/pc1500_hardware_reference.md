@@ -325,7 +325,7 @@ when that PA line is strobed and that IN line reads active).
 | IN0 | 2 | . | 1 | ) | + | = | ▶ | 3 |
 | IN1 | 5 | - | 4 | L | * | ◄ | MODE | 6 |
 | IN2 | 8 | OFF | 7 | O | / | P | CL | 9 |
-| IN3 | H | S | J | K | D | : | A | G |
+| IN3 | H | S | J | K | D | F | A | G |
 | IN4 | SHIFT | F1 | F5 | F6 | F2 | F3 | DEF | F4 |
 | IN5 | Y | W | U | I | E | R | Q | T |
 | IN6 | N | X | M | ( | C | V | Z | B |
@@ -345,12 +345,18 @@ this list, with two loose ends:
   Possibly it doesn't have a dedicated matrix cell at all (e.g. mapped to
   the same electrical position as `ENT` via a secondary keycap legend);
   unconfirmed.
-- The letter `F` never showed up as its own matrix cell either — only
-  `F1`-`F6`. Likely a secondary legend sharing a keycap with something
-  already placed (mirroring how `F1`-`F6` themselves visually share
-  keycaps with the digit/`SHIFT`/`SML` row per the manual's separate
-  "key code chart"), rather than a distinct 65th position that a strict
-  8×8=64 matrix couldn't have anyway.
+- The letter `F` **is IN3/PA5** — corrected 2026-07-30, found via
+  `pc1500emu`'s own text-entry keystroke simulation typing `F` as `O`
+  instead (this cell's `Keyboard`/`Bus` code had `Colon` here, an earlier
+  mistranscription). Confirmed against the clearer key-matrix diagram in
+  the *PC-2 Service Manual*, p.19 (PDF p.22, "6. KEY & POWER SUPPLY
+  CIRCUIT"), which plainly shows `F` at IN3/PA5 with no secondary legend
+  drawn there at all -- so this was a straightforward misread of the
+  PC-1500 Technical Reference Manual's own (lower-resolution) matrix
+  diagram, not a shared-keycap situation. `:` is not a distinct matrix
+  cell -- it's the Shift-tapped meaning of the `*` key (IN1/PA4), per
+  `charToTapActions`/`kSymbolMap` in `src/host/main.cpp`, unrelated to
+  this position.
 
 **Three-column digit pad**: PA0, PA2, and PA7 each step by 3 down rows
 IN0-IN2 (PA2: `1,4,7`; PA0: `2,5,8`; PA7: `3,6,9`) — the classic

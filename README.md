@@ -91,6 +91,17 @@ native OS menu) sits above the display:
   to the `FFH` end marker (see `findBasicProgramEnd()` in `main.cpp` and
   `docs/pc1500_hardware_reference.md`'s reserve-area note) — matches real
   `CLOAD`/`CSAVE` (without `M`) semantics, no address/length needed.
+- **File > Load/Save BASIC Text...** — a BASIC program as a plain-text
+  listing (e.g. a magazine transcription), rather than the tokenized
+  binary format above. *Load* drives the ROM's own line editor via
+  simulated keystrokes (so it's the real ROM tokenizing, not a
+  reimplementation) — type or paste a listing into the text box, or load
+  it from a file first, then click Load; any line the ROM doesn't accept
+  is reported by number/content rather than silently dropped. *Save*
+  detokenizes the current program into the text box using this project's
+  own keyword table (`src/basic/`); its spacing is our own readable
+  convention, not necessarily byte-for-byte identical to a real device's
+  `LIST` output. Either box can be copied to/from the clipboard.
 - **File > Load/Save Binary...** — a raw `[address, address+length)` ME0
   byte range plus a filename, matching real `CLOAD M`/`CSAVE M` semantics.
   Load has an optional "call after load" checkbox (sets the CPU's `P`
@@ -143,6 +154,12 @@ Commands:
 - `savebasic <path>` / `loadbasic <path>` / `savebinary <addr> <len> <path>`
   / `loadbinary <addr> <path>` — the same functions the File menu's dialogs
   call, invokable directly without going through the GUI.
+- `savebasictext <path>` / `loadbasictext <path>` — the text-listing
+  equivalents. `loadbasictext` drives the ROM's line editor internally (see
+  File menu section above) by stepping CPU/bus cycles directly rather than
+  the real-time `type`/`key` queue, so it completes in well under a second
+  regardless of program size; a returned `ERROR: N line(s) rejected...`
+  lists which lines the ROM didn't accept.
 - `call <addr>` — sets the CPU's `P` register directly (hex address).
 - `presskey <name>` / `releasekey <name>` — direct, synchronous key
   press/release (same names as `key`), bypassing the queue `type`/`key`

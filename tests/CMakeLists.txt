@@ -17,3 +17,7 @@ add_test(NAME lcd_test COMMAND lcd_test)
 add_executable(keyboard_test keyboard_test.cpp)
 target_link_libraries(keyboard_test PRIVATE pc1500keyboard)
 add_test(NAME keyboard_test COMMAND keyboard_test)
+
+add_executable(basic_text_test basic_text_test.cpp)
+target_link_libraries(basic_text_test PRIVATE pc1500basic)
+add_test(NAME basic_text_test COMMAND basic_text_test)
