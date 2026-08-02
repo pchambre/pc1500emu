@@ -143,10 +143,62 @@ constexpr int kCyclesPerTimerTick = 8;
 // interpreting Shift+X combinations is the ROM's job, not ours. Where
 // there's no natural 1:1 host key, a reasonable nearby substitute is
 // picked (documented inline).
+//
+// **Update, 2026-08-02: "maps directly" is no longer literally true for
+// ordinary text-producing keys.** A human typing on the host keyboard can
+// release one key and press the next with far less gap than the ROM's
+// own per-key dispatch settle time requires (see kIdleFrames's comment
+// below) -- confirmed by Paul: typing "PRINT" quickly on the host often
+// only registers as "PT" or "PI" in the emulator, while the *exact same*
+// timing-controlled synthetic typing (typeImmediateLine, this file) never
+// drops a character. Real hardware doesn't have this problem because a
+// physical keyboard's natural travel time already exceeds the ROM's own
+// requirement; a modern host keyboard/OS event stream can report a
+// press/release cadence far faster than that. Fix: ordinary keys
+// (letters/digits/space/punctuation) are queued through the same
+// fire-and-forget symbolActionQueue mechanism kSymbolMap already uses
+// (see isImmediateHostKey below for the keys deliberately excluded from
+// this and kept as direct, zero-latency passthrough instead).
 struct KeyMapping {
   SDL_Keycode keycode;
   pc1500::Key key;
 };
+
+// Keys that must stay direct/immediate host-state passthrough rather than
+// being queued through symbolActionQueue like ordinary text keys (see the
+// kKeyMap comment above). Per Paul: cursor keys need to feel live for
+// rollover/repeat (already governed by their own, separate
+// kCursorRepeatCycles mechanism in Bus::advanceCycles -- queuing them here
+// too would fight that), and Cl/Off need to respond instantly (e.g.
+// interrupting a running program) rather than sitting behind a queued
+// tap's own settle delay. Extended to the other non-text control keys
+// (Ent, Shift, Mode, Def, Rcl, F1-F6) on the same reasoning -- none of
+// them are part of the "type text quickly" scenario this fix targets, and
+// delaying their press edge behind a queue has no upside.
+bool isImmediateHostKey(pc1500::Key k) {
+  switch (k) {
+    case pc1500::Key::Left:
+    case pc1500::Key::Right:
+    case pc1500::Key::Up:
+    case pc1500::Key::Down:
+    case pc1500::Key::Cl:
+    case pc1500::Key::Off:
+    case pc1500::Key::Ent:
+    case pc1500::Key::Shift:
+    case pc1500::Key::Mode:
+    case pc1500::Key::Def:
+    case pc1500::Key::Rcl:
+    case pc1500::Key::F1:
+    case pc1500::Key::F2:
+    case pc1500::Key::F3:
+    case pc1500::Key::F4:
+    case pc1500::Key::F5:
+    case pc1500::Key::F6:
+      return true;
+    default:
+      return false;
+  }
+}
 
 // clang-format off
 constexpr KeyMapping kKeyMap[] = {
@@ -1772,7 +1824,23 @@ int main(int argc, char** argv) {
           if (!handledBySymbolMap) {
             for (const KeyMapping& m : kKeyMap) {
               if (m.keycode == kc) {
-                bus.setKeyState(m.key, pressed);
+                if (isImmediateHostKey(m.key)) {
+                  bus.setKeyState(m.key, pressed);
+                } else if (pressed) {
+                  // Ordinary text key: queue a fire-and-forget tap
+                  // (see kKeyMap's comment above) instead of reflecting
+                  // host press/release directly -- guarantees the ROM's
+                  // own minimum settle gap between keys regardless of how
+                  // fast the host reports them. Ignore OS key-repeat
+                  // (a long host hold) so it doesn't flood the queue.
+                  if (!event.key.repeat) {
+                    symbolActionQueue.push_back({m.key, true, kTapFrames});
+                    symbolActionQueue.push_back({m.key, false, kIdleFrames});
+                  }
+                }
+                // Release of a queued key: nothing to do -- the queued
+                // release above already governs timing independently of
+                // when the host key physically comes up.
                 break;
               }
             }
