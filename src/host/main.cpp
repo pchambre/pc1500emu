@@ -119,10 +119,23 @@ constexpr int16_t kBuzzerAmplitude = 8000;
 // at one static value decays to silence within ~50ms.
 constexpr double kBuzzerDcBlockAlpha = 2.0 * 3.14159265358979323846 * 20.0 / kAudioSampleRate;
 
-// Timer tick rate: approximated as machine-cycle/64, by analogy with the
-// PC-2's documented crystal/128 divider (see lh5801::CPU::tickTimer's
-// comment) -- not confirmed for the PC-1500's own divider depth.
-constexpr int kCyclesPerTimerTick = 64;
+// Timer tick rate, calibrated 2026-08-02 against the real PC-1500's
+// observed edit-cursor blink rate (visible by typing a char then pressing
+// Left to move the cursor back over it): Paul timed 10 real-hardware
+// blinks at 8 seconds. The old machine-cycle/64 guess (borrowed by
+// analogy from the PC-2 manual's crystal/128 divider, itself based on a
+// wrong 4MHz-crystal assumption -- both machines actually share the same
+// 2.6MHz crystal/1.3MHz CPU clock) produced a visibly too-slow blink
+// (measured ~2s/toggle, i.e. ~4s full cycle, 5x too slow). Bisected live
+// against the running emulator (64 -> 13 -> 11 -> 10 -> 9 -> 8), each
+// step timed the same way: 9 was a hair slow, 8 a hair fast, both within
+// stopwatch precision of correct. Chose 8 -- a power-of-two divider is
+// far more plausible in real silicon than 9, and it also errs in the
+// direction that helps keyboard-dispatch responsiveness (a separate,
+// related fix) rather than against it. See
+// [[pc1500_keyword_table_mechanism]] for the full process, including a
+// machine-cycle/1 dead end that was visibly too fast.
+constexpr int kCyclesPerTimerTick = 8;
 
 // SDL keycode -> PC-1500 matrix key. Host physical key state maps directly
 // to PC-1500 physical key state (ignoring host shift/modifiers) since the
@@ -224,10 +237,29 @@ constexpr KeyMapping kKeyMap[] = {
 // simultaneously with another key. Simulating a hold instead (as a
 // modern keyboard's Shift works) breaks things: the ROM's key-scan
 // would see "Shift alone" as its own key event the instant host Shift
-// goes down, *before* the target key arrives, which latches the same
+// goes down, *before* the target key arrives, which used to latch a
 // ~0.2s "a key was just processed" debounce window we traced for
-// MODE/CL -- and that window is well within normal Shift+key typing
-// speed, so it swallows the target key's press entirely.
+// MODE/CL -- well within normal Shift+key typing speed, so it swallowed
+// the target key's press entirely.
+//
+// **Update, 2026-08-02: the real root cause was found and fixed --
+// kCyclesPerTimerTick (below) was wrong by 8x.** The ROM's own 7B0EH
+// key-dispatch gate fix (linear -> real 9-bit polynomial timer, see
+// lh5801_timer_table.h) was necessary but not sufficient: it fixed
+// BASWORD's resident keyboard-hook, but a second ~230ms cliff remained in
+// kIdleFrames (14 frames registered reliably, 13 failed reliably) that
+// didn't budge. That ~230ms turned out to be the real ROM's own 8-period
+// debounce countdown (E260H-E370H in ROM1.BIN, called from BASIC's
+// keyboard-polling mainline at DC7BH) running at the WRONG rate, because
+// kCyclesPerTimerTick was carrying an unconfirmed guess (borrowed from
+// the PC-2 manual's crystal/128 divider, itself based on a wrong
+// 4MHz-crystal assumption for the PC-2 -- both machines actually share
+// the same 2.6MHz crystal/1.3MHz CPU clock). Calibrated live against
+// Paul's real-hardware edit-cursor blink-rate measurement (10 blinks in
+// 8 seconds) instead: the correct divider is 8, not 64. With that fixed,
+// kIdleFrames could finally shrink for real -- see its own comment below.
+// See [[pc1500_keyword_table_mechanism]] in memory for the full
+// calibration process.
 //
 // So each symbol is fired as a queued, fire-and-forget sequence of
 // PC-1500 key actions (see QueuedKeyAction/kSymbolActionQueue below),
@@ -235,14 +267,9 @@ constexpr KeyMapping kKeyMap[] = {
 //   1. Press PC-1500 Shift, hold for kTapFrames (long enough for one
 //      ROM scan cycle to see it as its own event).
 //   2. Release Shift, then wait *idle* (nothing pressed) for
-//      kIdleFrames -- confirmed empirically that this is what actually
-//      matters: the debounce counter only advances while nothing is
-//      pressed, so it's the gap *after* release that has to clear the
-//      ~0.2s (~260,000-cycle) window, not the hold duration. (Real
-//      hardware needs no such delay at all -- Shift stays lit
-//      indefinitely -- so this points at a real, still-unresolved bug
-//      in our own debounce logic; this queue is a working workaround,
-//      not a fix for that deeper issue.)
+//      kIdleFrames -- see the empirical cliff described above; this is
+//      not a "one scan period" margin, there's a real, larger constraint
+//      still not fully understood.
 //   3. Press the target key, hold for kTapFrames, then release.
 // Firing this as a queue (rather than tracking per-key held/released
 // state) also fixes an earlier, more serious bug: since a normal human
@@ -262,8 +289,11 @@ constexpr KeyMapping kKeyMap[] = {
 // unshifted (also via a PC-1500 Shift tap, just a different base key)
 // rather than falling through, since the PC-1500 has no plain "," or
 // ";" key of its own.
-constexpr int kTapFrames = 4;    // ~67ms -- spans the ROM's ~25ms scan cadence
-constexpr int kIdleFrames = 15;  // ~250ms -- clears the ~0.2s debounce window
+constexpr int kTapFrames = 4;   // ~67ms -- spans the ROM's ~25ms scan cadence
+constexpr int kIdleFrames = 4;  // ~67ms -- empirically bisected minimum (2026-08-02, after
+                                 // fixing kCyclesPerTimerTick, see the comment above) that
+                                 // still reliably registers BASWORD keywords; 3 fails
+                                 // reliably. Down from 14 (~233ms) before that fix.
 struct SymbolMapping {
   SDL_Keycode keycode;
   pc1500::Key shiftedTarget;     // host Shift+keycode -> PC-1500 Shift-tap then this
@@ -479,6 +509,22 @@ bool nameToKey(std::string name, pc1500::Key* out) {
   for (const auto& [n, k] : kNames) {
     if (name == n) {
       *out = k;
+      return true;
+    }
+  }
+  // Plain single letters/digits, for precise presskey/releasekey timing
+  // control in scripted tests (added 2026-08-02 -- see
+  // [[pc1500_keyword_table_mechanism]] for why this was needed: without
+  // it, `presskey <letter>` silently no-ops, which had been invalidating
+  // several earlier isolated-key timing measurements this session).
+  if (name.size() == 1) {
+    char c = name[0];
+    if (c >= 'a' && c <= 'z') {
+      *out = static_cast<pc1500::Key>(static_cast<int>(pc1500::Key::A) + (c - 'a'));
+      return true;
+    }
+    if (c >= '0' && c <= '9') {
+      *out = static_cast<pc1500::Key>(static_cast<int>(pc1500::Key::Digit0) + (c - '0'));
       return true;
     }
   }
@@ -828,13 +874,127 @@ bool typeImmediateLine(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& li
   return true;
 }
 
-// Same proven typing path as typeImmediateLine, but continues stepping
-// for traceCycles after Enter with instruction-level tracing turned on --
-// so the dispatch triggered by Enter is captured without ever leaving the
-// exact code path that's known to work (unlike reconstructing the
-// press/release/settle sequence via separate FIFO commands, which drifts
-// out of sync with typeImmediateLine's own timer-tick phase and key-hold
-// timing).
+// Diagnostic variant of typeImmediateLine: every character uses the
+// normal kIdleFrames wait after release EXCEPT the character at
+// `shortIdlePos` (0-based index into `line`; -1 = none), which uses
+// `shortIdleFrames` instead. Enter always uses the normal kIdleFrames.
+// For isolating *which* keystroke transition is sensitive to a short
+// idle gap, rather than just bisecting the uniform value -- see
+// [[pc1500_keyword_table_mechanism]] for why this matters (kIdleFrames
+// has a sharp 13-vs-14-frame cliff not explained by the already-fixed
+// 7B0EH gate).
+bool typeImmediateLinePartialIdle(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& line,
+                                   int shortIdlePos, int shortIdleFrames, std::string* error) {
+  int cyclesSinceTimerTick = 0;
+  auto stepCycles = [&](long cycles) {
+    for (long i = 0; i < cycles;) {
+      int c = cpu.step();
+      int used = (c > 0) ? c : 1;
+      i += used;
+      cyclesSinceTimerTick += used;
+      bus.advanceCycles(used);
+      while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+        cpu.tickTimer();
+        cyclesSinceTimerTick -= kCyclesPerTimerTick;
+      }
+    }
+  };
+  auto runKeyAction = [&](const QueuedKeyAction& action) {
+    bus.setKeyState(action.key, action.pressed);
+    stepCycles(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
+  };
+  for (size_t idx = 0; idx < line.size(); idx++) {
+    std::deque<QueuedKeyAction> actions;
+    if (!charToTapActions(line[idx], &actions)) {
+      *error = "no keystroke mapping for character '" + std::string(1, line[idx]) + "'";
+      return false;
+    }
+    int idleOverride = (shortIdlePos == -2 || static_cast<int>(idx) == shortIdlePos) ? shortIdleFrames : kIdleFrames;
+    for (size_t ai = 0; ai < actions.size(); ai++) {
+      QueuedKeyAction action = actions[ai];
+      // Only the FINAL release action in this character's sequence is the
+      // "idle gap before the next character" -- override just that one.
+      if (!action.pressed && ai + 1 == actions.size()) action.framesToWait = idleOverride;
+      runKeyAction(action);
+    }
+  }
+  runKeyAction({pc1500::Key::Ent, true, kTapFrames});
+  runKeyAction({pc1500::Key::Ent, false, kIdleFrames});
+  return true;
+}
+
+// Same as typeImmediateLinePartialIdle, but starts instruction tracing
+// right after shortIdlePos's character is released (i.e. for the short
+// gap itself and the following `tailChars` characters), to directly
+// observe what happens during/after the sensitive transition.
+bool typeImmediateLinePartialIdleTraced(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& line,
+                                         int shortIdlePos, int shortIdleFrames, int tailChars,
+                                         std::string* error, std::string* traceOut) {
+  int cyclesSinceTimerTick = 0;
+  std::ostringstream out;
+  bool tracing = false;
+  int charsTracedSince = 0;
+  auto stepCyclesMaybeTraced = [&](long cycles) {
+    for (long i = 0; i < cycles;) {
+      uint16_t pBefore = tracing ? cpu.p() : 0;
+      uint8_t op = tracing ? bus.readME0(pBefore) : 0;
+      int c = cpu.step();
+      int used = (c > 0) ? c : 1;
+      i += used;
+      cyclesSinceTimerTick += used;
+      bus.advanceCycles(used);
+      while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+        cpu.tickTimer();
+        cyclesSinceTimerTick -= kCyclesPerTimerTick;
+      }
+      if (tracing) {
+        out << std::hex << std::uppercase;
+        out.width(4); out.fill('0'); out << pBefore << " ";
+        out.width(2); out.fill('0'); out << static_cast<int>(op) << " A=";
+        out.width(2); out.fill('0'); out << static_cast<int>(cpu.a()) << " X=";
+        out.width(4); out.fill('0'); out << cpu.x() << " Y=";
+        out.width(4); out.fill('0'); out << cpu.y() << " U=";
+        out.width(4); out.fill('0'); out << cpu.u() << " 7B0E=";
+        out.width(2); out.fill('0'); out << static_cast<int>(bus.readME0(0x7B0E)) << "\n";
+      }
+    }
+  };
+  auto runKeyAction = [&](const QueuedKeyAction& action) {
+    bus.setKeyState(action.key, action.pressed);
+    stepCyclesMaybeTraced(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
+  };
+  for (size_t idx = 0; idx < line.size(); idx++) {
+    std::deque<QueuedKeyAction> actions;
+    if (!charToTapActions(line[idx], &actions)) {
+      *error = "no keystroke mapping for character '" + std::string(1, line[idx]) + "'";
+      return false;
+    }
+    int idleOverride = (shortIdlePos == -2 || static_cast<int>(idx) == shortIdlePos) ? shortIdleFrames : kIdleFrames;
+    for (size_t ai = 0; ai < actions.size(); ai++) {
+      QueuedKeyAction action = actions[ai];
+      if (!action.pressed && ai + 1 == actions.size()) action.framesToWait = idleOverride;
+      runKeyAction(action);
+    }
+    if (static_cast<int>(idx) == shortIdlePos) tracing = true;
+    if (tracing) {
+      charsTracedSince++;
+      if (charsTracedSince > tailChars) break;
+    }
+  }
+  *traceOut = out.str();
+  return true;
+}
+
+// Same proven typing path as typeImmediateLine, but the Enter press,
+// its release/settle wait, and traceCycles beyond that are ALL traced as
+// one continuous window -- not just the cycles after Enter's settle
+// period. Earlier versions of this traced only after the settle delay
+// and missed fast-resolving dispatches entirely (confirmed: a command
+// that fully executes within Enter's own kTapFrames+kIdleFrames settle,
+// e.g. PRINT 1+1, showed the correct result on screen but zero relevant
+// addresses in the trace -- the interesting execution had already
+// finished before tracing started). Typing itself (before Enter) is
+// still untraced, on the same proven code path as typeImmediateLine.
 bool typeImmediateLineWithTrace(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& line,
                                  long traceCycles, std::string* error, std::string* traceOut) {
   int cyclesSinceTimerTick = 0;
@@ -863,9 +1023,33 @@ bool typeImmediateLineWithTrace(pc1500::Bus& bus, lh5801::CPU& cpu, const std::s
     }
     for (const QueuedKeyAction& action : actions) runKeyAction(action);
   }
-  runKeyAction({pc1500::Key::Ent, true, kTapFrames});
-  runKeyAction({pc1500::Key::Ent, false, kIdleFrames});
   std::ostringstream out;
+  auto traceStepCycles = [&](long cycles) {
+    for (long i = 0; i < cycles;) {
+      uint16_t pBefore = cpu.p();
+      uint8_t op = bus.readME0(pBefore);
+      int c = cpu.step();
+      int used = (c > 0) ? c : 1;
+      i += used;
+      cyclesSinceTimerTick += used;
+      bus.advanceCycles(used);
+      while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+        cpu.tickTimer();
+        cyclesSinceTimerTick -= kCyclesPerTimerTick;
+      }
+      out << std::hex << std::uppercase;
+      out.width(4); out.fill('0'); out << pBefore << " ";
+      out.width(2); out.fill('0'); out << static_cast<int>(op) << " A=";
+      out.width(2); out.fill('0'); out << static_cast<int>(cpu.a()) << " X=";
+      out.width(4); out.fill('0'); out << cpu.x() << " Y=";
+      out.width(4); out.fill('0'); out << cpu.y() << " U=";
+      out.width(4); out.fill('0'); out << cpu.u() << "\n";
+    }
+  };
+  bus.setKeyState(pc1500::Key::Ent, true);
+  traceStepCycles(static_cast<long>(kTapFrames) * kCyclesPerFrame);
+  bus.setKeyState(pc1500::Key::Ent, false);
+  traceStepCycles(static_cast<long>(kIdleFrames) * kCyclesPerFrame);
   long i = 0;
   while (i < traceCycles) {
     uint16_t pBefore = cpu.p();
@@ -1191,6 +1375,31 @@ int main(int argc, char** argv) {
       std::string error;
       bool ok = typeImmediateLine(bus, cpu, line, &error, /*pressEnter=*/false);
       writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "typelinepartialidle") {
+      // <shortIdlePos decimal> <shortIdleFrames decimal> <text>
+      long pos = 0, frames = 0;
+      iss >> std::dec >> pos >> frames;
+      std::string line;
+      std::getline(iss, line);
+      size_t start = line.find_first_not_of(' ');
+      if (start != std::string::npos) line = line.substr(start);
+      std::string error;
+      bool ok = typeImmediateLinePartialIdle(bus, cpu, line, static_cast<int>(pos),
+                                              static_cast<int>(frames), &error);
+      writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "typelinepartialidletrace") {
+      // <shortIdlePos decimal> <shortIdleFrames decimal> <tailChars decimal> <text>
+      long pos = 0, frames = 0, tailChars = 0;
+      iss >> std::dec >> pos >> frames >> tailChars;
+      std::string line;
+      std::getline(iss, line);
+      size_t start = line.find_first_not_of(' ');
+      if (start != std::string::npos) line = line.substr(start);
+      std::string error, trace;
+      bool ok = typeImmediateLinePartialIdleTraced(bus, cpu, line, static_cast<int>(pos),
+                                                    static_cast<int>(frames),
+                                                    static_cast<int>(tailChars), &error, &trace);
+      writeResponse(ok ? trace : ("ERROR: " + error));
     } else if (cmd == "loadbasictext") {
       std::string path;
       iss >> path;
