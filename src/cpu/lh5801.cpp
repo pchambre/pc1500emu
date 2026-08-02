@@ -2,6 +2,8 @@
 // Version 2.0 -- see LICENSE.
 #include "lh5801.h"
 
+#include "lh5801_timer_table.h"
+
 // Every opcode byte, addressing mode, and flag-effect below is taken from
 // docs/lh5801_opcode_reference.md. Comments below only note the handful of
 // places where that doc itself flags an assumption or open question.
@@ -31,6 +33,7 @@ void CPU::reset() {
   bus_.setPv(false);
   miPending_ = nmiPending_ = timerInterruptPending_ = false;
   timerCounter_ = 0;
+  timerStep_ = 0;
   // "The contents of the address FFFEH are transferred to the PH register
   // and the contents of FFFFH to the PL register." (manual 2-3-3 Reset)
   uint8_t hi = bus_.readME0(0xFFFE);
@@ -39,8 +42,18 @@ void CPU::reset() {
 }
 
 void CPU::tickTimer() {
-  timerCounter_ = static_cast<uint16_t>((timerCounter_ + 1) & 0x1FF);
+  // 0x000 is the LFSR's fixed point (XOR-of-zeros is always zero) -- real
+  // hardware parks here forever until AM0/AM1 loads a nonzero value, per
+  // the TRM's own "the timer has to be set to 000H when it is not used".
+  if (timerCounter_ == 0) return;
+  timerStep_ = (timerStep_ + 1) % 511;
+  timerCounter_ = kPolyCounterTable[timerStep_];
   if (timerCounter_ == 0x1FF) timerInterruptPending_ = true;
+}
+
+void CPU::setTimerCounter(uint16_t v) {
+  timerCounter_ = v;
+  if (v != 0) timerStep_ = kPolyCounterReverse[v];
 }
 
 // Entry sequence for MI/NMI/timer interrupts. Derived from RTI's documented
@@ -700,8 +713,8 @@ void CPU::execFD(uint8_t opcode, int& cycles) {
     case 0xAA: { a_ = packFlags(); flags_.z = (a_ == 0); cycles = 9; break; }
 
     // ---- AM0 / AM1: load the 9-bit timer counter from A ----
-    case 0xCE: timerCounter_ = static_cast<uint16_t>(a_); cycles = 9; break;        // AM0: MSB=0
-    case 0xDE: timerCounter_ = static_cast<uint16_t>(a_ | 0x100); cycles = 9; break; // AM1: MSB=1
+    case 0xCE: setTimerCounter(static_cast<uint16_t>(a_)); cycles = 9; break;         // AM0: MSB=0
+    case 0xDE: setTimerCounter(static_cast<uint16_t>(a_ | 0x100)); cycles = 9; break; // AM1: MSB=1
 
     // ---- ATP: output port hardware not modeled yet ----
     case 0xCC: cycles = 9; break;

@@ -318,6 +318,20 @@ class Bus : public lh5801::MemoryBus {
   void unloadRomModule() { module_ = RomModule{}; }
   bool romModuleLoaded() const { return !module_.data.empty(); }
 
+  // Second, independent module slot -- e.g. testing a candidate PSoC-style
+  // card concurrently with a real CE-158 dump, one per PV level, both
+  // answering in 0x8000-0xBFFF at once. Same semantics as the primary slot
+  // above, just a second instance so the two don't clobber each other.
+  void loadRomModule2(const uint8_t* data, size_t size, uint16_t base, bool requirePv,
+                       bool usePuBank) {
+    module2_.data.assign(data, data + size);
+    module2_.base = base;
+    module2_.requirePv = requirePv;
+    module2_.usePuBank = usePuBank;
+  }
+  void unloadRomModule2() { module2_ = RomModule{}; }
+  bool romModule2Loaded() const { return !module2_.data.empty(); }
+
   // Forwarded from the CPU's own SPU/RPU/SPV/RPV opcode handlers (see
   // lh5801.cpp) -- Bus is the single source of truth for the *current*
   // pin level a module ROM read sees, since the CPU has no other reason
@@ -349,29 +363,28 @@ class Bus : public lh5801::MemoryBus {
   void setExtRam0000Size(size_t bytes) { extRam0000Size_ = bytes; }
   size_t extRam0000Size() const { return extRam0000Size_; }
 
-  // Wraps Keyboard::setKeyState with two hardware-behavior fixes confirmed
-  // on real PC-1500 hardware (extensive testing this session):
+  // Wraps Keyboard::setKeyState. The actual release is deferred by
+  // kMinimumHoldCycles (see applyRelease) rather than applied immediately,
+  // so a host keypress briefer than one ROM timer-interrupt period can't
+  // go all the way down and back up between two keyboard scans without
+  // any scan ever seeing it.
   //
-  // 1. Releasing a non-cursor key, with nothing else held, makes the
-  //    machine ready for the *next* keypress immediately -- no perceptible
-  //    delay, even typing several keys a second. The ROM's own
-  //    key-dispatch state machine (RAM flag at 7B0EH bit 0, traced in
-  //    detail via disassembly) only clears that flag after an
-  //    ~8-timer-period software countdown, which doesn't match observed
-  //    hardware behavior for ordinary keys; cursor keys (used for
-  //    typematic-style rollover while held, confirmed at ~5/sec -- see
-  //    advanceCycles) are the one case that countdown does seem to
-  //    legitimately govern. We couldn't find or reproduce whatever the
-  //    real fast-path mechanism is (possibly hardware-level, per the PC-2
-  //    manual's vague "key input routine" MPU function), so this forces
-  //    the observed outcome directly: clear 7B0EH bit 0 the moment a
-  //    non-cursor release leaves nothing held.
-  //
-  // 2. The actual release is deferred by kMinimumHoldCycles (see
-  //    applyRelease) rather than applied immediately, so a host keypress
-  //    briefer than one ROM timer-interrupt period can't go all the way
-  //    down and back up between two keyboard scans without any scan ever
-  //    seeing it.
+  // History, worth keeping in mind if key responsiveness ever looks wrong
+  // again: this used to *also* force-clear the ROM's key-dispatch gate
+  // (RAM flag at 7B0EH bit 0) the instant a non-cursor release left
+  // nothing held, because that flag's own ~8-timer-period software
+  // countdown didn't match observed real-hardware responsiveness (typing
+  // several keys a second with no perceptible delay). That was
+  // compensating for a real bug, not a genuine hardware quirk: the CPU
+  // timer was modeled as a linear counter instead of the real 9-bit
+  // *polynomial* one (see lh5801_timer_table.h; fixed 2026-08-02). With
+  // the correct polynomial sequence, the ROM's own countdown clears the
+  // gate on its own within a few thousand cycles -- the force-clear was
+  // removed once this was confirmed, and confirmed *necessary* to remove:
+  // it had been silently breaking BASWORD's own keyboard-hook timing
+  // (see [[pc1500_keyword_table_mechanism]] in memory for the full story
+  // -- `BASWORD +"name";"..."` only started actually registering new
+  // keywords once this force-clear was gone).
   void setKeyState(Key key, bool pressed);
 
   // Drives cursor-key rollover and deferred key releases (see
@@ -433,6 +446,7 @@ class Bus : public lh5801::MemoryBus {
   size_t extRam4800Size_ = 0;
   size_t extRam0000Size_ = 0;
   RomModule module_;
+  RomModule module2_;
   bool pv_ = false;  // matches CPU::reset()'s own pv_/pu_ default
   bool pu_ = false;
 

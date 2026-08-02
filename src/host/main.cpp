@@ -524,6 +524,22 @@ bool loadRomModule(pc1500::Bus& bus, uint16_t base, bool requirePv, bool usePuBa
   return true;
 }
 
+// Second, independent module slot -- see Bus::loadRomModule2's own comment.
+bool loadRomModule2(pc1500::Bus& bus, uint16_t base, bool requirePv, bool usePuBank,
+                     const char* path, std::string* error) {
+  std::vector<uint8_t> data = readFile(path);
+  if (data.empty()) {
+    *error = "Could not read file (or file is empty).";
+    return false;
+  }
+  if (usePuBank && (data.size() % 2) != 0) {
+    *error = "PU-banked module ROM must have an even size (split into two equal banks).";
+    return false;
+  }
+  bus.loadRomModule2(data.data(), data.size(), base, requirePv, usePuBank);
+  return true;
+}
+
 bool saveBinary(pc1500::Bus& bus, uint16_t addr, uint32_t len, const char* path, std::string* error) {
   if (len == 0) {
     *error = "Length must be greater than 0.";
@@ -771,6 +787,110 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
   return true;
 }
 
+// Types a single line via direct cycle-stepping (same technique as
+// typeBasicProgramText -- reliable regardless of real-frame pacing) and
+// presses Enter, without typeBasicProgramText's NEW0/full-replace
+// preamble. For driving one-off immediate-mode commands (e.g. testing a
+// BASWORD registration command) where wiping the program area first
+// isn't wanted.
+bool typeImmediateLine(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& line,
+                        std::string* error, bool pressEnter = true) {
+  int cyclesSinceTimerTick = 0;
+  auto stepCycles = [&](long cycles) {
+    for (long i = 0; i < cycles;) {
+      int c = cpu.step();
+      int used = (c > 0) ? c : 1;
+      i += used;
+      cyclesSinceTimerTick += used;
+      bus.advanceCycles(used);
+      while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+        cpu.tickTimer();
+        cyclesSinceTimerTick -= kCyclesPerTimerTick;
+      }
+    }
+  };
+  auto runKeyAction = [&](const QueuedKeyAction& action) {
+    bus.setKeyState(action.key, action.pressed);
+    stepCycles(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
+  };
+  for (char c : line) {
+    std::deque<QueuedKeyAction> actions;
+    if (!charToTapActions(c, &actions)) {
+      *error = "no keystroke mapping for character '" + std::string(1, c) + "'";
+      return false;
+    }
+    for (const QueuedKeyAction& action : actions) runKeyAction(action);
+  }
+  if (pressEnter) {
+    runKeyAction({pc1500::Key::Ent, true, kTapFrames});
+    runKeyAction({pc1500::Key::Ent, false, kIdleFrames});
+  }
+  return true;
+}
+
+// Same proven typing path as typeImmediateLine, but continues stepping
+// for traceCycles after Enter with instruction-level tracing turned on --
+// so the dispatch triggered by Enter is captured without ever leaving the
+// exact code path that's known to work (unlike reconstructing the
+// press/release/settle sequence via separate FIFO commands, which drifts
+// out of sync with typeImmediateLine's own timer-tick phase and key-hold
+// timing).
+bool typeImmediateLineWithTrace(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& line,
+                                 long traceCycles, std::string* error, std::string* traceOut) {
+  int cyclesSinceTimerTick = 0;
+  auto stepCycles = [&](long cycles) {
+    for (long i = 0; i < cycles;) {
+      int c = cpu.step();
+      int used = (c > 0) ? c : 1;
+      i += used;
+      cyclesSinceTimerTick += used;
+      bus.advanceCycles(used);
+      while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+        cpu.tickTimer();
+        cyclesSinceTimerTick -= kCyclesPerTimerTick;
+      }
+    }
+  };
+  auto runKeyAction = [&](const QueuedKeyAction& action) {
+    bus.setKeyState(action.key, action.pressed);
+    stepCycles(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
+  };
+  for (char c : line) {
+    std::deque<QueuedKeyAction> actions;
+    if (!charToTapActions(c, &actions)) {
+      *error = "no keystroke mapping for character '" + std::string(1, c) + "'";
+      return false;
+    }
+    for (const QueuedKeyAction& action : actions) runKeyAction(action);
+  }
+  runKeyAction({pc1500::Key::Ent, true, kTapFrames});
+  runKeyAction({pc1500::Key::Ent, false, kIdleFrames});
+  std::ostringstream out;
+  long i = 0;
+  while (i < traceCycles) {
+    uint16_t pBefore = cpu.p();
+    uint8_t op = bus.readME0(pBefore);
+    int c = cpu.step();
+    int used = (c > 0) ? c : 1;
+    i += used;
+    cyclesSinceTimerTick += used;
+    bus.advanceCycles(used);
+    while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+      cpu.tickTimer();
+      cyclesSinceTimerTick -= kCyclesPerTimerTick;
+    }
+    out << std::hex << std::uppercase;
+    out.width(4); out.fill('0'); out << pBefore << " ";
+    out.width(2); out.fill('0'); out << static_cast<int>(op) << " A=";
+    out.width(2); out.fill('0'); out << static_cast<int>(cpu.a()) << " X=";
+    out.width(4); out.fill('0'); out << cpu.x() << " Y=";
+    out.width(4); out.fill('0'); out << cpu.y() << " U=";
+    out.width(4); out.fill('0'); out << cpu.u() << "\n";
+  }
+  *traceOut = out.str();
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -963,6 +1083,27 @@ int main(int argc, char** argv) {
       long addr = 0, val = 0;
       iss >> std::hex >> addr >> val;
       bus.writeME0(static_cast<uint16_t>(addr), static_cast<uint8_t>(val));
+    } else if (cmd == "reset") {
+      // Same as Ctrl+F12 -- re-runs CPU::reset() without touching RAM.
+      // Needed after setextram: the ROM only detects installed extension
+      // RAM size at reset/cold-start (see README's "adding RAM" note), not
+      // on the fly.
+      cpu.reset();
+    } else if (cmd == "setextram") {
+      // FIFO equivalent of the Settings > Extension RAM menu items, for
+      // headless setups that need more than the bare 2K (e.g. running a
+      // real expansion-module binary like BASWORD). <window> is "4800" or
+      // "0000"; <bytes> is decimal.
+      std::string window;
+      long bytes = 0;
+      iss >> window >> std::dec >> bytes;
+      if (window == "4800") {
+        bus.setExtRam4800Size(static_cast<size_t>(bytes));
+      } else if (window == "0000") {
+        bus.setExtRam0000Size(static_cast<size_t>(bytes));
+      } else {
+        std::fprintf(stderr, "pc1500emu: setextram window must be 4800 or 0000\n");
+      }
     } else if (cmd == "dump") {
       long start = 0, end = 0;
       iss >> std::hex >> start >> end;
@@ -987,7 +1128,8 @@ int main(int argc, char** argv) {
           << " Y=" << cpu.y() << " U=" << cpu.u() << " S=" << cpu.s() << "\n";
       out << std::dec;
       out << "halted=" << cpu.halted() << " bf=" << cpu.bf() << " disp=" << cpu.disp()
-          << " pu=" << cpu.pu() << " pv=" << cpu.pv() << "\n";
+          << " pu=" << cpu.pu() << " pv=" << cpu.pv() << " ie=" << cpu.flags().ie
+          << " timerCounter=" << cpu.timerCounter() << "\n";
       uint8_t ind1 = bus.readME0(0x764E), ind2 = bus.readME0(0x764F);
       out << "ind1(764E)=" << std::hex << static_cast<int>(ind1) << " ind2(764F)="
           << static_cast<int>(ind2) << std::dec
@@ -1023,6 +1165,32 @@ int main(int argc, char** argv) {
       std::string error;
       bool ok = saveBasicTextFile(bus, path.c_str(), &error);
       writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "typeline") {
+      std::string line;
+      std::getline(iss, line);
+      size_t start = line.find_first_not_of(' ');
+      if (start != std::string::npos) line = line.substr(start);
+      std::string error;
+      bool ok = typeImmediateLine(bus, cpu, line, &error);
+      writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "typelinetrace") {
+      long cycles = 0;
+      iss >> std::dec >> cycles;
+      std::string line;
+      std::getline(iss, line);
+      size_t start = line.find_first_not_of(' ');
+      if (start != std::string::npos) line = line.substr(start);
+      std::string error, trace;
+      bool ok = typeImmediateLineWithTrace(bus, cpu, line, cycles, &error, &trace);
+      writeResponse(ok ? trace : ("ERROR: " + error));
+    } else if (cmd == "typelinenoenter") {
+      std::string line;
+      std::getline(iss, line);
+      size_t start = line.find_first_not_of(' ');
+      if (start != std::string::npos) line = line.substr(start);
+      std::string error;
+      bool ok = typeImmediateLine(bus, cpu, line, &error, /*pressEnter=*/false);
+      writeResponse(ok ? "OK" : ("ERROR: " + error));
     } else if (cmd == "loadbasictext") {
       std::string path;
       iss >> path;
@@ -1050,6 +1218,28 @@ int main(int argc, char** argv) {
       std::string error;
       bool ok = loadBinary(bus, static_cast<uint16_t>(addr), path.c_str(), &error);
       writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "loadrommodule") {
+      // <base hex> <requirePv 0|1> <usePuBank 0|1> <path>
+      long base = 0, requirePv = 0, usePuBank = 0;
+      std::string path;
+      iss >> std::hex >> base >> std::dec >> requirePv >> usePuBank;
+      iss >> path;
+      std::string error;
+      bool ok = loadRomModule(bus, static_cast<uint16_t>(base), requirePv != 0, usePuBank != 0,
+                               path.c_str(), &error);
+      writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "loadrommodule2") {
+      // <base hex> <requirePv 0|1> <usePuBank 0|1> <path> -- second, independent slot
+      long base = 0, requirePv = 0, usePuBank = 0;
+      std::string path;
+      iss >> std::hex >> base >> std::dec >> requirePv >> usePuBank;
+      iss >> path;
+      std::string error;
+      bool ok = loadRomModule2(bus, static_cast<uint16_t>(base), requirePv != 0, usePuBank != 0,
+                                path.c_str(), &error);
+      writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "unloadrommodule2") {
+      bus.unloadRomModule2();
     } else if (cmd == "call") {
       long addr = 0;
       iss >> std::hex >> addr;
@@ -1105,7 +1295,8 @@ int main(int argc, char** argv) {
         out.width(2); out.fill('0'); out << static_cast<int>(op) << " A=";
         out.width(2); out.fill('0'); out << static_cast<int>(cpu.a()) << " X=";
         out.width(4); out.fill('0'); out << cpu.x() << " Y=";
-        out.width(4); out.fill('0'); out << cpu.y() << "\n";
+        out.width(4); out.fill('0'); out << cpu.y() << " U=";
+        out.width(4); out.fill('0'); out << cpu.u() << "\n";
       }
       writeResponse(out.str());
     } else if (!cmd.empty()) {

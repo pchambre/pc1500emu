@@ -92,15 +92,23 @@ class CPU {
   // Non-maskable interrupt pin (NMI). Vector FFFCH, always responds.
   void requestNMI() { nmiPending_ = true; }
 
-  // Advances the internal 9-bit timer counter by one tick. Per the PC-2
-  // assembly language reference (Bruce Elliott, TRS-80 Microcomputer News,
-  // May 1983): the timer is a free-running 9-bit counter, and a timer
-  // interrupt (vector FFFAH, gated by IE) is requested when its content
-  // is 1FFH. The real tick rate comes from a divider off the crystal
-  // (documented there as crystal/128 for the PC-2's 4MHz crystal); the
-  // PC-1500 uses a 2.6MHz crystal and we don't have its exact divider
-  // depth confirmed, so callers should treat the rate as an approximation
-  // (see main.cpp) rather than a cycle-accurate figure.
+  // Advances the internal 9-bit timer counter by one tick. Per the PC-1500
+  // Technical Reference Manual §2-3-1: the timer is a free-running **9-bit
+  // polynomial (LFSR) counter** -- NOT a linear up-counter -- driven by
+  // ΦF, and a timer interrupt (vector FFFAH, gated by IE) is requested
+  // when its content reaches 1FFH. The real tick rate comes from a
+  // divider off the crystal (documented there as crystal/128 for the
+  // PC-2's 4MHz crystal); the PC-1500 uses a 2.6MHz crystal and we don't
+  // have its exact divider depth confirmed, so callers should treat the
+  // rate as an approximation (see main.cpp) rather than a cycle-accurate
+  // figure. The polynomial sequence itself (511 nonzero states, degree-9
+  // primitive polynomial x^9+x^4+1, confirmed against the TRM's own
+  // printed "POLINOMINAL COUNTER" table) is authoritative, though --
+  // AM0/AM1 can set the register to an arbitrary value to control
+  // interrupt timing precisely (confirmed: ROM1.BIN does this, e.g. at
+  // E2A4H), so returning the wrong intermediate values for a linear
+  // approximation (as this used to do) diverges from real hardware for
+  // any code that relies on it, not just a cosmetic detail.
   void tickTimer();
   uint16_t timerCounter() const { return timerCounter_; }
 
@@ -127,6 +135,11 @@ class CPU {
   bool nmiPending_ = false;
   bool timerInterruptPending_ = false;
   uint16_t timerCounter_ = 0;
+  // Index into kPolyCounterTable (lh5801_timer_table.h) that timerCounter_
+  // currently corresponds to; meaningless while timerCounter_ == 0 (the
+  // LFSR's fixed/parked point -- see tickTimer()/setTimerCounter()).
+  int timerStep_ = 0;
+  void setTimerCounter(uint16_t v);
   void dispatchInterrupt(uint16_t vectorAddr, int& cycles);
 
   // Register-select family used by ADC/SBC/CPA/LDA/STA/etc: 0=X, 1=Y, 2=U.

@@ -213,6 +213,7 @@ uint8_t Bus::readME0(uint16_t addr) {
   if (addr >= 0x8000 && addr <= 0xBFFF) {
     uint8_t v;
     if (module_.tryRead(addr, pv_, pu_, v)) return v;
+    if (module2_.tryRead(addr, pv_, pu_, v)) return v;
     return 0xFF;  // empty socket, or a module present but not selected by the current PV level
   }
   if (isUnmapped(addr)) return 0xFF;
@@ -291,9 +292,18 @@ void Bus::applyRelease(Key key) {
   keyboard_.setKeyState(key, false);
   if (isCursorKey(key)) {
     if (key == heldCursorKey_) cursorKeyHeld_ = false;
-  } else if (!keyboard_.anyPressed()) {
-    writeME0(0x7B0E, static_cast<uint8_t>(readME0(0x7B0E) & 0xFE));
   }
+  // No forced 7B0EH-bit-0 clear here for ordinary keys anymore -- see
+  // setKeyState's comment. That was compensating for the CPU timer being
+  // modeled as a linear counter instead of the real 9-bit polynomial one
+  // (fixed 2026-08-02, lh5801_timer_table.h); with the real polynomial
+  // sequence, the ROM's own countdown clears the gate within a few
+  // thousand cycles on its own (confirmed by direct trace, well under one
+  // ~32700-cycle timer period), not the ~200ms the old linear model
+  // implied. The forced clear was actively wrong, not just redundant: it
+  // broke BASWORD's own keyboard-hook timing (confirmed -- disabling it
+  // is what made `BASWORD +"name";"..."` start actually registering
+  // keywords, see [[pc1500_keyword_table_mechanism]]).
 }
 
 void Bus::advanceCycles(int cycles) {
