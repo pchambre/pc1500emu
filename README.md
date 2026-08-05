@@ -20,20 +20,35 @@ compiler backend work begins.
 
 ## Building
 
-Requires SDL2 and SDL2_ttf development packages (`libsdl2-dev`,
-`libsdl2-ttf-dev` on Debian/Ubuntu). [Dear ImGui](https://github.com/ocornut/imgui)
-(the menu bar UI) is vendored directly in `third_party/imgui/` — nothing
-extra to install for that.
+Requires SDL2 and SDL2_ttf development packages.
+
+**Linux**: `libsdl2-dev`, `libsdl2-ttf-dev` on Debian/Ubuntu.
+[Dear ImGui](https://github.com/ocornut/imgui) (the menu bar UI) is vendored
+directly in `third_party/imgui/` — nothing extra to install for that.
 
 ```sh
 cmake -B build
 cmake --build build
 ```
 
+**Windows**: install SDL2 and SDL2-ttf via [vcpkg](https://github.com/microsoft/vcpkg)
+(`vcpkg install sdl2 sdl2-ttf`), then point CMake at its toolchain file:
+
+```sh
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config RelWithDebInfo
+```
+
+The indicator row (see the Keyboard mapping section below) needs a
+CJK-capable font for its katakana glyphs; Windows ships one
+(`C:\Windows\Fonts\msgothic.ttc`) by default since Windows 8, so nothing
+extra to install there either.
+
 ## Running
 
 ```sh
-./build/src/host/pc1500emu [rom.bin]
+./build/src/host/pc1500emu [rom.bin]          # Linux
+build\src\host\RelWithDebInfo\pc1500emu.exe [rom.bin]   # Windows
 ```
 
 No PC-1500 ROM dump is bundled (it's copyrighted Sharp firmware) — without
@@ -42,11 +57,11 @@ rather than doing anything useful. Pass a real dump's path to load it at
 `C000H`.
 
 Keyboard mapping (host key -> PC-1500 key) is defined in `src/host/main.cpp`
-(`kKeyMap[]`). Digits (including the numpad), letters, arrows, F1-F6,
-Enter, and Space map directly; Backspace duplicates the left arrowhead.
-PC-1500 keys without an obvious host equivalent live on F7-F12 for
-muscle-memory reasons (chosen over keys like Delete/Insert, which don't
-map intuitively to a calculator's special keys):
+(`kKeyMap[]`). Letters, numpad digits, arrows, F1-F6, Enter, and Space map
+directly; Backspace duplicates the left arrowhead. PC-1500 keys without an
+obvious host equivalent live on F7-F12 for muscle-memory reasons (chosen
+over keys like Delete/Insert, which don't map intuitively to a
+calculator's special keys):
 - F7 = Cl, F8 = Mode, F9 = Def, F10 = Sml, F11 = Rcl
 - Shift+F10 = the up/down rocker key
 - **F12 = On** (it's wired directly to the CPU, not part of the keyboard
@@ -63,20 +78,26 @@ keyboard's whole keypress duration confuses the ROM's key-scan. **Tab**
 sends a direct, standalone PC-1500 Shift keypress for cases not covered
 by the punctuation passthrough below.
 
-**Punctuation passthrough** (`kSymbolMap[]`): typing `!"#$%&@^<>:?;,`
-directly on the host reproduces the exact PC-1500 Shift+key combo that
-types each one on real hardware (confirmed by Paul), queued as a
-fire-and-forget sequence (Shift tap, then the target key) that runs to
-completion regardless of how long the host key is held. There's a small
-(~0.25s) delay before the character appears. Some of these host keycodes
-are *shared* with a plain meaning (QWERTY's `1` is plain "1" alone, or
-"!" with host Shift also held) -- those correctly gate on host Shift and
-fall through to a plain keypress when it isn't held. Others have no such
-plain meaning at all (Insert/Delete, or `"` on a layout like AZERTY that
-types it without touching Shift) -- those always send the PC-1500 Shift
-tap regardless of host Shift, encoded by giving both of a mapping's
-targets the same key. Insert and Delete use this mechanism for
-Shift+Right and Shift+Left.
+**Digits and punctuation** (`charToTapActions()`, driven by `SDL_TEXTINPUT`
+rather than keycodes): typing a digit or one of `!"#$%&@^<>:?;,` on the
+host reproduces the exact PC-1500 keypress (or Shift+key combo) that types
+each one on real hardware (confirmed by Paul), queued as a fire-and-forget
+sequence that runs to completion regardless of how long the host key is
+held. There's a small (~0.25s) delay before the character appears.
+
+Because this is driven by `SDL_TEXTINPUT` (the OS's own composed text)
+instead of raw keycodes, it's host-keyboard-layout-aware automatically --
+e.g. on a French AZERTY host, the unshifted top-row key reproduces `&`
+(what's printed on the keycap) and Shift+that key reproduces `1`, matching
+the host layout rather than assuming QWERTY. (An earlier keycode-based
+design didn't have this property, and was additionally broken on Windows
+specifically: SDL's Windows backend hardcodes the top row's *keycode* to
+always report digits regardless of the real OS layout, so AZERTY typed
+"1" instead of "&" no matter what -- SDL_TEXTINPUT isn't affected by that
+quirk.) Insert and Delete are the two exceptions -- not printable
+characters, so they can't come from `SDL_TEXTINPUT` -- handled directly by
+keycode instead, always sending Shift+Right / Shift+Left regardless of
+host Shift state.
 
 Interrupt delivery (MI/NMI/timer) is implemented, so `HLT` resumes normally
 when one fires.
@@ -123,10 +144,13 @@ fields, not the emulated PC-1500 keyboard.
 
 ## Scriptable command interface
 
-A running instance also reads commands from a named pipe at
-`/tmp/pc1500emu.cmd`, one per line, letting an external process (or a
-script) drive it directly instead of relaying everything through the GUI
-by hand. Query commands write their result to `/tmp/pc1500emu.response`.
+A running instance also reads commands from a named pipe, one per line,
+letting an external process (or a script) drive it directly instead of
+relaying everything through the GUI by hand. Query commands write their
+result to a response file for the caller to read back afterward.
+
+**Linux**: a POSIX FIFO at `/tmp/pc1500emu.cmd`, writable with plain shell
+redirection; the response file is `/tmp/pc1500emu.response`.
 
 ```sh
 echo 'type 10 PRINT "HELLO"' > /tmp/pc1500emu.cmd
@@ -136,6 +160,17 @@ echo 'status' > /tmp/pc1500emu.cmd; cat /tmp/pc1500emu.response    # registers, 
 echo 'peek 4000' > /tmp/pc1500emu.cmd; cat /tmp/pc1500emu.response
 echo 'poke 4000 ff' > /tmp/pc1500emu.cmd
 echo 'dump 4000 40ff' > /tmp/pc1500emu.cmd; cat /tmp/pc1500emu.response
+```
+
+**Windows**: there's no filesystem-visible equivalent of a FIFO, so this is
+a named pipe (`\\.\pipe\pc1500emu.cmd`) instead, which plain shell
+redirection can't write to — use `tools/send-command.ps1`. The response
+file is `%TEMP%\pc1500emu.response`.
+
+```powershell
+powershell -File tools\send-command.ps1 'type 10 PRINT "HELLO"'
+powershell -File tools\send-command.ps1 'key enter'
+powershell -File tools\send-command.ps1 'status'; Get-Content $env:TEMP\pc1500emu.response
 ```
 
 Commands:

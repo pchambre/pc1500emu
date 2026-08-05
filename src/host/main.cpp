@@ -1,5 +1,11 @@
 // Copyright (c) 2026 Paul Chambre. Licensed under the Apache License,
 // Version 2.0 -- see LICENSE.
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 
@@ -7,9 +13,11 @@
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
 
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <array>
 #include <cctype>
@@ -51,7 +59,15 @@ constexpr int kIndicatorBarHeight = 18;
 constexpr int kIndicatorFontPtSize = 11;
 // A .ttc font collection; index picks a language face, but katakana glyphs
 // don't differ meaningfully between the CJK variants for our purposes.
+// Windows has shipped a CJK-capable font collection by default since
+// Windows 8 regardless of display language, so msgothic.ttc needs no
+// separate install; Linux distros vary in where they put Noto, so this is
+// still just the one path this project's dev machine has it at.
+#if defined(_WIN32)
+constexpr const char* kIndicatorFontPath = "C:\\Windows\\Fonts\\msgothic.ttc";
+#else
 constexpr const char* kIndicatorFontPath = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+#endif
 constexpr int kIndicatorFontFaceIndex = 0;
 
 constexpr int kWindowH =
@@ -156,7 +172,8 @@ constexpr int kCyclesPerTimerTick = 8;
 // requirement; a modern host keyboard/OS event stream can report a
 // press/release cadence far faster than that. Fix: ordinary keys
 // (letters/digits/space/punctuation) are queued through the same
-// fire-and-forget symbolActionQueue mechanism kSymbolMap already uses
+// fire-and-forget symbolActionQueue mechanism the SDL_TEXTINPUT-driven
+// symbol/digit dispatch already uses (see the comment above kTapFrames)
 // (see isImmediateHostKey below for the keys deliberately excluded from
 // this and kept as direct, zero-latency passthrough instead).
 struct KeyMapping {
@@ -202,11 +219,17 @@ bool isImmediateHostKey(pc1500::Key k) {
 
 // clang-format off
 constexpr KeyMapping kKeyMap[] = {
-    {SDLK_0, pc1500::Key::Digit0}, {SDLK_1, pc1500::Key::Digit1},
-    {SDLK_2, pc1500::Key::Digit2}, {SDLK_3, pc1500::Key::Digit3},
-    {SDLK_4, pc1500::Key::Digit4}, {SDLK_5, pc1500::Key::Digit5},
-    {SDLK_6, pc1500::Key::Digit6}, {SDLK_7, pc1500::Key::Digit7},
-    {SDLK_8, pc1500::Key::Digit8}, {SDLK_9, pc1500::Key::Digit9},
+    // Deliberately no top-row-digit entries (SDLK_0-SDLK_9) here -- SDL's
+    // Windows backend hardcodes that scancode range's keycode to always
+    // report digits regardless of the OS's actual keyboard layout (a
+    // deliberate SDL quirk so number-row game hotkeys stay consistent
+    // across layouts), which makes keycode matching useless for
+    // distinguishing "1" from AZERTY's unshifted "&" on that same
+    // physical key. Numpad digits are unaffected (always genuinely
+    // digits, on every layout) and keep their direct entries below; the
+    // top row is handled by SDL_TEXTINPUT instead (see the dispatch loop
+    // and the comment above kTapFrames), which reports the real composed
+    // character on every platform/layout with no special-casing needed.
     {SDLK_KP_0, pc1500::Key::Digit0}, {SDLK_KP_1, pc1500::Key::Digit1},
     {SDLK_KP_2, pc1500::Key::Digit2}, {SDLK_KP_3, pc1500::Key::Digit3},
     {SDLK_KP_4, pc1500::Key::Digit4}, {SDLK_KP_5, pc1500::Key::Digit5},
@@ -241,8 +264,9 @@ constexpr KeyMapping kKeyMap[] = {
     // Shift+key typing speed. So host Shift (either one) is read only
     // as a modifier (event.key.keysym.mod) and only ever engages
     // PC-1500 Shift atomically together with a specific target key, via
-    // kSymbolMap below. For cases kSymbolMap doesn't cover, Tab sends a
-    // direct, standalone PC-1500 Shift keypress (real hardware's own
+    // the SDL_TEXTINPUT-driven dispatch below. For non-printable keys
+    // that doesn't cover, Tab sends a direct, standalone PC-1500 Shift
+    // keypress (real hardware's own
     // Shift is a tap-to-toggle key, not a hold, so this matches that
     // directly rather than needing the tap-sequence machinery below).
     {SDLK_TAB, pc1500::Key::Shift},
@@ -314,7 +338,7 @@ constexpr KeyMapping kKeyMap[] = {
 // calibration process.
 //
 // So each symbol is fired as a queued, fire-and-forget sequence of
-// PC-1500 key actions (see QueuedKeyAction/kSymbolActionQueue below),
+// PC-1500 key actions (see QueuedKeyAction/symbolActionQueue below),
 // entirely decoupled from how long the *host* key is actually held:
 //   1. Press PC-1500 Shift, hold for kTapFrames (long enough for one
 //      ROM scan cycle to see it as its own event).
@@ -334,105 +358,51 @@ constexpr KeyMapping kKeyMap[] = {
 // filtered out (event.key.repeat) so a long hold doesn't flood the
 // queue with duplicate sequences.
 //
-// Each entry fires when the *host* types the target symbol (typically
-// host Shift+key on a US layout). Most keys fall through to kKeyMap
-// when host Shift isn't held (e.g. plain "1" -> Digit1); SDLK_COMMA and
-// SDLK_SEMICOLON are the exception -- they type a *different* symbol
-// unshifted (also via a PC-1500 Shift tap, just a different base key)
-// rather than falling through, since the PC-1500 has no plain "," or
-// ";" key of its own.
+// **Update, 2026-08-04: what actually decides which symbol/digit fires
+// switched from SDL_Keycode to SDL_TEXTINPUT.** The original design (see
+// git history for the removed kSymbolMap/kShiftedDirectMap tables) keyed
+// symbols off SDL_Keycode + a host-Shift flag, hardcoding the QWERTY
+// assumption that (say) Shift+SDLK_1 means "!" and plain SDLK_1 means
+// "1". That's wrong on any layout where the number row's *un*shifted
+// glyph isn't a digit (AZERTY and most other European layouts put digits
+// on the Shift layer) -- confirmed as a real bug by Paul on Windows/
+// AZERTY, and independently confirmed empirically: SDL's Windows backend
+// hardcodes the top-row scancodes' keycode to always report SDLK_1..
+// SDLK_0 regardless of the OS's real keyboard layout (deliberately, so
+// number-row game hotkeys stay consistent across layouts), so keycode
+// matching can't even see AZERTY's real "&" there in the first place.
+// SDL_TEXTINPUT sidesteps this entirely: it reports the actual composed
+// character for *any* platform/layout (it's literally the OS's own text
+// composition, the same source a text editor would use), so the same
+// charToTapActions(char, ...) function that already drives the
+// scriptable command interface's `type` command (see below) now drives
+// live keyboard symbol/digit input too -- one character-indexed
+// implementation instead of two parallel (and, on Windows, differently
+// broken) keycode-indexed tables. This is why the top-row digit entries
+// are gone from kKeyMap above: SDL_TEXTINPUT is now the *only* source for
+// that scancode range, both for its shifted (digit) and unshifted
+// (symbol) meaning. See the SDL_TEXTINPUT branch in the event dispatch
+// loop below, and suppressNextTextInput's comment for how it avoids
+// double-handling keys kKeyMap already deals with directly (letters,
+// numpad, arrows, etc.).
 constexpr int kTapFrames = 4;   // ~67ms -- spans the ROM's ~25ms scan cadence
 constexpr int kIdleFrames = 4;  // ~67ms -- empirically bisected minimum (2026-08-02, after
                                  // fixing kCyclesPerTimerTick, see the comment above) that
                                  // still reliably registers BASWORD keywords; 3 fails
                                  // reliably. Down from 14 (~233ms) before that fix.
-struct SymbolMapping {
-  SDL_Keycode keycode;
-  pc1500::Key shiftedTarget;     // host Shift+keycode -> PC-1500 Shift-tap then this
-  bool hasUnshiftedTarget;       // if true, plain keycode also -> PC-1500 Shift-tap then unshiftedTarget
-  pc1500::Key unshiftedTarget;   // (only meaningful if hasUnshiftedTarget)
-};
-// clang-format off
-constexpr SymbolMapping kSymbolMap[] = {
-    {SDLK_1, pc1500::Key::F1, false, {}},              // !
-    {SDLK_QUOTE, pc1500::Key::F2, false, {}},           // " (US layout: Shift+')
-    {SDLK_QUOTEDBL, pc1500::Key::F2, true, pc1500::Key::F2},  // " (some layouts/setups
-                                                               // report this keycode
-                                                               // directly instead of
-                                                               // SDLK_QUOTE+Shift)
-    {SDLK_3, pc1500::Key::F3, false, {}},               // #
-    {SDLK_4, pc1500::Key::F4, false, {}},               // $
-    {SDLK_5, pc1500::Key::F5, false, {}},               // %
-    {SDLK_7, pc1500::Key::F6, false, {}},               // &
-    {SDLK_2, pc1500::Key::Equals, false, {}},           // @
-    {SDLK_6, pc1500::Key::Space, false, {}},            // ^
-    {SDLK_PERIOD, pc1500::Key::RightParen, false, {}},  // >
-    {SDLK_SLASH, pc1500::Key::Slash, false, {}},        // ?
-    {SDLK_COMMA, pc1500::Key::LeftParen, true, pc1500::Key::Minus},    // < (shifted) / , (plain)
-    {SDLK_SEMICOLON, pc1500::Key::Asterisk, true, pc1500::Key::Plus}, // : (shifted) / ; (plain)
-    // Insert/Delete have only one meaning regardless of host Shift (no
-    // plain-key gesture exists for either), so both targets are the same
-    // key -- see the comment where hasTarget is computed for why.
-    {SDLK_INSERT, pc1500::Key::Right, true, pc1500::Key::Right},  // Insert -> Shift+Right
-    {SDLK_DELETE, pc1500::Key::Left, true, pc1500::Key::Left},    // Delete -> Shift+Left
-    // F1-F6 and Mode: the ROM itself decides what a *plain* F-key press
-    // means (an unassigned reserve key shows "!" etc.; an assigned one
-    // runs/types whatever was registered in RESERVE mode; plain Mode
-    // toggles RUN/PRO) -- our job is only to always send the plain matrix
-    // key (via kKeyMap, unaffected by these entries: hasUnshiftedTarget is
-    // false, so an unshifted press here falls through exactly like before)
-    // and to genuinely engage PC-1500 Shift, via the same Shift-tap
-    // mechanism as the symbols above, when host Shift is actually held --
-    // e.g. Shift+F1 always types "!" regardless of F1's current RESERVE
-    // assignment, and Shift+Mode enters/exits RESERVE mode (confirmed by
-    // Paul; previously host Shift was silently ignored for these keys,
-    // so Shift+Mode could never reach RESERVE mode at all).
-    {SDLK_F1, pc1500::Key::F1, false, {}},
-    {SDLK_F2, pc1500::Key::F2, false, {}},
-    {SDLK_F3, pc1500::Key::F3, false, {}},
-    {SDLK_F4, pc1500::Key::F4, false, {}},
-    {SDLK_F5, pc1500::Key::F5, false, {}},
-    {SDLK_F6, pc1500::Key::F6, false, {}},
-    {SDLK_F8, pc1500::Key::Mode, false, {}},
-};
-// clang-format on
 
-// "(" and ")" are each their own dedicated, unshifted physical key on real
-// PC-1500 hardware (IN6/PA3 and IN0/PA3 -- see docs/pc1500_hardware_reference.md's
-// key matrix), same as kKeyMap's other direct mappings -- unlike
-// kSymbolMap's entries above, sending them needs no PC-1500 Shift at all.
-// But on a QWERTY host they're naturally typed as Shift+9/Shift+0, and
-// SDLK_9/SDLK_0 are otherwise plain kKeyMap digit keys (Digit9/Digit0)
-// regardless of host Shift -- so without this, Shift+9/Shift+0 just typed
-// "9"/"0" instead of "("/")", with no way to reach the parens at all
-// (confirmed as a real gap by Paul: the *only* working path was the
-// unshifted `[`/`]` keys in kKeyMap below, which isn't how a QWERTY typist
-// would ever guess to type them). Handled as its own small dispatch step,
-// separate from kSymbolMap's PC-1500-Shift-tap-queue machinery, since
-// there's no PC-1500 Shift involved -- just an instant, direct keypress of
-// a different target key than kKeyMap's own unshifted entry for the same
-// host keycode.
-struct ShiftedDirectMapping {
-  SDL_Keycode keycode;
-  pc1500::Key shiftedTarget;
-};
-constexpr ShiftedDirectMapping kShiftedDirectMap[] = {
-    {SDLK_9, pc1500::Key::LeftParen},   // Shift+9 -> (
-    {SDLK_0, pc1500::Key::RightParen},  // Shift+0 -> )
-};
-
-// One step of a queued symbol-tap sequence (see kSymbolMap above): set a
-// PC-1500 key's state, then wait `framesToWait` real frames before the
-// next queued action runs. Processed one action at a time in the main
-// loop, independent of host key state -- see the "fire-and-forget"
-// rationale in the kSymbolMap comment.
+// One step of a queued symbol-tap sequence (see the comment above
+// kTapFrames): set a PC-1500 key's state, then wait `framesToWait` real
+// frames before the next queued action runs. Processed one action at a
+// time in the main loop, independent of host key state -- see the
+// "fire-and-forget" rationale in that same comment.
 struct QueuedKeyAction {
   pc1500::Key key;
   bool pressed;
   int framesToWait;
 };
 
-// ---- Scriptable command FIFO (/tmp/pc1500emu.cmd) ----
+// ---- Scriptable command interface (pc1500emu.cmd) ----
 //
 // Lets an external process (Claude, via Bash) drive a *running* emulator
 // session directly -- type text, press named keys, peek/poke memory, dump
@@ -441,15 +411,144 @@ struct QueuedKeyAction {
 // (peek/dump/status/display) write their result to a response file
 // (kResponsePath) for the caller to read back afterward.
 //
-// Deliberately simple/textual (one command per line) and POSIX-only (this
-// is a dev/debug tool, not a portability-sensitive feature).
+// Deliberately simple/textual (one command per line). On POSIX this is a
+// real FIFO at a fixed /tmp path, writable with plain shell redirection
+// (`echo cmd > path`). Windows has no filesystem-visible equivalent, so
+// there it's a named pipe instead (see the cmdPipe* functions below) --
+// write to it with tools/send-command.ps1 rather than shell redirection.
+#if defined(_WIN32)
+constexpr const char* kCommandPipeName = "\\\\.\\pipe\\pc1500emu.cmd";
+#else
 constexpr const char* kCommandFifoPath = "/tmp/pc1500emu.cmd";
-constexpr const char* kResponsePath = "/tmp/pc1500emu.response";
+#endif
+
+// Returns a path for `filename` in the platform temp directory: a fixed
+// /tmp on POSIX, or the directory %TEMP% (etc.) resolves to on Windows.
+std::string platformTempFilePath(const char* filename) {
+#if defined(_WIN32)
+  char dir[MAX_PATH]{};
+  DWORD n = GetTempPathA(static_cast<DWORD>(sizeof(dir)), dir);
+  std::string path = (n > 0 && n < sizeof(dir)) ? std::string(dir, n) : std::string("C:\\Windows\\Temp\\");
+  if (!path.empty() && path.back() != '\\') path += '\\';
+  return path + filename;
+#else
+  return std::string("/tmp/") + filename;
+#endif
+}
+
+const std::string kResponsePath = platformTempFilePath("pc1500emu.response");
+
+#if defined(_WIN32)
+// Win32 named-pipe equivalent of the POSIX FIFO. Uses overlapped
+// (asynchronous) I/O throughout so polling it every frame never blocks the
+// GUI loop -- ConnectNamedPipe/ReadFile both return immediately and
+// completion is checked via GetOverlappedResult(..., bWait=FALSE), mirroring
+// the O_NONBLOCK FIFO read on POSIX.
+HANDLE g_cmdPipe = INVALID_HANDLE_VALUE;
+OVERLAPPED g_cmdPipeOverlapped{};
+bool g_cmdPipeConnected = false;
+bool g_cmdPipeIoPending = false;
+char g_cmdPipeReadBuf[4096];
+
+bool cmdPipeInit(const char* pipeName) {
+  g_cmdPipeOverlapped.hEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+  g_cmdPipe = CreateNamedPipeA(pipeName, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+                                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
+                                4096, 4096, 0, nullptr);
+  return g_cmdPipe != INVALID_HANDLE_VALUE;
+}
+
+// Drops the current client and re-arms the pipe to accept the next one --
+// each send-command.ps1 invocation is a short-lived connect/write/close, so
+// this runs after essentially every command.
+void cmdPipeReset() {
+  DisconnectNamedPipe(g_cmdPipe);
+  g_cmdPipeConnected = false;
+  g_cmdPipeIoPending = false;
+}
+
+// Called once per frame; appends any newly-arrived bytes to *out.
+void cmdPipePoll(std::string* out) {
+  if (g_cmdPipe == INVALID_HANDLE_VALUE) return;
+
+  if (!g_cmdPipeConnected) {
+    if (!g_cmdPipeIoPending) {
+      ResetEvent(g_cmdPipeOverlapped.hEvent);
+      if (ConnectNamedPipe(g_cmdPipe, &g_cmdPipeOverlapped)) {
+        g_cmdPipeConnected = true;
+      } else {
+        switch (GetLastError()) {
+          case ERROR_PIPE_CONNECTED:
+            g_cmdPipeConnected = true;
+            break;
+          case ERROR_IO_PENDING:
+            g_cmdPipeIoPending = true;
+            break;
+          default:
+            return;  // real error -- try again next frame
+        }
+      }
+    } else {
+      DWORD transferred;
+      if (GetOverlappedResult(g_cmdPipe, &g_cmdPipeOverlapped, &transferred, FALSE)) {
+        g_cmdPipeConnected = true;
+        g_cmdPipeIoPending = false;
+      } else if (GetLastError() != ERROR_IO_INCOMPLETE) {
+        g_cmdPipeIoPending = false;  // connect attempt failed -- retry next frame
+      }
+    }
+    if (!g_cmdPipeConnected) return;
+  }
+
+  for (;;) {
+    if (!g_cmdPipeIoPending) {
+      ResetEvent(g_cmdPipeOverlapped.hEvent);
+      BOOL ok = ReadFile(g_cmdPipe, g_cmdPipeReadBuf, sizeof(g_cmdPipeReadBuf), nullptr, &g_cmdPipeOverlapped);
+      if (!ok) {
+        if (GetLastError() == ERROR_IO_PENDING) {
+          g_cmdPipeIoPending = true;
+        } else {
+          cmdPipeReset();  // client disconnected, or a real error
+        }
+        return;
+      }
+    }
+    DWORD transferred = 0;
+    if (!GetOverlappedResult(g_cmdPipe, &g_cmdPipeOverlapped, &transferred, FALSE)) {
+      if (GetLastError() == ERROR_IO_INCOMPLETE) return;  // read still pending
+      g_cmdPipeIoPending = false;
+      cmdPipeReset();
+      return;
+    }
+    g_cmdPipeIoPending = false;
+    if (transferred == 0) {
+      cmdPipeReset();
+      return;
+    }
+    out->append(g_cmdPipeReadBuf, transferred);
+  }
+}
+
+void cmdPipeClose() {
+  if (g_cmdPipe != INVALID_HANDLE_VALUE) {
+    CancelIo(g_cmdPipe);
+    CloseHandle(g_cmdPipe);
+    g_cmdPipe = INVALID_HANDLE_VALUE;
+  }
+  if (g_cmdPipeOverlapped.hEvent) {
+    CloseHandle(g_cmdPipeOverlapped.hEvent);
+    g_cmdPipeOverlapped.hEvent = nullptr;
+  }
+}
+#endif  // _WIN32
 
 // Maps a plain typed character to a direct PC-1500 keypress (letters,
-// digits, space) or a Shift-tap sequence (symbols that need PC-1500 Shift,
-// mirroring kSymbolMap's mechanism above) -- returns false if there's no
-// mapping at all, in which case the caller should use `key NAME` instead.
+// digits, space) or a Shift-tap sequence (symbols that need PC-1500 Shift)
+// -- returns false if there's no mapping at all, in which case the caller
+// should use `key NAME` instead. The single source of truth for "what does
+// this character do on the PC-1500", used both by the scriptable command
+// interface's `type` command and (see the SDL_TEXTINPUT branch in the main
+// loop, and the comment above kTapFrames) live keyboard input.
 bool charToTapActions(char c, std::deque<QueuedKeyAction>* out) {
   pc1500::Key direct{};
   bool hasDirect = true;
@@ -471,18 +570,17 @@ bool charToTapActions(char c, std::deque<QueuedKeyAction>* out) {
   } else if (c == '=') {
     direct = pc1500::Key::Equals;
   } else if (c == '(') {
-    // LeftParen/RightParen are dedicated, unshifted PC-1500 keys (see
-    // kShiftedDirectMap's comment) -- '(' and ')' need no PC-1500 Shift at
-    // all, unlike '<'/'>' below which are the *shifted* meaning of the
-    // same two physical keys.
+    // LeftParen/RightParen are dedicated, unshifted PC-1500 keys (IN6/PA3
+    // and IN0/PA3 -- see docs/pc1500_hardware_reference.md's key matrix)
+    // -- '(' and ')' need no PC-1500 Shift at all, unlike '<'/'>' below
+    // which are the *shifted* meaning of the same two physical keys.
     direct = pc1500::Key::LeftParen;
   } else if (c == ')') {
     direct = pc1500::Key::RightParen;
   } else if (c == '*') {
     // Asterisk is the PC-1500's dedicated multiply key; unshifted it
     // types '*' (see kKeyMap's SDLK_KP_MULTIPLY entry) -- shifted, it
-    // types ':' (handled below, matching kSymbolMap's SDLK_SEMICOLON
-    // entry).
+    // types ':' (handled below).
     direct = pc1500::Key::Asterisk;
   } else {
     hasDirect = false;
@@ -492,12 +590,11 @@ bool charToTapActions(char c, std::deque<QueuedKeyAction>* out) {
     out->push_back({direct, false, kIdleFrames});
     return true;
   }
-  // Symbols needing a PC-1500 Shift-tap sequence -- target keys taken
-  // directly from kSymbolMap above (F1-F6/Equals/Space/Slash/LeftParen/
-  // RightParen/Asterisk/Plus/Minus, each PC-1500-Shifted, already
-  // confirmed on real hardware to produce these symbols), just re-indexed
-  // here by the character a BASIC listing actually contains rather than
-  // by host keycode.
+  // Symbols needing a PC-1500 Shift-tap sequence -- target keys
+  // (F1-F6/Equals/Space/Slash/LeftParen/RightParen/Asterisk/Plus/Minus,
+  // each PC-1500-Shifted) confirmed on real hardware to produce these
+  // symbols, indexed here by the character itself rather than by host
+  // keycode -- see the comment above kTapFrames for why.
   pc1500::Key shiftedTarget{};
   bool hasShifted = true;
   if (c == '!') {
@@ -1231,15 +1328,23 @@ int main(int argc, char** argv) {
 
   auto readByte = [&](uint16_t addr) { return bus.readME0(addr); };
 
-  // See kCommandFifoPath's comment (near QueuedKeyAction) for the overall
-  // design. mkfifo() is a no-op (EEXIST) on repeated launches -- the FIFO
-  // just persists on disk between runs, same file every time.
+  // See the scriptable-command-interface comment (near QueuedKeyAction) for
+  // the overall design.
+#if defined(_WIN32)
+  if (!cmdPipeInit(kCommandPipeName)) {
+    std::fprintf(stderr, "pc1500emu: could not create command pipe '%s' (error %lu)\n", kCommandPipeName,
+                 GetLastError());
+  }
+#else
+  // mkfifo() is a no-op (EEXIST) on repeated launches -- the FIFO just
+  // persists on disk between runs, same file every time.
   mkfifo(kCommandFifoPath, 0666);
   int cmdFifoFd = open(kCommandFifoPath, O_RDONLY | O_NONBLOCK);
   if (cmdFifoFd < 0) {
     std::fprintf(stderr, "pc1500emu: could not open command FIFO '%s': %s\n", kCommandFifoPath,
                  strerror(errno));
   }
+#endif
   std::string cmdBuf;
 
   bool running = true;
@@ -1249,23 +1354,19 @@ int main(int argc, char** argv) {
   // (otherwise a modifier change mid-hold could release the wrong
   // PC-1500 key and leave the other one stuck "pressed" forever).
   bool f10IsRocker = false;
-  // Pending symbol-tap sequences (see kSymbolMap/QueuedKeyAction above),
-  // processed one action at a time regardless of host key state.
+  // Pending symbol-tap sequences (see QueuedKeyAction and the comment
+  // above kTapFrames), processed one action at a time regardless of host
+  // key state.
   std::deque<QueuedKeyAction> symbolActionQueue;
   int symbolActionFramesRemaining = 0;
-  // Per kSymbolMap entry (by index): whether the *last* press of that
-  // host key fell through to kKeyMap (no PC-1500-Shift meaning at the
-  // time) rather than being symbol-queued, so release matches whichever
-  // actually happened even if Shift's state changed in between.
-  std::array<bool, std::size(kSymbolMap)> engagedViaKeyMap{};
-  // Per kShiftedDirectMap entry: whether the *last* press of that host key
-  // used the shifted-direct target (so release matches even if Shift's
-  // state changed mid-hold) -- same pattern as engagedViaKeyMap/f10IsRocker.
-  std::array<bool, std::size(kShiftedDirectMap)> shiftedKeyActive{};
+  // Whether the SDL_TEXTINPUT event a KEYDOWN is about to generate (if
+  // any) should be ignored -- see its computation and the SDL_TEXTINPUT
+  // branch, both in the event loop below, for why.
+  bool suppressNextTextInput = false;
 
   // Command FIFO dispatcher -- see kCommandFifoPath's comment. Parses one
-  // line at a time; `type`/`key` append to the same queue kSymbolMap's
-  // punctuation handling uses (so scripted and real typing interleave
+  // line at a time; `type`/`key` append to the same queue live keyboard
+  // symbol/digit input uses (so scripted and real typing interleave
   // naturally instead of racing); `peek`/`dump`/`status`/`display` write
   // their result to kResponsePath immediately (no queueing needed -- these
   // don't touch the keyboard at all).
@@ -1292,7 +1393,7 @@ int main(int argc, char** argv) {
       std::string name;
       iss >> name;
       // "shift+NAME" queues a genuine PC-1500 Shift-tap before NAME's tap,
-      // same mechanism kSymbolMap uses for e.g. Shift+F1 -- for testing
+      // same mechanism charToTapActions uses for symbols -- for testing
       // host-Shift-combo behavior directly via the command interface.
       bool withShift = false;
       constexpr const char* kShiftPrefix = "shift+";
@@ -1587,8 +1688,8 @@ int main(int argc, char** argv) {
   ActiveDialog activeDialog = ActiveDialog::None;
   char filenameBuf[512] = "";
   // BASIC-text dialogs' multi-line editor -- fixed-size like every other
-  // dialog field here (see kSymbolMap-adjacent style), sized generously
-  // above any realistic PC-1500 program's text-listing length.
+  // dialog field here (e.g. filenameBuf above), sized generously above
+  // any realistic PC-1500 program's text-listing length.
   static constexpr size_t kBasicTextBufSize = 32768;
   auto basicTextBuf = std::make_unique<char[]>(kBasicTextBufSize);
   basicTextBuf[0] = '\0';
@@ -1634,8 +1735,8 @@ int main(int argc, char** argv) {
   };
   // Temporary: logs every real key event with a precise timestamp, so a
   // captured typing sample can be replayed against the C++ core exactly
-  // as typed (see /tmp/pc1500emu_keycapture.log).
-  std::ofstream keyCaptureLog("/tmp/pc1500emu_keycapture.log", std::ios::app);
+  // as typed (see platformTempFilePath("pc1500emu_keycapture.log")).
+  std::ofstream keyCaptureLog(platformTempFilePath("pc1500emu_keycapture.log"), std::ios::app);
   auto captureStart = std::chrono::steady_clock::now();
 
   // Audio sample budget is tracked against real elapsed wall-clock time,
@@ -1670,12 +1771,18 @@ int main(int argc, char** argv) {
   double buzzerDcEstimate = -1.0;
 
   while (running) {
+#if defined(_WIN32)
+    cmdPipePoll(&cmdBuf);
+#else
     if (cmdFifoFd >= 0) {
       char buf[4096];
       ssize_t n;
       while ((n = read(cmdFifoFd, buf, sizeof(buf))) > 0) {
         cmdBuf.append(buf, static_cast<size_t>(n));
       }
+    }
+#endif
+    {
       size_t nl;
       while ((nl = cmdBuf.find('\n')) != std::string::npos) {
         std::string line = cmdBuf.substr(0, nl);
@@ -1719,6 +1826,27 @@ int main(int argc, char** argv) {
                         << (event.key.repeat ? 1 : 0) << ',' << mod << '\n';
           keyCaptureLog.flush();
         }
+        // Whether the SDL_TEXTINPUT event this key's press is about to
+        // generate (if any) should be ignored by the SDL_TEXTINPUT branch
+        // below -- true when this keydown is already fully handled by a
+        // keycode-based path (F10/F12/Insert/Delete/kKeyMap), or is an OS
+        // auto-repeat (filtered here for the same anti-flood reason the
+        // queued-tap paths below filter event.key.repeat). Recomputed on
+        // every keydown, so it's always correct by the time the following
+        // SDL_TEXTINPUT (if any) is processed -- SDL always delivers a
+        // key's TEXTINPUT immediately after its KEYDOWN, never reordered.
+        if (pressed) {
+          suppressNextTextInput = event.key.repeat || kc == SDLK_F10 || kc == SDLK_F12 ||
+                                   kc == SDLK_INSERT || kc == SDLK_DELETE;
+          if (!suppressNextTextInput) {
+            for (const KeyMapping& m : kKeyMap) {
+              if (m.keycode == kc) {
+                suppressNextTextInput = true;
+                break;
+              }
+            }
+          }
+        }
         if (kc == SDLK_F12) {
           if (pressed && ctrlHeld) {
             cpu.reset();
@@ -1736,115 +1864,58 @@ int main(int argc, char** argv) {
         } else if (kc == SDLK_F10) {
           if (pressed) f10IsRocker = shiftHeld;
           bus.setKeyState(f10IsRocker ? pc1500::Key::UpDownRocker : pc1500::Key::Sml, pressed);
+        } else if (kc == SDLK_INSERT || kc == SDLK_DELETE) {
+          // Both keys have exactly one PC-1500 meaning regardless of host
+          // Shift (there's no plain-key gesture for either), and neither
+          // produces SDL_TEXTINPUT (not printable characters) -- so unlike
+          // the printable punctuation handled by SDL_TEXTINPUT below, these
+          // stay a small dedicated keycode dispatch.
+          if (pressed && !event.key.repeat) {
+            pc1500::Key target = (kc == SDLK_INSERT) ? pc1500::Key::Right : pc1500::Key::Left;
+            symbolActionQueue.push_back({pc1500::Key::Shift, true, kTapFrames});
+            symbolActionQueue.push_back({pc1500::Key::Shift, false, kIdleFrames});
+            symbolActionQueue.push_back({target, true, kTapFrames});
+            symbolActionQueue.push_back({target, false, kIdleFrames});
+          }
+          // Release: nothing to do -- the queue above governs the target
+          // key's own release timing independently of the host key.
         } else {
-          bool handledByShiftedDirectMap = false;
-          for (size_t i = 0; i < std::size(kShiftedDirectMap); i++) {
-            const ShiftedDirectMapping& sdm = kShiftedDirectMap[i];
-            if (sdm.keycode != kc) continue;
-            if (pressed) {
-              if (event.key.repeat) {
-                handledByShiftedDirectMap = shiftedKeyActive[i];
-                break;
-              }
-              if (shiftHeld) {
-                bus.setKeyState(sdm.shiftedTarget, true);
-                shiftedKeyActive[i] = true;
-                handledByShiftedDirectMap = true;
-              } else {
-                shiftedKeyActive[i] = false;  // falls through to kKeyMap below
-              }
-            } else if (shiftedKeyActive[i]) {
-              bus.setKeyState(sdm.shiftedTarget, false);
-              shiftedKeyActive[i] = false;
-              handledByShiftedDirectMap = true;
-            }
-            break;
-          }
-          if (handledByShiftedDirectMap) {
-            // Handled above -- skip kSymbolMap/kKeyMap entirely for this
-            // event.
-          } else {
-          bool handledBySymbolMap = false;
-          for (size_t i = 0; i < std::size(kSymbolMap); i++) {
-            const SymbolMapping& sm = kSymbolMap[i];
-            if (sm.keycode != kc) continue;
-            if (pressed) {
-              if (event.key.repeat) {
-                // Don't flood the queue with duplicate sequences while
-                // the host key is held past the OS's key-repeat delay.
-                handledBySymbolMap = true;
-                break;
-              }
-              // Some of these keycodes are *shared*: on QWERTY, SDLK_1 is
-              // plain "1" alone, or "!" when host Shift is also held --
-              // shiftHeld must gate the choice, and plain "1" needs to
-              // fall through to kKeyMap (there's no PC-1500-Shift meaning
-              // for it at all). Others (Insert/Delete, or a layout like
-              // AZERTY reporting SDLK_QUOTEDBL directly for ") have only
-              // one meaning regardless of host Shift -- those are encoded
-              // by giving hasUnshiftedTarget=true with unshiftedTarget set
-              // to the *same* key as shiftedTarget, so they always queue
-              // the tap sequence without ever depending on shiftHeld.
-              bool hasTarget = true;
-              pc1500::Key target = pc1500::Key::Space;
-              if (shiftHeld) {
-                target = sm.shiftedTarget;
-              } else if (sm.hasUnshiftedTarget) {
-                target = sm.unshiftedTarget;
-              } else {
-                hasTarget = false;
-              }
-              if (hasTarget) {
-                // Fire-and-forget: queue the whole tap sequence now: it
-                // runs to completion regardless of how long the host
-                // key ends up being held, or when it's released.
-                symbolActionQueue.push_back({pc1500::Key::Shift, true, kTapFrames});
-                symbolActionQueue.push_back({pc1500::Key::Shift, false, kIdleFrames});
-                symbolActionQueue.push_back({target, true, kTapFrames});
-                symbolActionQueue.push_back({target, false, 0});
-                engagedViaKeyMap[i] = false;
-                handledBySymbolMap = true;
-              } else {
-                // No PC-1500-Shift meaning right now (e.g. plain "1")
-                // -- falls through to kKeyMap, remembered so release
-                // matches even if Shift's state changes meanwhile.
-                engagedViaKeyMap[i] = true;
-              }
-            } else if (!engagedViaKeyMap[i]) {
-              // This host key's last press was symbol-queued, not
-              // passed through to kKeyMap -- the queue above already
-              // handles releasing the target key on its own schedule,
-              // so there's nothing to do here.
-              handledBySymbolMap = true;
-            }
-            // else: last press fell through to kKeyMap, so let release
-            // fall through too (handledBySymbolMap stays false).
-            break;
-          }
-          if (!handledBySymbolMap) {
-            for (const KeyMapping& m : kKeyMap) {
-              if (m.keycode == kc) {
-                if (isImmediateHostKey(m.key)) {
-                  bus.setKeyState(m.key, pressed);
-                } else if (pressed) {
-                  // Ordinary text key: queue a fire-and-forget tap
-                  // (see kKeyMap's comment above) instead of reflecting
-                  // host press/release directly -- guarantees the ROM's
-                  // own minimum settle gap between keys regardless of how
-                  // fast the host reports them. Ignore OS key-repeat
-                  // (a long host hold) so it doesn't flood the queue.
-                  if (!event.key.repeat) {
-                    symbolActionQueue.push_back({m.key, true, kTapFrames});
-                    symbolActionQueue.push_back({m.key, false, kIdleFrames});
-                  }
+          for (const KeyMapping& m : kKeyMap) {
+            if (m.keycode == kc) {
+              if (isImmediateHostKey(m.key)) {
+                bus.setKeyState(m.key, pressed);
+              } else if (pressed) {
+                // Ordinary text key: queue a fire-and-forget tap
+                // (see kKeyMap's comment above) instead of reflecting
+                // host press/release directly -- guarantees the ROM's
+                // own minimum settle gap between keys regardless of how
+                // fast the host reports them. Ignore OS key-repeat
+                // (a long host hold) so it doesn't flood the queue.
+                if (!event.key.repeat) {
+                  symbolActionQueue.push_back({m.key, true, kTapFrames});
+                  symbolActionQueue.push_back({m.key, false, kIdleFrames});
                 }
-                // Release of a queued key: nothing to do -- the queued
-                // release above already governs timing independently of
-                // when the host key physically comes up.
-                break;
               }
+              // Release of a queued key: nothing to do -- the queued
+              // release above already governs timing independently of
+              // when the host key physically comes up.
+              break;
             }
           }
+        }
+      } else if (event.type == SDL_TEXTINPUT && event.text.windowID != mainWindowID) {
+        // Belongs to the dialog window -- its own ImGui context already
+        // processed it above; never feed it to the emulated keyboard.
+      } else if (event.type == SDL_TEXTINPUT) {
+        // The layout-aware source for every printable/symbol key not
+        // already handled directly above -- see the comment above
+        // kTapFrames for why this replaced keycode-based symbol tables.
+        // suppressNextTextInput (computed on the preceding KEYDOWN, above)
+        // skips this whenever that key was already handled there, so nothing
+        // ever fires twice.
+        if (!suppressNextTextInput) {
+          for (const char* p = event.text.text; *p != '\0'; ++p) {
+            charToTapActions(*p, &symbolActionQueue);
           }
         }
       }
@@ -2137,7 +2208,7 @@ int main(int argc, char** argv) {
     }
 
     // Process one step of the pending symbol-tap queue per frame,
-    // independent of host key state (see kSymbolMap/QueuedKeyAction).
+    // independent of host key state (see QueuedKeyAction).
     if (!symbolActionQueue.empty() && --symbolActionFramesRemaining <= 0) {
       QueuedKeyAction action = symbolActionQueue.front();
       symbolActionQueue.pop_front();
@@ -2278,7 +2349,11 @@ int main(int argc, char** argv) {
   }
 
   closeDialogWindow();
+#if defined(_WIN32)
+  cmdPipeClose();
+#else
   if (cmdFifoFd >= 0) close(cmdFifoFd);
+#endif
 
   for (auto& [text, tex] : indicatorTextures) {
     (void)text;

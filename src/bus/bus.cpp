@@ -2,6 +2,18 @@
 // Version 2.0 -- see LICENSE.
 #include "bus.h"
 
+namespace {
+inline std::tm portable_localtime(std::time_t t) {
+  std::tm result{};
+#if defined(_WIN32)
+  localtime_s(&result, &t);
+#else
+  localtime_r(&t, &result);
+#endif
+  return result;
+}
+}  // namespace
+
 namespace pc1500 {
 
 namespace {
@@ -85,8 +97,7 @@ bool Upd1990ac::advanceRealTime(double elapsedSeconds) {
 uint64_t Upd1990ac::liveTimeAsBcd40() const {
   auto now = std::chrono::system_clock::now() + timeOffset_;
   std::time_t t = std::chrono::system_clock::to_time_t(now);
-  std::tm tmv{};
-  localtime_r(&t, &tmv);
+  std::tm tmv = portable_localtime(t);
 
   uint8_t month = static_cast<uint8_t>(tmv.tm_mon + 1);  // 1-12, binary/hex -- not BCD
   uint8_t dow = static_cast<uint8_t>(tmv.tm_wday);        // 0-6, Sunday=0
@@ -119,8 +130,7 @@ void Upd1990ac::commitShiftRegisterToTime() {
 
   auto now = std::chrono::system_clock::now();
   std::time_t nowT = std::chrono::system_clock::to_time_t(now);
-  std::tm tmv{};
-  localtime_r(&nowT, &tmv);  // seeds tm_year -- the chip has no year field at all
+  std::tm tmv = portable_localtime(nowT);  // seeds tm_year -- the chip has no year field at all
   tmv.tm_mon = month - 1;
   tmv.tm_mday = day;
   tmv.tm_hour = hour;
