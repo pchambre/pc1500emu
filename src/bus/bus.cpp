@@ -158,8 +158,19 @@ uint8_t IoPortController::read(uint8_t reg) const {
       // Bits 5/6 are hardwired to the RTC's TP/DATA OUT pins (see rtc_ and
       // docs/pc1500_hardware_reference.md), read unconditionally like PB7
       // regardless of DDB -- these aren't general-purpose I/O on a stock
-      // PC-1500.
+      // PC-1500. Bit 3 (PB3) is hardwired to VCC on export units (GND on
+      // domestic ones) -- previously documented as "no logical function"
+      // since nothing writes it, until tracing the SML-key regression
+      // (2026-08-06) found the ROM's keyboard dispatch at E3F6H *reads*
+      // PB3 to decide whether to run its real Small-toggle code (E40CH,
+      // EAI #08H against 764EH) or fall into an inert cleanup path. With
+      // PB3 left at its opb_ default of 0 (unset), every SML press took
+      // the inert path and the Small status bit could never be set -- SML
+      // silently never worked on this export-ROM build. Forcing this bit
+      // high (matching VCC) is what real export hardware's dispatch code
+      // is actually reading.
       uint8_t v = static_cast<uint8_t>(opb_ & 0x1F);
+      v = static_cast<uint8_t>(v | 0x08);
       v = static_cast<uint8_t>(v | (rtc_.tp() ? 0x20 : 0x00));
       v = static_cast<uint8_t>(v | (rtc_.dataOut() ? 0x40 : 0x00));
       v = static_cast<uint8_t>(v | (onKeyLine_ ? 0x80 : 0x00));

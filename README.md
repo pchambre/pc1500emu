@@ -62,7 +62,7 @@ directly; Backspace duplicates the left arrowhead. PC-1500 keys without an
 obvious host equivalent live on F7-F12 for muscle-memory reasons (chosen
 over keys like Delete/Insert, which don't map intuitively to a
 calculator's special keys):
-- F7 = Cl, F8 = Mode, F9 = Def, F10 = Sml, F11 = Rcl
+- F7 = CL, F8 = MODE, F9 = DEF, F10 = SML, F11 = RCL
 - Shift+F10 = the up/down rocker key
 - **F12 = On** (it's wired directly to the CPU, not part of the keyboard
   matrix, so it's handled separately from every other key). While a

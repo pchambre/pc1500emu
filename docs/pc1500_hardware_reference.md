@@ -272,7 +272,7 @@ ones — G, F, MSK/IF beyond basic IRQ, serial U/transmit):
 | PA0-PA7 | key strobe | Keyboard column drive (8 lines) |
 | PB0, PB1 | — | not used |
 | PB2 | — | cassette serial in (out of scope) |
-| PB3 | — | VCC (export) / GND (domestic) — no logical function |
+| PB3 | — | VCC (export) / GND (domestic) — read by the ROM's keyboard dispatch (E3F6H, F00FH bit 3) to gate whether the SML/Shift/Def-style status-toggle code at E40CH actually runs; confirmed on the export ROM, where it must read high (`Bus` forces this bit on readback -- see the SML-regression comment in `bus.cpp`) |
 | PB4 | — | GND |
 | PB5, PB6 | — | uPD1990AC RTC: TP (timer pulse) / DATA OUT -- see "uPD1990AC real-time clock" below |
 | PB7 | ON key input | dedicated ON-key read (see Keyboard) |

@@ -39,8 +39,29 @@
 #include "keyboard.h"
 #include "lcd.h"
 #include "lh5801.h"
+#include "text_loader.h"
 
 namespace {
+
+// Keystroke-tap timing, the QueuedKeyAction type, charToTapActions, and the
+// BASIC program load/save helpers (findBasicProgramEnd,
+// readBasicProgramBytes, saveBasicProgram, saveBasicTextFile,
+// loadBasicProgram, typeBasicProgramText, kBasicProgramStart,
+// kProgramEndPointerAddr) all live in src/basic/text_loader.h now -- shared
+// with tests/basic_load_roundtrip_test.cpp, which needs to drive the ROM's
+// line editor the exact same way this file does, without a GUI. Pulled
+// into unqualified scope here so every existing call site below (the
+// interactive symbolActionQueue, calltrace, entertrace, and friends) keeps
+// compiling unchanged.
+using pc1500::basic::charToTapActions;
+using pc1500::basic::kIdleFrames;
+using pc1500::basic::kTapFrames;
+using pc1500::basic::loadBasicProgram;
+using pc1500::basic::QueuedKeyAction;
+using pc1500::basic::readBasicProgramBytes;
+using pc1500::basic::saveBasicProgram;
+using pc1500::basic::saveBasicTextFile;
+using pc1500::basic::typeBasicProgramText;
 
 constexpr int kScale = 6;         // pixels per dot
 // ImGui's default main menu bar height at default font size.
@@ -396,22 +417,14 @@ constexpr KeyMapping kKeyMap[] = {
 // loop below, and suppressNextTextInput's comment for how it avoids
 // double-handling keys kKeyMap already deals with directly (letters,
 // numpad, arrows, etc.).
-constexpr int kTapFrames = 4;   // ~67ms -- spans the ROM's ~25ms scan cadence
-constexpr int kIdleFrames = 4;  // ~67ms -- empirically bisected minimum (2026-08-02, after
-                                 // fixing kCyclesPerTimerTick, see the comment above) that
-                                 // still reliably registers BASWORD keywords; 3 fails
-                                 // reliably. Down from 14 (~233ms) before that fix.
-
-// One step of a queued symbol-tap sequence (see the comment above
-// kTapFrames): set a PC-1500 key's state, then wait `framesToWait` real
-// frames before the next queued action runs. Processed one action at a
-// time in the main loop, independent of host key state -- see the
-// "fire-and-forget" rationale in that same comment.
-struct QueuedKeyAction {
-  pc1500::Key key;
-  bool pressed;
-  int framesToWait;
-};
+// kTapFrames (~67ms, spans the ROM's ~25ms scan cadence) / kIdleFrames
+// (~67ms, empirically bisected minimum that still reliably registers
+// BASWORD keywords -- 3 fails reliably) and QueuedKeyAction (one step of a
+// queued symbol-tap sequence: set a PC-1500 key's state, then wait
+// `framesToWait` real frames before the next queued action runs, processed
+// one action at a time in the main loop, independent of host key state --
+// the "fire-and-forget" rationale below) now live in text_loader.h, pulled
+// into scope by the `using` block above.
 
 // ---- Scriptable command interface (pc1500emu.cmd) ----
 //
@@ -553,101 +566,14 @@ void cmdPipeClose() {
 }
 #endif  // _WIN32
 
-// Maps a plain typed character to a direct PC-1500 keypress (letters,
-// digits, space) or a Shift-tap sequence (symbols that need PC-1500 Shift)
-// -- returns false if there's no mapping at all, in which case the caller
-// should use `key NAME` instead. The single source of truth for "what does
-// this character do on the PC-1500", used both by the scriptable command
-// interface's `type` command and (see the SDL_TEXTINPUT branch in the main
-// loop, and the comment above kTapFrames) live keyboard input.
-bool charToTapActions(char c, std::deque<QueuedKeyAction>* out) {
-  pc1500::Key direct{};
-  bool hasDirect = true;
-  char upper = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c;
-  if (upper >= 'A' && upper <= 'Z') {
-    direct = static_cast<pc1500::Key>(static_cast<int>(pc1500::Key::A) + (upper - 'A'));
-  } else if (c >= '0' && c <= '9') {
-    direct = static_cast<pc1500::Key>(static_cast<int>(pc1500::Key::Digit0) + (c - '0'));
-  } else if (c == ' ') {
-    direct = pc1500::Key::Space;
-  } else if (c == '.') {
-    direct = pc1500::Key::Period;
-  } else if (c == '/') {
-    direct = pc1500::Key::Slash;
-  } else if (c == '+') {
-    direct = pc1500::Key::Plus;
-  } else if (c == '-') {
-    direct = pc1500::Key::Minus;
-  } else if (c == '=') {
-    direct = pc1500::Key::Equals;
-  } else if (c == '(') {
-    // LeftParen/RightParen are dedicated, unshifted PC-1500 keys (IN6/PA3
-    // and IN0/PA3 -- see docs/pc1500_hardware_reference.md's key matrix)
-    // -- '(' and ')' need no PC-1500 Shift at all, unlike '<'/'>' below
-    // which are the *shifted* meaning of the same two physical keys.
-    direct = pc1500::Key::LeftParen;
-  } else if (c == ')') {
-    direct = pc1500::Key::RightParen;
-  } else if (c == '*') {
-    // Asterisk is the PC-1500's dedicated multiply key; unshifted it
-    // types '*' (see kKeyMap's SDLK_KP_MULTIPLY entry) -- shifted, it
-    // types ':' (handled below).
-    direct = pc1500::Key::Asterisk;
-  } else {
-    hasDirect = false;
-  }
-  if (hasDirect) {
-    out->push_back({direct, true, kTapFrames});
-    out->push_back({direct, false, kIdleFrames});
-    return true;
-  }
-  // Symbols needing a PC-1500 Shift-tap sequence -- target keys
-  // (F1-F6/Equals/Space/Slash/LeftParen/RightParen/Asterisk/Plus/Minus,
-  // each PC-1500-Shifted) confirmed on real hardware to produce these
-  // symbols, indexed here by the character itself rather than by host
-  // keycode -- see the comment above kTapFrames for why.
-  pc1500::Key shiftedTarget{};
-  bool hasShifted = true;
-  if (c == '!') {
-    shiftedTarget = pc1500::Key::F1;
-  } else if (c == '"') {
-    shiftedTarget = pc1500::Key::F2;
-  } else if (c == '#') {
-    shiftedTarget = pc1500::Key::F3;
-  } else if (c == '$') {
-    shiftedTarget = pc1500::Key::F4;
-  } else if (c == '%') {
-    shiftedTarget = pc1500::Key::F5;
-  } else if (c == '&') {
-    shiftedTarget = pc1500::Key::F6;
-  } else if (c == '@') {
-    shiftedTarget = pc1500::Key::Equals;
-  } else if (c == '^') {
-    shiftedTarget = pc1500::Key::Space;
-  } else if (c == '?') {
-    shiftedTarget = pc1500::Key::Slash;
-  } else if (c == ':') {
-    shiftedTarget = pc1500::Key::Asterisk;
-  } else if (c == '<') {
-    shiftedTarget = pc1500::Key::LeftParen;
-  } else if (c == '>') {
-    shiftedTarget = pc1500::Key::RightParen;
-  } else if (c == ';') {
-    shiftedTarget = pc1500::Key::Plus;
-  } else if (c == ',') {
-    shiftedTarget = pc1500::Key::Minus;
-  } else {
-    hasShifted = false;
-  }
-  if (hasShifted) {
-    out->push_back({pc1500::Key::Shift, true, kTapFrames});
-    out->push_back({pc1500::Key::Shift, false, kIdleFrames});
-    out->push_back({shiftedTarget, true, kTapFrames});
-    out->push_back({shiftedTarget, false, kIdleFrames});
-    return true;
-  }
-  return false;
-}
+// charToTapActions (maps a plain typed character to a direct PC-1500
+// keypress or a Shift-tap sequence, returning false if there's no mapping
+// at all, in which case the caller should use `key NAME` instead) now
+// lives in text_loader.h/.cpp, pulled into scope by the `using` block
+// above -- the single source of truth for "what does this character do on
+// the PC-1500", used both by the scriptable command interface's `type`
+// command and (see the SDL_TEXTINPUT branch in the main loop) live
+// keyboard input.
 
 // Maps a `key NAME` command's name (case-insensitive) to a PC-1500 key for
 // a direct tap -- covers keys with no natural printable-character form
@@ -763,264 +689,13 @@ bool saveBinary(pc1500::Bus& bus, uint16_t addr, uint32_t len, const char* path,
   return true;
 }
 
-// ---- BASIC load-save: CLOAD / CSAVE semantics (filename only, no offsets)
-// ----
-//
-// The BASIC program itself always starts at 40C5H on a bare PC-1500 (see
-// docs/pc1500_hardware_reference.md's reserve-area note) and is a sequence
-// of lines, each [2-byte line number][1-byte line size][line-size bytes of
-// tokenized code][0DH], terminated by a single FFH byte after the last
-// line (PC-1500 Technical Reference Manual section 5-3-5, "Structure of
-// program", confirmed against its own worked example). That FFH byte is
-// what CLOAD/CSAVE actually key off, *not* anything in the 4000H-40C4H
-// reserve area -- an earlier version of our own hardware-reference doc
-// assumed the reserve area held a live "pointer to the BASIC program",
-// but on closer reading (PC1500_Technical_reference_manual.pdf section
-// 5-3-6) that area is ROM/module bookkeeping and F1-F6 key-reassignment
-// shortcuts, unrelated to CLOAD/CSAVE bounds -- see the correction in
-// that doc.
-//
-// We walk the line structure (rather than just scanning for the first FFH
-// byte) so an FFH that happens to occur *inside* a line's own tokenized
-// content or a string literal can't be mistaken for the terminator -- each
-// line's own size field tells us exactly how many content bytes to skip.
-constexpr uint16_t kBasicProgramStart = 0x40C5;
-
-// Returns the address of the terminating FFH byte (i.e. one past the last
-// real program byte), or 0 if the structure runs off the end of the
-// addressable range without finding one (a corrupt/never-initialized
-// program area).
-uint32_t findBasicProgramEnd(pc1500::Bus& bus) {
-  uint32_t addr = kBasicProgramStart;
-  while (addr <= 0xFFFF) {
-    uint8_t hi = bus.readME0(static_cast<uint16_t>(addr));
-    if (hi == 0xFF) return addr;  // end-of-program marker
-    if (addr + 2 > 0xFFFF) break;
-    uint8_t lineSize = bus.readME0(static_cast<uint16_t>(addr + 2));
-    // lineSize already includes the trailing 0DH terminator byte (verified
-    // against the manual's own worked example: line "10 PRINT A"'s size
-    // byte is 04H, covering exactly F0 97 41 0D -- 3 content bytes plus
-    // the CR, not just the content).
-    addr += 3 + lineSize;  // line#(2) + size(1) + (content + CR)(lineSize)
-  }
-  return 0;
-}
-
-// Reads the current BASIC program's raw tokenized bytes (kBasicProgramStart
-// through the trailing 0xFFH, inclusive) -- shared by the binary and text
-// save paths. Returns an empty vector and sets *error if the program area
-// looks corrupt.
-std::vector<uint8_t> readBasicProgramBytes(pc1500::Bus& bus, std::string* error) {
-  uint32_t endAddr = findBasicProgramEnd(bus);
-  if (endAddr == 0) {
-    *error = "Could not find end of BASIC program (corrupt program area?).";
-    return {};
-  }
-  std::vector<uint8_t> data;
-  data.reserve(endAddr - kBasicProgramStart + 1);
-  for (uint32_t a = kBasicProgramStart; a <= endAddr; a++) {
-    data.push_back(bus.readME0(static_cast<uint16_t>(a)));
-  }
-  return data;
-}
-
-bool saveBasicProgram(pc1500::Bus& bus, const char* path, std::string* error) {
-  std::vector<uint8_t> data = readBasicProgramBytes(bus, error);
-  if (data.empty()) return false;
-  std::ofstream f(path, std::ios::binary);
-  if (!f) {
-    *error = "Could not open file for writing.";
-    return false;
-  }
-  f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
-  return true;
-}
-
-bool saveBasicTextFile(pc1500::Bus& bus, const char* path, std::string* error) {
-  std::vector<uint8_t> data = readBasicProgramBytes(bus, error);
-  if (data.empty()) return false;
-  std::string text;
-  if (!pc1500::basic::detokenizeBasicProgram(data, &text, error)) return false;
-  std::ofstream f(path, std::ios::binary);
-  if (!f) {
-    *error = "Could not open file for writing.";
-    return false;
-  }
-  f.write(text.data(), static_cast<std::streamsize>(text.size()));
-  return true;
-}
-
-// The ROM tracks the program's end address itself (not just the FFH byte
-// in-place) at this fixed system-RAM location -- big-endian, value = the
-// address of the FFH terminator itself (i.e. exactly what
-// findBasicProgramEnd() returns). Found empirically: LIST/RUN both showed
-// nothing for a program whose bytes were otherwise byte-for-byte correct
-// (verified via direct memory dump) until this pointer was also updated to
-// match -- writing raw program bytes into 40C5H+ alone isn't sufficient,
-// this cached pointer has to agree or the ROM still thinks the program
-// ends wherever it last did (e.g. right at 40C5H, if the program was
-// cleared just before loading).
-constexpr uint16_t kProgramEndPointerAddr = 0x7867;
-
-bool loadBasicProgram(pc1500::Bus& bus, const char* path, std::string* error) {
-  std::vector<uint8_t> data = readFile(path);
-  if (data.empty()) {
-    *error = "Could not read file (or file is empty).";
-    return false;
-  }
-  if (data.back() != 0xFF) {
-    *error = "File doesn't end with the BASIC end-of-program marker (FFH) -- not a saved BASIC program?";
-    return false;
-  }
-  bus.loadME0(kBasicProgramStart, data.data(), data.size());
-  uint32_t endAddr = kBasicProgramStart + data.size() - 1;
-  bus.writeME0(kProgramEndPointerAddr, static_cast<uint8_t>(endAddr >> 8));
-  bus.writeME0(kProgramEndPointerAddr + 1, static_cast<uint8_t>(endAddr & 0xFF));
-  return true;
-}
-
-// Loads `text` (one BASIC program line per input line, e.g. a listing
-// pasted from a magazine transcription) by driving the ROM's own PRO-mode
-// line editor via simulated keystrokes -- see the design note above
-// charToTapActions. This is authoritative rather than a reimplementation:
-// the ROM itself tokenizes each line exactly as it would for a human
-// typing it in, including quirks (like the "GOSUB \"label\"" idiom) a
-// hand-written parser would have to special-case.
-//
-// Not tied to real GUI frames: advances cpu/bus cycles directly (the same
-// stepping shape as the FIFO `run` command) rather than pacing one key
-// action per real frame the way the interactive symbolActionQueue does,
-// so a whole listing loads in well under a second of host time regardless
-// of how many characters it "types".
-bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& text,
-                          std::string* error) {
-  int cyclesSinceTimerTick = 0;
-  auto stepCycles = [&](long cycles) {
-    for (long i = 0; i < cycles;) {
-      int c = cpu.step();
-      int used = (c > 0) ? c : 1;
-      i += used;
-      cyclesSinceTimerTick += used;
-      bus.advanceCycles(used);
-      while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
-        cpu.tickTimer();
-        cyclesSinceTimerTick -= kCyclesPerTimerTick;
-      }
-    }
-  };
-  auto runKeyAction = [&](const QueuedKeyAction& action) {
-    bus.setKeyState(action.key, action.pressed);
-    stepCycles(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
-  };
-  auto typeChar = [&](char c) {
-    std::deque<QueuedKeyAction> actions;
-    if (!charToTapActions(c, &actions)) return false;
-    for (const QueuedKeyAction& action : actions) runKeyAction(action);
-    return true;
-  };
-  auto pressEnter = [&]() {
-    runKeyAction({pc1500::Key::Ent, true, kTapFrames});
-    runKeyAction({pc1500::Key::Ent, false, kIdleFrames});
-  };
-  auto pressCl = [&]() {
-    runKeyAction({pc1500::Key::Cl, true, kTapFrames});
-    runKeyAction({pc1500::Key::Cl, false, kIdleFrames});
-  };
-
-  // The ROM boots (and returns after certain operations) to a state that
-  // doesn't respond to typed characters until CL is pressed once --
-  // confirmed empirically via the FIFO (`key cl` before typing was the
-  // difference between every line being silently ignored and a line
-  // typing and storing correctly). One press here, not per-line: once the
-  // first line is accepted, the ROM's own line editor returns to a fresh
-  // prompt ready for the next line on its own.
-  pressCl();
-
-  // Full replace, not merge: clear the program through the ROM's own NEW
-  // command (typed, like everything else here) rather than poking
-  // kBasicProgramStart/kProgramEndPointerAddr directly -- confirmed
-  // empirically that a direct poke leaves the program area in a state the
-  // ROM's own periodic memory-validity pass doesn't recognize as either
-  // "freshly typed" or "properly cleared", and it quietly re-zeroes
-  // 4000H-47FFH (including whatever we'd just typed) within the next
-  // several hundred thousand cycles -- invisible to a check done right
-  // after each line, but very visible by the time the whole load
-  // finishes. Driving NEW the same way a human would avoids relying on
-  // any of that internal bookkeeping being right.
-  for (char c : std::string("NEW0")) typeChar(c);
-  pressEnter();
-  // NEW's own memory-clear work isn't done the instant Enter is processed
-  // -- give it extra settling time beyond the usual per-key idle gap
-  // before typing the first program line, confirmed empirically necessary
-  // (without this, the very first line -- sometimes several -- was
-  // silently rejected as if the ROM wasn't listening yet).
-  stepCycles(4L * kIdleFrames * kCyclesPerFrame);
-
-  std::vector<std::string> rejectedLines;
-  std::istringstream lineStream(text);
-  std::string line;
-  while (std::getline(lineStream, line)) {
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (line.find_first_not_of(" \t") == std::string::npos) continue;  // blank line
-
-    // The ROM's own line editor has a hard 79-character input limit
-    // (confirmed empirically: a 79-character line stores in full, an
-    // 80-character line has its 80th character and everything after it
-    // silently dropped, with no error shown -- the line is just cut off
-    // mid-token/mid-string and Enter commits whatever's left). Checked
-    // proactively here rather than relying on findBasicProgramEnd growing
-    // at all below: a truncated line still grows the program area (just
-    // not by as much as intended), so that check alone can't tell "stored
-    // in full" from "silently truncated" -- it would otherwise report
-    // this line as accepted while quietly corrupting it.
-    if (line.size() > 79) {
-      *error = "line exceeds the PC-1500's 79-character input limit (" +
-               std::to_string(line.size()) + " chars) and would be silently truncated by the "
-               "ROM -- split it into multiple lines: " + line;
-      return false;
-    }
-
-    uint32_t beforeEnd = findBasicProgramEnd(bus);
-    for (char c : line) {
-      if (!typeChar(c)) {
-        *error = "no keystroke mapping for character '" + std::string(1, c) + "' in line: " + line;
-        return false;
-      }
-    }
-    pressEnter();
-    // A line's own tokenization/storage work isn't necessarily done the
-    // instant Enter is processed -- same issue as NEW0's own extra
-    // settling above, but per-line instead of once. Confirmed empirically:
-    // a long-but-simple line (e.g. one big PRINT literal) settles fine
-    // with only the per-key idle gap, but a line combining several
-    // colon-separated statements with a multi-argument function call
-    // (e.g. `... MID$(D$,I,1) ... : GOSUB 110 : V1=V`) does not -- without
-    // this extra settle, the *next* line's very first typed characters
-    // arrive while the ROM is still busy with this one and get dropped,
-    // which then manifests as the next line being wrongly reported as
-    // rejected (a cascading false positive, not a real syntax error).
-    stepCycles(4L * kIdleFrames * kCyclesPerFrame);
-    if (findBasicProgramEnd(bus) == beforeEnd) {
-      // The ROM didn't grow the program area at all -- it rejected this
-      // line (most likely a syntax error). We can't recover its specific
-      // error text without decoding LCD pixels, but we can at least
-      // surface which line didn't take instead of silently dropping it.
-      rejectedLines.push_back(line);
-    }
-  }
-
-  if (!rejectedLines.empty()) {
-    std::string msg =
-        std::to_string(rejectedLines.size()) + " line(s) rejected by the ROM (syntax error?): ";
-    for (size_t i = 0; i < rejectedLines.size(); i++) {
-      if (i > 0) msg += " | ";
-      msg += rejectedLines[i];
-    }
-    *error = msg;
-    return false;
-  }
-  return true;
-}
+// BASIC program load/save helpers (kBasicProgramStart, kProgramEndPointerAddr,
+// findBasicProgramEnd, readBasicProgramBytes, saveBasicProgram,
+// saveBasicTextFile, loadBasicProgram, typeBasicProgramText -- CLOAD/CSAVE
+// filename-only semantics, the ROM's program storage format per Technical
+// Reference Manual section 5-3-5, and keystroke-driven text loading with
+// SML/lowercase handling) now live in src/basic/text_loader.h/.cpp, pulled
+// into scope by the 'using' block above.
 
 // Types a single line via direct cycle-stepping (same technique as
 // typeBasicProgramText -- reliable regardless of real-frame pacing) and
@@ -1807,7 +1482,7 @@ int main(int argc, char** argv) {
         writeResponse("ERROR: Could not read file (or file is empty).");
       } else {
         std::string text(fileData.begin(), fileData.end());
-        bool ok = typeBasicProgramText(bus, cpu, text, &error);
+        bool ok = typeBasicProgramText(bus, cpu, text, kCyclesPerFrame, kCyclesPerTimerTick, &error);
         writeResponse(ok ? "OK" : ("ERROR: " + error));
       }
     } else if (cmd == "savebinary") {
@@ -2592,7 +2267,8 @@ int main(int argc, char** argv) {
               break;
             }
             case ActiveDialog::LoadBasicText:
-              ok = typeBasicProgramText(bus, cpu, basicTextBuf.get(), &dialogError);
+              ok = typeBasicProgramText(bus, cpu, basicTextBuf.get(), kCyclesPerFrame,
+                                        kCyclesPerTimerTick, &dialogError);
               break;
             case ActiveDialog::SaveBasicText: {
               std::ofstream f(filenameBuf, std::ios::binary);
