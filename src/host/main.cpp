@@ -244,8 +244,19 @@ constexpr KeyMapping kKeyMap[] = {
     {SDLK_s, pc1500::Key::S}, {SDLK_t, pc1500::Key::T}, {SDLK_u, pc1500::Key::U},
     {SDLK_v, pc1500::Key::V}, {SDLK_w, pc1500::Key::W}, {SDLK_x, pc1500::Key::X},
     {SDLK_y, pc1500::Key::Y}, {SDLK_z, pc1500::Key::Z},
-    {SDLK_MINUS, pc1500::Key::Minus}, {SDLK_EQUALS, pc1500::Key::Equals},
-    {SDLK_SLASH, pc1500::Key::Slash}, {SDLK_PERIOD, pc1500::Key::Period},
+    // Deliberately no {SDLK_MINUS, ...}/{SDLK_EQUALS, ...}/{SDLK_SLASH,
+    // ...}/{SDLK_PERIOD, ...} entries -- same class of bug the top-row
+    // digits comment above already explains: these are direct-keycode
+    // entries that ignore host Shift entirely, and (confirmed on Windows/
+    // AZERTY, same root cause as the digit row) the underlying keycode is
+    // tied to physical scancode position, not actual layout/shift-level
+    // glyph. On AZERTY, the key two right of '0' is unshifted '=',
+    // shifted '+' -- but this direct entry always sent plain Equals
+    // regardless of Shift, so Shift+that-key produced '=' instead of '+'.
+    // charToTapActions already handles '.', '/', '-', '=' (and their
+    // shifted forms) correctly by the actual character SDL_TEXTINPUT
+    // reports, so removing these entries here lets that layout-aware path
+    // handle them, exactly like the digit row.
     {SDLK_LEFTBRACKET, pc1500::Key::LeftParen},   // nearest substitute for (
     {SDLK_RIGHTBRACKET, pc1500::Key::RightParen}, // nearest substitute for )
     {SDLK_KP_PLUS, pc1500::Key::Plus},
@@ -952,6 +963,23 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
     if (!line.empty() && line.back() == '\r') line.pop_back();
     if (line.find_first_not_of(" \t") == std::string::npos) continue;  // blank line
 
+    // The ROM's own line editor has a hard 79-character input limit
+    // (confirmed empirically: a 79-character line stores in full, an
+    // 80-character line has its 80th character and everything after it
+    // silently dropped, with no error shown -- the line is just cut off
+    // mid-token/mid-string and Enter commits whatever's left). Checked
+    // proactively here rather than relying on findBasicProgramEnd growing
+    // at all below: a truncated line still grows the program area (just
+    // not by as much as intended), so that check alone can't tell "stored
+    // in full" from "silently truncated" -- it would otherwise report
+    // this line as accepted while quietly corrupting it.
+    if (line.size() > 79) {
+      *error = "line exceeds the PC-1500's 79-character input limit (" +
+               std::to_string(line.size()) + " chars) and would be silently truncated by the "
+               "ROM -- split it into multiple lines: " + line;
+      return false;
+    }
+
     uint32_t beforeEnd = findBasicProgramEnd(bus);
     for (char c : line) {
       if (!typeChar(c)) {
@@ -960,6 +988,18 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
       }
     }
     pressEnter();
+    // A line's own tokenization/storage work isn't necessarily done the
+    // instant Enter is processed -- same issue as NEW0's own extra
+    // settling above, but per-line instead of once. Confirmed empirically:
+    // a long-but-simple line (e.g. one big PRINT literal) settles fine
+    // with only the per-key idle gap, but a line combining several
+    // colon-separated statements with a multi-argument function call
+    // (e.g. `... MID$(D$,I,1) ... : GOSUB 110 : V1=V`) does not -- without
+    // this extra settle, the *next* line's very first typed characters
+    // arrive while the ROM is still busy with this one and get dropped,
+    // which then manifests as the next line being wrongly reported as
+    // rejected (a cascading false positive, not a real syntax error).
+    stepCycles(4L * kIdleFrames * kCyclesPerFrame);
     if (findBasicProgramEnd(bus) == beforeEnd) {
       // The ROM didn't grow the program area at all -- it rejected this
       // line (most likely a syntax error). We can't recover its specific
@@ -1078,10 +1118,14 @@ bool typeImmediateLinePartialIdle(pc1500::Bus& bus, lh5801::CPU& cpu, const std:
 // observe what happens during/after the sensitive transition.
 bool typeImmediateLinePartialIdleTraced(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& line,
                                          int shortIdlePos, int shortIdleFrames, int tailChars,
+                                         long extraCycles,
                                          std::string* error, std::string* traceOut) {
   int cyclesSinceTimerTick = 0;
   std::ostringstream out;
-  bool tracing = false;
+  // shortIdlePos == -1: trace from the very first character's first action,
+  // not just from after some later character finishes -- needed to see
+  // what happens on the *first* keystroke of a line, not only later ones.
+  bool tracing = (shortIdlePos == -1);
   int charsTracedSince = 0;
   auto stepCyclesMaybeTraced = [&](long cycles) {
     for (long i = 0; i < cycles;) {
@@ -1103,7 +1147,8 @@ bool typeImmediateLinePartialIdleTraced(pc1500::Bus& bus, lh5801::CPU& cpu, cons
         out.width(2); out.fill('0'); out << static_cast<int>(cpu.a()) << " X=";
         out.width(4); out.fill('0'); out << cpu.x() << " Y=";
         out.width(4); out.fill('0'); out << cpu.y() << " U=";
-        out.width(4); out.fill('0'); out << cpu.u() << " 7B0E=";
+        out.width(4); out.fill('0'); out << cpu.u() << " S=";
+        out.width(4); out.fill('0'); out << cpu.s() << " 7B0E=";
         out.width(2); out.fill('0'); out << static_cast<int>(bus.readME0(0x7B0E)) << "\n";
       }
     }
@@ -1130,7 +1175,84 @@ bool typeImmediateLinePartialIdleTraced(pc1500::Bus& bus, lh5801::CPU& cpu, cons
       if (charsTracedSince > tailChars) break;
     }
   }
+  // Keep tracing past the last typed character's own kIdleFrames settle --
+  // some display/state updates (e.g. the LCD buffer mode byte at 7880H)
+  // don't happen within a single character's own minimal settle window,
+  // only after further natural idle-loop cycling.
+  if (extraCycles > 0) {
+    tracing = true;
+    stepCyclesMaybeTraced(extraCycles);
+  }
   *traceOut = out.str();
+  return true;
+}
+
+// Debug-only watchpoint: types `line` (same proven cycle-stepping path as
+// typeImmediateLine, from the very first character), then continues for
+// `extraCycles` more, and after EVERY single instruction checks whether
+// the `watchLen` bytes starting at `watchAddr` changed since the previous
+// instruction. Since exactly one instruction executes between checks, any
+// change is unambiguously attributable to the instruction at `pBefore` --
+// far faster than eyeballing full instruction traces to find which of
+// thousands of instructions touched a specific address. Logs one line per
+// write: PC, old bytes, new bytes, plus A/X/Y/U for context.
+bool typeImmediateLineWatch(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& line,
+                             uint16_t watchAddr, int watchLen, long extraCycles, std::string* error,
+                             std::string* watchOut) {
+  int cyclesSinceTimerTick = 0;
+  std::ostringstream out;
+  std::vector<uint8_t> prevBytes(watchLen);
+  for (int i = 0; i < watchLen; i++) prevBytes[i] = bus.readME0(static_cast<uint16_t>(watchAddr + i));
+  auto stepCyclesWatched = [&](long cycles) {
+    for (long i = 0; i < cycles;) {
+      uint16_t pBefore = cpu.p();
+      int c = cpu.step();
+      int used = (c > 0) ? c : 1;
+      i += used;
+      cyclesSinceTimerTick += used;
+      bus.advanceCycles(used);
+      while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+        cpu.tickTimer();
+        cyclesSinceTimerTick -= kCyclesPerTimerTick;
+      }
+      bool changed = false;
+      for (int b = 0; b < watchLen; b++) {
+        if (bus.readME0(static_cast<uint16_t>(watchAddr + b)) != prevBytes[b]) changed = true;
+      }
+      if (changed) {
+        out << std::hex << std::uppercase;
+        out.width(4); out.fill('0'); out << pBefore << " wrote " << watchAddr << ": ";
+        for (int b = 0; b < watchLen; b++) {
+          out.width(2); out.fill('0'); out << static_cast<int>(prevBytes[b]) << " ";
+        }
+        out << "-> ";
+        for (int b = 0; b < watchLen; b++) {
+          uint8_t nv = bus.readME0(static_cast<uint16_t>(watchAddr + b));
+          out.width(2); out.fill('0'); out << static_cast<int>(nv) << " ";
+          prevBytes[b] = nv;
+        }
+        out << " A="; out.width(2); out.fill('0'); out << static_cast<int>(cpu.a());
+        out << " X="; out.width(4); out.fill('0'); out << cpu.x();
+        out << " Y="; out.width(4); out.fill('0'); out << cpu.y();
+        out << " U="; out.width(4); out.fill('0'); out << cpu.u();
+        out << " S="; out.width(4); out.fill('0'); out << cpu.s() << "\n";
+      }
+    }
+  };
+  auto runKeyAction = [&](const QueuedKeyAction& action) {
+    bus.setKeyState(action.key, action.pressed);
+    stepCyclesWatched(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
+  };
+  for (char c : line) {
+    std::deque<QueuedKeyAction> actions;
+    if (!charToTapActions(c, &actions)) {
+      *error = "no keystroke mapping for character '" + std::string(1, c) + "'";
+      return false;
+    }
+    for (const QueuedKeyAction& action : actions) runKeyAction(action);
+  }
+  if (extraCycles > 0) stepCyclesWatched(extraCycles);
+  *watchOut = out.str();
   return true;
 }
 
@@ -1363,6 +1485,13 @@ int main(int argc, char** argv) {
   // any) should be ignored -- see its computation and the SDL_TEXTINPUT
   // branch, both in the event loop below, for why.
   bool suppressNextTextInput = false;
+  // When true, real host keyboard input (SDL_KEYDOWN/KEYUP/TEXTINPUT
+  // destined for the emulated keyboard) is ignored entirely -- only the
+  // FIFO/pipe command interface can drive the emulator. Toggled via the
+  // Settings menu or the `automation on`/`automation off` FIFO command, so
+  // a session driving pc1500emu via scripted commands can't be disrupted
+  // by an accidental real keypress landing on the window.
+  bool automationMode = false;
 
   // Command FIFO dispatcher -- see kCommandFifoPath's comment. Parses one
   // line at a time; `type`/`key` append to the same queue live keyboard
@@ -1420,6 +1549,52 @@ int main(int argc, char** argv) {
       long addr = 0, val = 0;
       iss >> std::hex >> addr >> val;
       bus.writeME0(static_cast<uint16_t>(addr), static_cast<uint8_t>(val));
+    } else if (cmd == "automation") {
+      // `automation on`/`automation off` (also accepts 1/0) -- see
+      // automationMode's own comment above its declaration.
+      std::string arg;
+      iss >> arg;
+      automationMode = (arg == "on" || arg == "1");
+      writeResponse(automationMode ? "ON" : "OFF");
+    } else if (cmd == "break") {
+      // Scriptable equivalent of a plain (unmodified) F12 press+release --
+      // see F12's own handler for why both pieces (setOnKeyLine's IF-bit
+      // latch and requestMI) are needed together.
+      // Optional trailing cycle count: if present, traces that many
+      // cycles synchronously within this same command (like calltrace),
+      // atomically with the interrupt request -- necessary to actually
+      // observe the dispatch, since the live ~60fps loop keeps stepping
+      // the CPU in real time between separate pipe commands and would
+      // otherwise race a separate `trace` call, handling and returning
+      // from the interrupt before it ever arrives.
+      cpu.pressOnKey();
+      bus.ioPort().setOnKeyLine(true);
+      cpu.requestMI();
+      long cycles = 0;
+      iss >> std::dec >> cycles;
+      if (cycles > 0) {
+        std::ostringstream out;
+        long i = 0;
+        while (i < cycles) {
+          uint16_t pBefore = cpu.p();
+          uint8_t op = bus.readME0(pBefore);
+          int c = cpu.step();
+          int used = (c > 0) ? c : 1;
+          i += used;
+          cyclesSinceTimerTick += used;
+          bus.advanceCycles(used);
+          while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+            cpu.tickTimer();
+            cyclesSinceTimerTick -= kCyclesPerTimerTick;
+          }
+          out << std::hex << std::uppercase;
+          out.width(4); out.fill('0'); out << pBefore << " ";
+          out.width(2); out.fill('0'); out << static_cast<int>(op) << "\n";
+        }
+        writeResponse(out.str());
+      }
+      bus.setKeyState(pc1500::Key::Off, false);
+      bus.ioPort().setOnKeyLine(false);
     } else if (cmd == "reset") {
       // Same as Ctrl+F12 -- re-runs CPU::reset() without touching RAM.
       // Needed after setextram: the ROM only detects installed extension
@@ -1458,6 +1633,43 @@ int main(int argc, char** argv) {
         out << "\n";
       }
       writeResponse(out.str());
+    } else if (cmd == "testcursorrepeat") {
+      // Debug-only, temporary: reproduces the double-press bug scenario
+      // atomically (press, advance, release, re-press, advance, report),
+      // avoiding the real-time race a sequence of separate pipe commands
+      // has against the live frame loop's own background stepping.
+      // <cyclesFirstHold> <cyclesAfterRetap> decimal.
+      long cyclesFirstHold = 0, cyclesAfterRetap = 0;
+      iss >> std::dec >> cyclesFirstHold >> cyclesAfterRetap;
+      auto advance = [&](long n) {
+        long i = 0;
+        while (i < n) {
+          int c = cpu.step();
+          int used = (c > 0) ? c : 1;
+          i += used;
+          cyclesSinceTimerTick += used;
+          bus.advanceCycles(used);
+          while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+            cpu.tickTimer();
+            cyclesSinceTimerTick -= kCyclesPerTimerTick;
+          }
+        }
+      };
+      bus.setKeyState(pc1500::Key::Up, true);
+      advance(cyclesFirstHold);
+      long afterFirstHold = bus.debugCursorRepeatCycles();
+      bool firedAfterFirstHold = bus.debugCursorRepeatFired();
+      bus.setKeyState(pc1500::Key::Up, false);
+      bus.setKeyState(pc1500::Key::Up, true);
+      long afterRetap = bus.debugCursorRepeatCycles();
+      advance(cyclesAfterRetap);
+      long afterFinal = bus.debugCursorRepeatCycles();
+      bool firedAfterFinal = bus.debugCursorRepeatFired();
+      std::ostringstream out;
+      out << "afterFirstHold=" << afterFirstHold << " firedAfterFirstHold=" << firedAfterFirstHold
+          << " afterRetapImmediate=" << afterRetap << " afterFinal=" << afterFinal
+          << " firedAfterFinal=" << firedAfterFinal;
+      writeResponse(out.str());
     } else if (cmd == "status") {
       std::ostringstream out;
       out << std::hex << std::uppercase;
@@ -1474,6 +1686,8 @@ int main(int argc, char** argv) {
           << " small=" << ((ind1 & 0x08) != 0) << " def=" << ((ind1 & 0x80) != 0)
           << " run=" << ((ind2 & 0x40) != 0) << " pro=" << ((ind2 & 0x20) != 0)
           << " reserve=" << ((ind2 & 0x10) != 0) << "]\n";
+      out << "cursorKeyHeld=" << bus.debugCursorKeyHeld()
+          << " cursorRepeatCycles=" << bus.debugCursorRepeatCycles() << "\n";
       writeResponse(out.str());
     } else if (cmd == "display") {
       std::ostringstream out;
@@ -1484,6 +1698,24 @@ int main(int argc, char** argv) {
         out << "\n";
       }
       writeResponse(out.str());
+    } else if (cmd == "displaytext") {
+      // Reads the ROM's own 80-byte LCD text buffer (7BB0H-7BFFH, per the
+      // PC-2 Assembly Language manual's "DISPLAY THROUGH A BUFFER" section --
+      // system call E8CAH) directly as ASCII, terminated by the documented
+      // 0DH end code -- ground truth for what's on screen (e.g. "ERROR 1",
+      // "NEW0? :CHECK") without decoding LCD dot-matrix pixels against the
+      // ROM's font, which is error-prone to eyeball and unnecessary since
+      // the ROM already keeps the text itself in RAM before rendering it.
+      static constexpr uint16_t kDisplayTextBufBase = 0x7BB0;
+      static constexpr int kDisplayTextBufLen = 80;
+      std::string text;
+      for (int i = 0; i < kDisplayTextBufLen; i++) {
+        uint8_t b = bus.readME0(static_cast<uint16_t>(kDisplayTextBufBase + i));
+        if (b == 0x0D) break;
+        text += (b >= 0x20 && b < 0x7F) ? static_cast<char>(b)
+                                         : '?';
+      }
+      writeResponse(text);
     } else if (cmd == "savebasic") {
       std::string path;
       iss >> path;
@@ -1541,9 +1773,9 @@ int main(int argc, char** argv) {
                                               static_cast<int>(frames), &error);
       writeResponse(ok ? "OK" : ("ERROR: " + error));
     } else if (cmd == "typelinepartialidletrace") {
-      // <shortIdlePos decimal> <shortIdleFrames decimal> <tailChars decimal> <text>
-      long pos = 0, frames = 0, tailChars = 0;
-      iss >> std::dec >> pos >> frames >> tailChars;
+      // <shortIdlePos decimal> <shortIdleFrames decimal> <tailChars decimal> <extraCycles decimal> <text>
+      long pos = 0, frames = 0, tailChars = 0, extraCycles = 0;
+      iss >> std::dec >> pos >> frames >> tailChars >> extraCycles;
       std::string line;
       std::getline(iss, line);
       size_t start = line.find_first_not_of(' ');
@@ -1551,8 +1783,21 @@ int main(int argc, char** argv) {
       std::string error, trace;
       bool ok = typeImmediateLinePartialIdleTraced(bus, cpu, line, static_cast<int>(pos),
                                                     static_cast<int>(frames),
-                                                    static_cast<int>(tailChars), &error, &trace);
+                                                    static_cast<int>(tailChars), extraCycles, &error,
+                                                    &trace);
       writeResponse(ok ? trace : ("ERROR: " + error));
+    } else if (cmd == "typelinewatch") {
+      // <watchAddr hex> <watchLen decimal> <extraCycles decimal> <text>
+      long watchAddr = 0, watchLen = 0, extraCycles = 0;
+      iss >> std::hex >> watchAddr >> std::dec >> watchLen >> extraCycles;
+      std::string line;
+      std::getline(iss, line);
+      size_t start = line.find_first_not_of(' ');
+      if (start != std::string::npos) line = line.substr(start);
+      std::string error, watchLog;
+      bool ok = typeImmediateLineWatch(bus, cpu, line, static_cast<uint16_t>(watchAddr),
+                                        static_cast<int>(watchLen), extraCycles, &error, &watchLog);
+      writeResponse(ok ? watchLog : ("ERROR: " + error));
     } else if (cmd == "loadbasictext") {
       std::string path;
       iss >> path;
@@ -1606,6 +1851,147 @@ int main(int argc, char** argv) {
       long addr = 0;
       iss >> std::hex >> addr;
       cpu.setP(static_cast<uint16_t>(addr));
+    } else if (cmd == "calltrace") {
+      // Debug-only: like `call` followed by `trace`, but atomic within one
+      // command handler invocation (sets P, force-clears halted_, then
+      // steps/records synchronously) -- unlike two separate pipe commands,
+      // nothing races against this since the live ~60fps frame loop can't
+      // run in between. Needed to trace from an arbitrary entry point
+      // (e.g. mid-ROM, not the normal reset vector) without the free-running
+      // loop advancing the CPU past the intended window before `trace`'s own
+      // pipe message even arrives.
+      long addr = 0, cycles = 0;
+      iss >> std::hex >> addr >> std::dec >> cycles;
+      cpu.setP(static_cast<uint16_t>(addr));
+      cpu.setHalted(false);
+      std::ostringstream out;
+      long i = 0;
+      while (i < cycles) {
+        uint16_t pBefore = cpu.p();
+        uint8_t op = bus.readME0(pBefore);
+        int c = cpu.step();
+        int used = (c > 0) ? c : 1;
+        i += used;
+        cyclesSinceTimerTick += used;
+        bus.advanceCycles(used);
+        while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+          cpu.tickTimer();
+          cyclesSinceTimerTick -= kCyclesPerTimerTick;
+        }
+        out << std::hex << std::uppercase;
+        out.width(4); out.fill('0'); out << pBefore << " ";
+        out.width(2); out.fill('0'); out << static_cast<int>(op) << " A=";
+        out.width(2); out.fill('0'); out << static_cast<int>(cpu.a()) << " X=";
+        out.width(4); out.fill('0'); out << cpu.x() << " Y=";
+        out.width(4); out.fill('0'); out << cpu.y() << " U=";
+        out.width(4); out.fill('0'); out << cpu.u() << " S=";
+        out.width(4); out.fill('0'); out << cpu.s() << "\n";
+      }
+      writeResponse(out.str());
+    } else if (cmd == "entertrace") {
+      // Debug-only: atomically presses Enter, holds kTapFrames, releases,
+      // waits kIdleFrames, then traces `cycles` more -- all as ONE
+      // continuous, unbroken instruction stream, exactly like the proven
+      // typeImmediateLineWithTrace() (see its own comment on why: an
+      // earlier version that traced only *after* the settle window missed
+      // fast-resolving dispatches entirely). Deliberately does NOT touch
+      // `P`/halted_ the way `calltrace` does -- unlike jumping to a known
+      // static address, a live keypress's dispatch is timing-sensitive, and
+      // the ~60fps frame loop keeps running in the real-world gaps between
+      // separate pipe commands; a `presskey`/`calltrace`/`releasekey`/
+      // `calltrace` sequence sent as four separate commands lets the frame
+      // loop make real progress in those gaps, which `calltrace`'s forced
+      // `cpu.setP()` then silently discards. This command presses Enter and
+      // traces in one shot instead, so nothing can race it.
+      long cycles = 0;
+      iss >> std::dec >> cycles;
+      std::ostringstream out;
+      auto traceStepCycles = [&](long n) {
+        long i = 0;
+        while (i < n) {
+          uint16_t pBefore = cpu.p();
+          uint8_t op = bus.readME0(pBefore);
+          int c = cpu.step();
+          int used = (c > 0) ? c : 1;
+          i += used;
+          cyclesSinceTimerTick += used;
+          bus.advanceCycles(used);
+          while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+            cpu.tickTimer();
+            cyclesSinceTimerTick -= kCyclesPerTimerTick;
+          }
+          out << std::hex << std::uppercase;
+          out.width(4); out.fill('0'); out << pBefore << " ";
+          out.width(2); out.fill('0'); out << static_cast<int>(op) << " A=";
+          out.width(2); out.fill('0'); out << static_cast<int>(cpu.a()) << " X=";
+          out.width(4); out.fill('0'); out << cpu.x() << " Y=";
+          out.width(4); out.fill('0'); out << cpu.y() << " U=";
+          out.width(4); out.fill('0'); out << cpu.u() << " S=";
+          out.width(4); out.fill('0'); out << cpu.s() << "\n";
+        }
+      };
+      bus.setKeyState(pc1500::Key::Ent, true);
+      traceStepCycles(static_cast<long>(kTapFrames) * kCyclesPerFrame);
+      bus.setKeyState(pc1500::Key::Ent, false);
+      traceStepCycles(static_cast<long>(kIdleFrames) * kCyclesPerFrame);
+      traceStepCycles(cycles);
+      writeResponse(out.str());
+    } else if (cmd == "enterwatch") {
+      // <watchAddr hex> <watchLen decimal> <cycles decimal> -- same atomic,
+      // race-free Enter-press pattern as entertrace, but logs only writes
+      // to a specific address (see typeImmediateLineWatch's own comment)
+      // instead of every instruction. For watching what happens to some
+      // piece of state during a keyword's own dispatch, not just during
+      // typing of a later line.
+      long watchAddr = 0, watchLen = 0, cycles = 0;
+      iss >> std::hex >> watchAddr >> std::dec >> watchLen >> cycles;
+      std::ostringstream out;
+      std::vector<uint8_t> prevBytes(watchLen);
+      for (long b = 0; b < watchLen; b++)
+        prevBytes[b] = bus.readME0(static_cast<uint16_t>(watchAddr + b));
+      auto watchStepCycles = [&](long n) {
+        long i = 0;
+        while (i < n) {
+          uint16_t pBefore = cpu.p();
+          int c = cpu.step();
+          int used = (c > 0) ? c : 1;
+          i += used;
+          cyclesSinceTimerTick += used;
+          bus.advanceCycles(used);
+          while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+            cpu.tickTimer();
+            cyclesSinceTimerTick -= kCyclesPerTimerTick;
+          }
+          bool changed = false;
+          for (long b = 0; b < watchLen; b++) {
+            if (bus.readME0(static_cast<uint16_t>(watchAddr + b)) != prevBytes[b]) changed = true;
+          }
+          if (changed) {
+            out << std::hex << std::uppercase;
+            out.width(4); out.fill('0'); out << pBefore << " wrote " << watchAddr << ": ";
+            for (long b = 0; b < watchLen; b++) {
+              out.width(2); out.fill('0'); out << static_cast<int>(prevBytes[b]) << " ";
+            }
+            out << "-> ";
+            for (long b = 0; b < watchLen; b++) {
+              uint8_t nv = bus.readME0(static_cast<uint16_t>(watchAddr + b));
+              out.width(2); out.fill('0'); out << static_cast<int>(nv) << " ";
+              prevBytes[b] = nv;
+            }
+            out << " A="; out.width(2); out.fill('0'); out << static_cast<int>(cpu.a());
+            out << " X="; out.width(4); out.fill('0'); out << cpu.x();
+            out << " Y="; out.width(4); out.fill('0'); out << cpu.y();
+            out << " U="; out.width(4); out.fill('0'); out << cpu.u();
+            out << " S="; out.width(4); out.fill('0'); out << cpu.s() << "\n";
+          }
+        }
+      };
+      bus.setKeyState(pc1500::Key::Ent, true);
+      watchStepCycles(static_cast<long>(kTapFrames) * kCyclesPerFrame);
+      bus.setKeyState(pc1500::Key::Ent, false);
+      watchStepCycles(static_cast<long>(kIdleFrames) * kCyclesPerFrame);
+      watchStepCycles(cycles);
+      writeResponse(out.str());
     } else if (cmd == "presskey" || cmd == "releasekey") {
       // Direct, synchronous bus.setKeyState -- bypasses the symbolActionQueue
       // that type/key use (which only drains via the normal ~60fps frame
@@ -1812,6 +2198,13 @@ int main(int argc, char** argv) {
         // Belongs to the dialog window (or something else) -- its own
         // ImGui context already processed it above; never feed it to the
         // emulated keyboard regardless of focus/capture state.
+      } else if (automationMode &&
+                 (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP ||
+                  event.type == SDL_TEXTINPUT)) {
+        // Automation mode: real host keyboard input never reaches the
+        // emulated keyboard -- only presskey/releasekey/type/key over the
+        // FIFO can. ImGui already saw this event above, so menu
+        // interaction/dialogs still work normally.
       } else if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
         bool pressed = (event.type == SDL_KEYDOWN);
         SDL_Keycode kc = event.key.keysym.sym;
@@ -1855,6 +2248,14 @@ int main(int argc, char** argv) {
           } else if (pressed) {
             cpu.pressOnKey();
             bus.ioPort().setOnKeyLine(true);
+            // The ON key doubles as BREAK while a program is running.
+            // setOnKeyLine(true) above latches the IF register bit real
+            // hardware sets for this (see its own comment); requesting MI
+            // here is what actually gets the CPU to notice it -- neither
+            // alone is sufficient (confirmed by testing each in
+            // isolation). Traced by finding what actually reaches the
+            // literal "BREAK IN" string in ROM1.BIN's own message table.
+            cpu.requestMI();
           } else {
             // Unconditionally release both -- whichever was actually
             // pressed gets released; releasing the other is a no-op.
@@ -1883,7 +2284,17 @@ int main(int argc, char** argv) {
           for (const KeyMapping& m : kKeyMap) {
             if (m.keycode == kc) {
               if (isImmediateHostKey(m.key)) {
-                bus.setKeyState(m.key, pressed);
+                // Ignore OS-level key-repeat here too (repeat is only ever
+                // true for a KEYDOWN, never a KEYUP, so this only filters
+                // the press side) -- without this, a held key's repeated
+                // synthetic KEYDOWNs re-called setKeyState(key,true) on
+                // top of an already-pressed key, which for cursor keys
+                // fed spurious presses into Bus's own repeat-timing state
+                // (see setKeyState's cursor-key comment) and could double
+                // up a single physical tap. Bus's own kCursorRepeatCycles
+                // mechanism (advanceCycles) is the sole intended source of
+                // auto-repeat for a genuinely held cursor key.
+                if (!event.key.repeat) bus.setKeyState(m.key, pressed);
               } else if (pressed) {
                 // Ordinary text key: queue a fire-and-forget tap
                 // (see kKeyMap's comment above) instead of reflecting
@@ -1996,7 +2407,16 @@ int main(int argc, char** argv) {
           }
           ImGui::EndMenu();
         }
+        if (ImGui::MenuItem("Automation Mode (ignore host keyboard)", nullptr, automationMode)) {
+          automationMode = !automationMode;
+        }
         ImGui::EndMenu();
+      }
+      if (automationMode) {
+        // Visible notice so it's obvious real typing won't reach the
+        // emulator -- deliberately in the menu bar itself, not just the
+        // menu checkbox, so it's seen without opening Settings.
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.1f, 1.0f), "  [AUTOMATION MODE -- host keyboard ignored]");
       }
       ImGui::EndMainMenuBar();
     }

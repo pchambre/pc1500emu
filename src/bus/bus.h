@@ -143,8 +143,19 @@ class IoPortController {
 
   // PB7 is hardwired as the ON-key input regardless of DDB (see
   // docs/pc1500_hardware_reference.md) -- live level, not a latch, so it
-  // tracks the physical key state directly.
-  void setOnKeyLine(bool pressed) { onKeyLine_ = pressed; }
+  // tracks the physical key state directly. On a rising edge, also
+  // latches IF bit 0x02 (kTpFlagBit -- confirmed shared with the RTC's TP
+  // edge, see its own comment below) -- PB7 is configured as an LH5811
+  // interrupt input, and this is the flag real hardware sets so the CPU's
+  // MI handler notices. Confirmed by tracing backward from the literal
+  // "BREAK IN" string in ROM1.BIN's message table to find what actually
+  // triggers it: setting only this bit, or only requesting MI without it,
+  // was each independently confirmed insufficient -- a running BASIC
+  // program only actually breaks with both together.
+  void setOnKeyLine(bool pressed) {
+    if (pressed && !onKeyLine_) if_ |= kTpFlagBit;
+    onKeyLine_ = pressed;
+  }
 
   // OPC bit 6 (PC6) is the buzzer on/off control -- there's no separate
   // tone/frequency register on real hardware; BASIC's BEEP works by
@@ -228,7 +239,12 @@ class IoPortController {
   // IF bit 1: latched from the RTC's TP rising edge -- see
   // advanceRealTime() and Upd1990ac's class comment. Unlike TD/RD (bits
   // 3/2), this one *is* ROM-confirmed (BASIC BEEP's repeat-gap wait polls
-  // exactly this bit after commanding TP=64Hz).
+  // exactly this bit after commanding TP=64Hz). Also confirmed shared
+  // with PB7 (see setOnKeyLine()) -- rather than a dedicated bit per
+  // possible LH5811 interrupt-input pin, this looks like one shared
+  // "external event" flag, with software expected to disambiguate the
+  // actual cause afterward by checking each candidate pin's own live
+  // level (e.g. onKeyLine_ for "was this ON/BREAK").
   static constexpr uint8_t kTpFlagBit = 0x02;
   Upd1990ac rtc_;
 };
@@ -387,6 +403,13 @@ class Bus : public lh5801::MemoryBus {
   // keywords once this force-clear was gone).
   void setKeyState(Key key, bool pressed);
 
+  // Debug-only: exposes cursor-key repeat-timing state directly, for
+  // testing the double-press fix without the confound of normal ROM
+  // execution also touching 7B0EH during a `run`.
+  bool debugCursorKeyHeld() const { return cursorKeyHeld_; }
+  int debugCursorRepeatCycles() const { return cursorRepeatCycles_; }
+  bool debugCursorRepeatFired() const { return cursorRepeatFired_; }
+
   // Drives cursor-key rollover and deferred key releases (see
   // setKeyState): call once per emulated cycle batch (see main.cpp's frame
   // loop) with the number of cycles just executed.
@@ -454,9 +477,22 @@ class Bus : public lh5801::MemoryBus {
   bool cursorKeyHeld_ = false;
   Key heldCursorKey_ = Key::Left;
   int cursorRepeatCycles_ = 0;
+  // Whether this hold has already fired its first repeat -- real keyboard
+  // auto-repeat has two distinct timings (a longer initial delay, then a
+  // faster ongoing rate once repeating has started); this distinguishes
+  // which threshold (kCursorInitialDelayCycles vs kCursorRepeatCycles)
+  // applies. Reset alongside cursorRepeatCycles_ on every fresh press.
+  bool cursorRepeatFired_ = false;
+  // ~1s at 1.3MHz: Paul's own hardware observation ("close to one second
+  // held down to start repeating") -- confirmed distinct from the ongoing
+  // repeat rate below, which an earlier tuning pass had wrongly applied
+  // to the initial delay too (making the first repeat fire ~6x too soon).
+  static constexpr int kCursorInitialDelayCycles = 1300000;
   // ~154ms at 1.3MHz: Paul's own "~5/sec" estimate, refined after
   // side-by-side comparison to hardware (initial 200ms guess ran ~30%
-  // slower than the real repeat rate).
+  // slower than the real repeat rate). This is the *ongoing* rate once
+  // repeating has already started -- see kCursorInitialDelayCycles above
+  // for the (much longer) delay before the first repeat.
   static constexpr int kCursorRepeatCycles = 200000;
 
   // Deferred-release state (see setKeyState/advanceCycles/applyRelease).

@@ -65,7 +65,14 @@ calculator's special keys):
 - F7 = Cl, F8 = Mode, F9 = Def, F10 = Sml, F11 = Rcl
 - Shift+F10 = the up/down rocker key
 - **F12 = On** (it's wired directly to the CPU, not part of the keyboard
-  matrix, so it's handled separately from every other key)
+  matrix, so it's handled separately from every other key). While a
+  program is running, the same key doubles as **BREAK**: it latches IF
+  register bit `0x02` (via PB7, the LH5811 pin ON is wired to, configured
+  as an interrupt input -- confirmed shared with the RTC's TP edge, see
+  `IoPortController::setOnKeyLine()`) and requests the CPU's maskable
+  interrupt (vector `FFF8H`); both together are what gets a running BASIC
+  program to actually stop and show `BREAK IN <line>`, in addition to
+  ON's own wake-from-off role.
 - Shift+F12 = Off
 - **Ctrl+F12 is a host-only RESET key**, mimicking the real machine's
   recessed ALL RESET pinhole switch (also not part of the matrix) — it
@@ -79,11 +86,17 @@ sends a direct, standalone PC-1500 Shift keypress for cases not covered
 by the punctuation passthrough below.
 
 **Digits and punctuation** (`charToTapActions()`, driven by `SDL_TEXTINPUT`
-rather than keycodes): typing a digit or one of `!"#$%&@^<>:?;,` on the
-host reproduces the exact PC-1500 keypress (or Shift+key combo) that types
-each one on real hardware (confirmed by Paul), queued as a fire-and-forget
-sequence that runs to completion regardless of how long the host key is
-held. There's a small (~0.25s) delay before the character appears.
+rather than keycodes): typing a digit or one of `!"#$%&@^<>:?;,.+-/=()*`
+on the host reproduces the exact PC-1500 keypress (or Shift+key combo)
+that types each one on real hardware (confirmed by Paul), queued as a
+fire-and-forget sequence that runs to completion regardless of how long
+the host key is held. There's a small (~0.25s) delay before the character
+appears. `.`, `-`, `/`, and `=` used to have their own direct keycode
+entries in `kKeyMap[]` as well, which (same root cause as the digit-row
+bug below) ignored host Shift entirely -- confirmed broken on AZERTY,
+where the key that types unshifted `=`/shifted `+` always produced `=`
+regardless of Shift. Removed in favor of the same `SDL_TEXTINPUT` path
+everything else here uses.
 
 Because this is driven by `SDL_TEXTINPUT` (the OS's own composed text)
 instead of raw keycodes, it's host-keyboard-layout-aware automatically --
@@ -134,6 +147,14 @@ native OS menu) sits above the display:
   not a real period-correct module, but easy to emulate.
 - **Settings > Extension RAM (0000H)** — None (default) / 16K of emulated
   module RAM at `0000H`-`3FFFH`.
+- **Settings > Automation Mode** — when checked, real host keyboard input
+  (typing, arrow keys, F-keys, etc.) is ignored entirely; only the
+  scriptable command interface below can drive the emulator. An orange
+  `[AUTOMATION MODE]` notice appears in the menu bar whenever it's on, so
+  it's never silently active. Meant for scripted/automated test sessions
+  where an accidental real keypress landing on the window would otherwise
+  corrupt whatever state is being driven over the FIFO. Toggle from the
+  FIFO itself with `automation on` / `automation off`.
 
 When "adding" RAM, it is necessary to reset the emulator (Ctrl+F12), then
 press CL and execute NEW0 to update the emulator to be aware of the
@@ -186,6 +207,11 @@ Commands:
 - `dump <start> <end>` — hex bytes, 16 per line, address-prefixed.
 - `status` — CPU registers/flags and the fixed-segment indicator bits.
 - `display` — the 156x7 dot matrix as ASCII art (`#`/`.`).
+- `displaytext` — the ROM's own LCD text buffer (`7BB0H`-`7BFFH`, per the
+  PC-2 Assembly Language manual's "DISPLAY THROUGH A BUFFER" section) read
+  directly as ASCII up to its `0DH` terminator -- e.g. `ERROR 1` or
+  `NEW0? :CHECK`. Prefer this over `display` for anything that's plain
+  text: it's exact, where eyeballing the dot-matrix ASCII art is not.
 - `savebasic <path>` / `loadbasic <path>` / `savebinary <addr> <len> <path>`
   / `loadbinary <addr> <path>` — the same functions the File menu's dialogs
   call, invokable directly without going through the GUI.
@@ -194,7 +220,23 @@ Commands:
   File menu section above) by stepping CPU/bus cycles directly rather than
   the real-time `type`/`key` queue, so it completes in well under a second
   regardless of program size; a returned `ERROR: N line(s) rejected...`
-  lists which lines the ROM didn't accept.
+  lists which lines the ROM didn't accept. Any line longer than 79
+  characters is rejected up front with a clear error instead of being
+  typed — the ROM's own line editor has a hard 79-character input limit
+  and silently drops everything past it with no error shown, so without
+  this check a too-long line would appear to load successfully while
+  actually being truncated.
+- `break [cycles]` — scriptable equivalent of pressing the physical ON key
+  (F12) while a program is running: sets the ON-key line (which latches IF
+  register bit `0x02`, confirmed shared with the RTC's TP edge -- see
+  `IoPortController::setOnKeyLine()`) and requests the CPU's maskable
+  interrupt (vector `FFF8H`) -- both are needed together to actually break
+  a running program; either alone does nothing. If `cycles` is given,
+  traces that many cycles synchronously in the same call (like
+  `calltrace`) so the dispatch can actually be observed -- otherwise the
+  live frame loop's own background stepping will most likely have already
+  handled and returned from the interrupt by the time a separate `trace`
+  call gets to look.
 - `call <addr>` — sets the CPU's `P` register directly (hex address).
 - `presskey <name>` / `releasekey <name>` — direct, synchronous key
   press/release (same names as `key`), bypassing the queue `type`/`key`

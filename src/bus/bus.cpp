@@ -276,13 +276,21 @@ void Bus::setKeyState(Key key, bool pressed) {
     }
     keyboard_.setKeyState(key, true);
     if (isCursorKey(key)) {
-      // Only reset the repeat timer on a genuinely new press -- host OS
-      // key-repeat re-sends "pressed" for a key that's already held, at a
-      // much faster rate than our ~200ms window, which would otherwise
-      // keep resetting the counter before it ever fires again.
-      if (!cursorKeyHeld_ || heldCursorKey_ != key) {
-        cursorRepeatCycles_ = 0;
-      }
+      // Every call here now represents a genuine fresh press -- the host
+      // event loop filters OS-level key-repeat before it ever reaches
+      // setKeyState (see main.cpp), so there's no "is this just an OS
+      // repeat of an already-held key" case left to distinguish here.
+      // Always resetting is also *correct* where the old conditional
+      // wasn't: a quick tap's deferred release (see below) can still be
+      // pending when a genuinely new, separate tap of the same key
+      // arrives, which left cursorKeyHeld_/heldCursorKey_ looking
+      // unchanged and wrongly carried over the first tap's accumulated
+      // cursorRepeatCycles_ -- if that pushed the total over
+      // kCursorRepeatCycles, the second tap got a spurious extra
+      // "repeat" injected on top of its own real press, i.e. exactly the
+      // double-press bug this fixes.
+      cursorRepeatCycles_ = 0;
+      cursorRepeatFired_ = false;
       cursorKeyHeld_ = true;
       heldCursorKey_ = key;
     }
@@ -320,8 +328,10 @@ void Bus::advanceCycles(int cycles) {
   io_.advanceCycles(cycles);
   if (cursorKeyHeld_) {
     cursorRepeatCycles_ += cycles;
-    if (cursorRepeatCycles_ >= kCursorRepeatCycles) {
+    int threshold = cursorRepeatFired_ ? kCursorRepeatCycles : kCursorInitialDelayCycles;
+    if (cursorRepeatCycles_ >= threshold) {
       cursorRepeatCycles_ = 0;
+      cursorRepeatFired_ = true;
       writeME0(0x7B0E, static_cast<uint8_t>(readME0(0x7B0E) & 0xFE));
     }
   }

@@ -77,6 +77,7 @@ class CPU {
   bool pv() const { return pv_; }
 
   void setP(uint16_t p) { p_ = p; }
+  void setHalted(bool h) { halted_ = h; }
   void setS(uint16_t s) { s_ = s; }
   void setX(uint16_t x) { x_ = x; }
   void setY(uint16_t y) { y_ = y; }
