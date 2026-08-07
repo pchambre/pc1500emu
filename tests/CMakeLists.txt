@@ -25,3 +25,19 @@ add_test(NAME basic_text_test COMMAND basic_text_test)
 add_executable(basic_load_roundtrip_test basic_load_roundtrip_test.cpp)
 target_link_libraries(basic_load_roundtrip_test PRIVATE pc1500basic pc1500bus pc1500keyboard lh5801cpu)
 add_test(NAME basic_load_roundtrip_test COMMAND basic_load_roundtrip_test)
+
+add_executable(opcode_table_test opcode_table_test.cpp)
+target_link_libraries(opcode_table_test PRIVATE pc1500disasm)
+add_test(NAME opcode_table_test COMMAND opcode_table_test)
+
+add_executable(disasm_analyzer_test disasm_analyzer_test.cpp)
+target_link_libraries(disasm_analyzer_test PRIVATE pc1500disasm)
+add_test(NAME disasm_analyzer_test COMMAND disasm_analyzer_test)
+
+add_executable(disasm_rom1_smoke_test disasm_rom1_smoke_test.cpp)
+target_link_libraries(disasm_rom1_smoke_test PRIVATE pc1500disasm)
+add_test(NAME disasm_rom1_smoke_test COMMAND disasm_rom1_smoke_test)
+
+add_executable(known_symbols_test known_symbols_test.cpp)
+target_link_libraries(known_symbols_test PRIVATE pc1500disasm)
+add_test(NAME known_symbols_test COMMAND known_symbols_test)

@@ -1,0 +1,28 @@
+{
+  "name": "lh5801-asm",
+  "displayName": "LH5801 Assembly (sdaslh5801)",
+  "description": "Syntax highlighting for the sdaslh5801 (PC-1500 LH5801) assembler dialect, matching pc1500emu's disassembler output and https://github.com/pchambre/sdcc-pc1500",
+  "version": "0.1.0",
+  "publisher": "pchambre",
+  "private": true,
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "lh5801-asm",
+        "aliases": ["LH5801 Assembly", "lh5801-asm"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lh5801-asm",
+        "scopeName": "source.lh5801asm",
+        "path": "./syntaxes/lh5801.tmLanguage.json"
+      }
+    ]
+  }
+}

@@ -3,5 +3,8 @@ build/
 *.obj
 .cache/
 compile_commands.json
-.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/extensions.json
 .idea/

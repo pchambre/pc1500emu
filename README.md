@@ -253,6 +253,61 @@ Commands:
 `type`/`key` commands queue onto the same mechanism real typing uses, so
 scripted and live keyboard input interleave safely rather than racing.
 
+## Disassembler
+
+`pc1500disasm` is a standalone recursive-descent LH5801 disassembler for
+ROM dumps, built alongside the emulator. Rather than a naive linear sweep,
+it discovers code by following actual control flow from a set of seed
+entry points, so data interleaved into code regions (string pools, jump
+tables, BASIC keyword tables) renders as data, not garbage instructions.
+Output is `sdas`-syntax text, directly reassemblable by
+[sdaslh5801](https://github.com/pchambre/sdcc-pc1500).
+
+```sh
+./build/src/disasm/pc1500disasm --mode base ROM1.BIN -o rom1.asm          # Linux
+build\src\disasm\RelWithDebInfo\pc1500disasm.exe --mode base ROM1.BIN -o rom1.asm   # Windows
+
+# expansion module, either platform (adjust the binary path as above):
+pc1500disasm --mode module --base 0xA000 CE-150.ROM -o ce150.asm
+```
+
+- `--mode base` (default load address `0xC000`) seeds the reset/interrupt
+  vectors and the ROM's built-in BASIC keyword table (`C01EH`).
+- `--mode module` (default load address `0x8000`) scans for the `0x55`
+  sentinel byte expansion modules use at each 2KB-aligned page and
+  auto-detects that page's own keyword table.
+- `--base 0xNNNN` overrides the default load address.
+- `-o out.asm` writes to a file instead of stdout; `--annotate` adds a
+  trailing `; 0xNNNN: XX XX` comment per line for human review.
+
+Labels and operand references also carry a `; NAME -- comment` annotation
+whenever the address is one of the confirmed PC-1500 memory-map/ROM
+addresses in `src/disasm/known_symbols.cpp` (e.g. `E2AAH` → `IDLE`,
+`764EH` → `STATUS1`, `7B0EH` → `KEYGATE`) — always on, not gated behind
+`--annotate`, since it's real documentation rather than a raw byte dump.
+
+### Editing disassembly output
+
+No dedicated LH5801 IDE exists anywhere (checked). `tools/vscode-lh5801-asm/`
+is a small local VS Code extension providing syntax highlighting for the
+`sdas` dialect this disassembler emits and `sdaslh5801` accepts. Install it
+by copying the folder into `%USERPROFILE%\.vscode\extensions\` (Windows) or
+`~/.vscode/extensions/` (Linux/Mac), then reload the window.
+
+Opening this repo in VS Code also picks up:
+- `.vscode/settings.json` — associates `*.asm`/`*.s` with the extension's
+  grammar, scoped to this project only.
+- `.vscode/tasks.json` — a build task (`Ctrl+Shift+B`) that runs
+  `sdaslh5801` on the active file and reports errors in the Problems panel.
+  Fill in `lh5801.sdasCommand` in `settings.json` with your own built
+  `sdaslh5801` path first (see the setting's own comment for the WSL vs.
+  MSYS2 form) — it isn't built by default.
+- `.vscode/extensions.json` — recommends Microsoft's official
+  [Hex Editor](https://marketplace.visualstudio.com/items?itemName=ms-vscode.hexeditor)
+  extension for viewing a ROM's raw bytes (hex grid + decoded text) next to
+  its disassembly: open the `.BIN`/`.ROM` file, "Open With" → Hex Editor,
+  then drag its tab into a split pane alongside the generated `.asm`.
+
 ## Layout
 
 - `src/cpu/` — LH5801 CPU core
@@ -260,6 +315,11 @@ scripted and live keyboard input interleave safely rather than racing.
 - `src/keyboard/` — keyboard matrix emulation
 - `src/lcd/` — dot-matrix LCD controller emulation
 - `src/host/` — host-side glue (windowing, input, main loop, menu bar)
+- `src/basic/` — BASIC keyword tokenizer/detokenizer and keystroke-driven
+  program load/save
+- `src/disasm/` — LH5801 ROM disassembler (`pc1500disasm`)
+- `tools/vscode-lh5801-asm/` — local VS Code extension for editing
+  disassembly output (see the Disassembler section above)
 - `third_party/imgui/` — vendored Dear ImGui (menu bar UI), MIT licensed
 - `tests/` — unit tests
 - `docs/` — technical reference notes (ISA, hardware) backing the implementation

@@ -1,0 +1,46 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Assemble current file (sdaslh5801)",
+      "type": "shell",
+      // Reads lh5801.sdasCommand from settings.json, so this works whether
+      // that ends up being a plain Windows exe path (MSYS2 build) or a
+      // "wsl <path>" invocation (WSL build) -- fill that setting in once
+      // sdaslh5801 is actually built. `-l -o <file>` matches the exact
+      // invocation sdcc-pc1500's own test_lh5801.py uses.
+      //
+      // WSL caveat: recent WSL translates a Windows-style ${file} path
+      // automatically when passed as a plain argument like this, but if
+      // your build errors out on the path itself, switch to an explicit
+      // /mnt/c/... path or wrap the call in a small shell script under WSL
+      // that does the translation instead.
+      "command": "${config:lh5801.sdasCommand} -l -o \"${file}\"",
+      "problemMatcher": {
+        "owner": "lh5801-asm",
+        // sdaslh5801's error format (confirmed against sdcc-pc1500's own
+        // assubr.c diag(), the "conform to gcc error standard" branch
+        // taken whenever it's built in sdas mode, which sdaslh5801 is):
+        //   <file>:<line>: Error: <message>
+        // Warnings use a different, older, multi-line format
+        // (warnBanner()) not captured by this pattern.
+        "fileLocation": ["absolute"],
+        "pattern": {
+          "regexp": "^(.*):(\\d+): Error: (.*)$",
+          "file": 1,
+          "line": 2,
+          "message": 3
+        }
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    }
+  ]
+}

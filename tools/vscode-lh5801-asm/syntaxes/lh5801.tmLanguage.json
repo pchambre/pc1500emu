@@ -1,0 +1,54 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "LH5801 Assembly",
+  "scopeName": "source.lh5801asm",
+  "fileTypes": [],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#directive" },
+    { "include": "#label" },
+    { "include": "#mnemonic" },
+    { "include": "#register" },
+    { "include": "#number" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.semicolon.lh5801asm",
+      "match": ";.*$"
+    },
+    "string": {
+      "name": "string.quoted.double.lh5801asm",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "name": "constant.character.escape.lh5801asm", "match": "\\\\." }
+      ]
+    },
+    "directive": {
+      "name": "keyword.control.directive.lh5801asm",
+      "match": "(?i)\\.(area|org|db|dw|ascii|module|globl|equ|include|byte|word|ds)\\b"
+    },
+    "label": {
+      "name": "entity.name.function.label.lh5801asm",
+      "match": "^\\s*([A-Za-z_.$][A-Za-z0-9_.$]*)\\s*:"
+    },
+    "mnemonic": {
+      "name": "keyword.control.mnemonic.lh5801asm",
+      "match": "(?i)\\b(adc|adi|adr|aex|am0|am1|and|ani|atp|att|bch|bcr|bcs|bhr|bhs|bii|bit|bvr|bvs|bzr|bzs|cdv|cin|cpa|cpi|dca|dcs|dec|drl|drr|eai|eor|hlt|inc|ita|jmp|lda|lde|ldi|ldx|lin|lop|nop|off|ora|ori|pop|psh|rdp|rec|rie|rol|ror|rpu|rpv|rti|rtn|sbc|sbi|sde|sdp|sec|shl|shr|sie|sin|sjp|spu|spv|sta|stx|tin|tta|vcr|vcs|vej|vhr|vhs|vmj|vvs|vzr|vzs)\\b"
+    },
+    "register": {
+      "name": "variable.language.register.lh5801asm",
+      "match": "(?i)\\b(xl|yl|ul|xh|yh|uh|x|y|u|a|s|p)\\b"
+    },
+    "number": {
+      "name": "constant.numeric.lh5801asm",
+      "match": "\\b(0x[0-9A-Fa-f]+|[0-9]+)\\b"
+    },
+    "punctuation": {
+      "name": "punctuation.lh5801asm",
+      "match": "[(),#]"
+    }
+  }
+}

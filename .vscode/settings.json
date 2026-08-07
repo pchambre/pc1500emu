@@ -1,0 +1,18 @@
+{
+  // Scoped to this project only (not a global file association) -- avoids
+  // hijacking .asm/.s for any other assembly work elsewhere. Requires the
+  // lh5801-asm extension (tools/vscode-lh5801-asm/) to be installed --
+  // see README.md's Disassembler section.
+  "files.associations": {
+    "*.asm": "lh5801-asm",
+    "*.s": "lh5801-asm"
+  },
+
+  // The command tasks.json's build task runs, as a single string split on
+  // spaces (no quoting support -- keep paths space-free, or point at a
+  // short wrapper script). Left blank until sdaslh5801 is actually built;
+  // fill in one of:
+  //   WSL build:   wsl /home/<you>/sdcc-pc1500/sdcc/sdas/aslh5801/sdaslh5801
+  //   MSYS2 build: C:/msys64/home/<you>/sdcc-pc1500/sdcc/sdas/aslh5801/sdaslh5801.exe
+  "lh5801.sdasCommand": ""
+}

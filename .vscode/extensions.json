@@ -1,0 +1,8 @@
+{
+  // ms-vscode.hexeditor: Microsoft's official hex editor, for viewing a
+  // ROM's raw bytes (hex grid + decoded text column) side-by-side with its
+  // disassembly. See README.md's Disassembler section for the workflow.
+  "recommendations": [
+    "ms-vscode.hexeditor"
+  ]
+}
