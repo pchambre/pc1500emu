@@ -112,13 +112,58 @@ KeywordTable parseKeywordTableAt(const std::vector<uint8_t>& image, uint16_t bas
 // tables with no false positives.
 constexpr int kMinEntriesForConfidence = 2;
 
+// Cross-checks a below-confidence candidate (as few as 1 entry) against
+// the 52-byte first-letter index that should immediately precede every
+// real keyword table (mechanism doc §2): for each entry whose name is 2+
+// characters, the index slot for its first letter must be a big-endian
+// pointer to the entry's *second* letter (markerAddr + 2) -- exactly the
+// doc's own worked examples (CHAIN, MERGE, RMT, ...). A well-formed index
+// backing even a single entry is strong independent corroborating
+// evidence the whole structure is real (a coincidental run of valid-
+// looking code bytes would also need to coincidentally produce a correct
+// pointer 52 bytes earlier), so this can safely accept what
+// kMinEntriesForConfidence alone would reject -- confirmed against a
+// real single-keyword module ROM this session (INVERT_minimal_8000_pvlow.ROM).
+// Entries with 1-character names are skipped (no second letter to point
+// at) and don't count for or against the check; a candidate with only
+// such entries can't be validated this way at all.
+bool indexValidatesCandidate(const std::vector<uint8_t>& image, uint16_t base,
+                              const KeywordTable& candidate) {
+  if (candidate.entries.empty()) return false;
+  uint16_t indexAddr = static_cast<uint16_t>(candidate.tableAddr - 52);
+  bool checkedAny = false;
+  for (const auto& e : candidate.entries) {
+    if (e.name.size() < 2) continue;
+    checkedAny = true;
+    int letterIdx = e.name[0] - 'A';
+    if (letterIdx < 0 || letterIdx > 25) return false;
+    uint16_t slot = static_cast<uint16_t>(indexAddr + letterIdx * 2);
+    int hi = byteAt(image, base, slot);
+    int lo = byteAt(image, base, static_cast<uint16_t>(slot + 1));
+    if (hi < 0 || lo < 0) return false;
+    uint16_t pointer = static_cast<uint16_t>((hi << 8) | lo);
+    uint16_t expected = static_cast<uint16_t>(e.markerAddr + 2);
+    if (pointer != expected) return false;
+  }
+  return checkedAny;
+}
+
+// `bestRejected`, if non-null, is set to the highest-entry-count candidate
+// seen (even a 1-entry one) when no candidate reaches confidence or gets
+// index-validated -- left default-constructed (empty entries) if literally
+// nothing parsed at all.
 bool findKeywordTableInPage(const std::vector<uint8_t>& image, uint16_t base, uint16_t pageStart,
-                             uint16_t pageEnd, KeywordTable* out) {
+                             uint16_t pageEnd, KeywordTable* out, KeywordTable* bestRejected = nullptr) {
   for (uint16_t candidate = static_cast<uint16_t>(pageStart + 1); candidate < pageEnd; candidate++) {
     KeywordTable kt = parseKeywordTableAt(image, base, candidate);
-    if (static_cast<int>(kt.entries.size()) >= kMinEntriesForConfidence) {
+    if (kt.entries.empty()) continue;
+    if (static_cast<int>(kt.entries.size()) >= kMinEntriesForConfidence ||
+        indexValidatesCandidate(image, base, kt)) {
       *out = kt;
       return true;
+    }
+    if (bestRejected != nullptr && kt.entries.size() > bestRejected->entries.size()) {
+      *bestRejected = kt;
     }
   }
   return false;
@@ -187,11 +232,16 @@ void traverse(const std::vector<uint8_t>& image, uint16_t base, std::vector<Byte
 
 }  // namespace
 
-AnalysisResult analyzeBaseRom(const std::vector<uint8_t>& image, uint16_t base) {
+AnalysisResult analyzeBaseRom(const std::vector<uint8_t>& image, uint16_t base,
+                               const std::vector<uint16_t>& extraSeeds) {
   AnalysisResult r;
   r.base = base;
   r.kind.assign(image.size(), ByteKind::Unknown);
   std::deque<uint16_t> worklist;
+  for (uint16_t seed : extraSeeds) {
+    r.labels.insert(seed);
+    worklist.push_back(seed);
+  }
 
   // MI / Timer / NMI / Reset vectors, per lh5801.cpp's dispatchInterrupt
   // (FFF8H=MI, FFFAH=Timer, FFFCH=NMI, FFFEH=Reset), 2 bytes each,
@@ -235,11 +285,16 @@ AnalysisResult analyzeBaseRom(const std::vector<uint8_t>& image, uint16_t base) 
   return r;
 }
 
-AnalysisResult analyzeModuleRom(const std::vector<uint8_t>& image, uint16_t base) {
+AnalysisResult analyzeModuleRom(const std::vector<uint8_t>& image, uint16_t base,
+                                 const std::vector<uint16_t>& extraSeeds) {
   AnalysisResult r;
   r.base = base;
   r.kind.assign(image.size(), ByteKind::Unknown);
   std::deque<uint16_t> worklist;
+  for (uint16_t seed : extraSeeds) {
+    r.labels.insert(seed);
+    worklist.push_back(seed);
+  }
 
   constexpr uint16_t kPageSize = 0x800;  // 2KB
   uint16_t pageStart = static_cast<uint16_t>(base & ~(kPageSize - 1));
@@ -249,7 +304,11 @@ AnalysisResult analyzeModuleRom(const std::vector<uint8_t>& image, uint16_t base
     uint16_t pageEnd = static_cast<uint16_t>(page + kPageSize);
     if (pageEnd > base + image.size()) pageEnd = static_cast<uint16_t>(base + image.size());
     KeywordTable kt;
-    if (!findKeywordTableInPage(image, base, page, pageEnd, &kt)) continue;
+    KeywordTable rejected;
+    if (!findKeywordTableInPage(image, base, page, pageEnd, &kt, &rejected)) {
+      if (!rejected.entries.empty()) r.lowConfidenceTables.push_back(std::move(rejected));
+      continue;
+    }
     for (const auto& e : kt.entries) {
       r.labels.insert(e.address);
       worklist.push_back(e.address);

@@ -1,0 +1,41 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Attaches to an already-running pc1500emu instance (launch it
+      // yourself first, e.g. via the pc1500emu target or a terminal) and
+      // loads the currently-open .asm's assembled program into it.
+      //
+      // Known gap as of this writing: sdaslh5801 produces a relocatable
+      // .rel, not a raw loadable binary -- there's no aslink-based link
+      // step wired up yet to turn that into the flat "program" file this
+      // expects. Point "program"/"listing" at a real assembled+linked
+      // binary and its .lst once that toolchain exists; until then this
+      // configuration is a template, not a working one-click debug.
+      "type": "lh5801",
+      "request": "launch",
+      "name": "LH5801: Attach to running pc1500emu",
+      "program": "${fileDirname}/${fileBasenameNoExtension}.bin",
+      "loadAddress": "4200",
+      "entry": "4200",
+      "listing": "${fileDirname}/${fileBasenameNoExtension}.lst",
+      "sourcePath": "${file}",
+      "stopOnEntry": true
+    },
+    {
+      // Same, but also starts pc1500emu itself rather than requiring one
+      // already running. Fill in romPath for your machine.
+      "type": "lh5801",
+      "request": "launch",
+      "name": "LH5801: Launch pc1500emu and debug",
+      "emulatorPath": "${workspaceFolder}/build/src/host/RelWithDebInfo/pc1500emu.exe",
+      "romPath": "C:/path/to/ROM1.BIN",
+      "program": "${fileDirname}/${fileBasenameNoExtension}.bin",
+      "loadAddress": "4200",
+      "entry": "4200",
+      "listing": "${fileDirname}/${fileBasenameNoExtension}.lst",
+      "sourcePath": "${file}",
+      "stopOnEntry": true
+    }
+  ]
+}

@@ -28,6 +28,7 @@
 #include <deque>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -1146,6 +1147,57 @@ int main(int argc, char** argv) {
 
   bool running = true;
   int cyclesSinceTimerTick = 0;
+
+  // Debugger execution control -- see the "setbreakpoints"/"continue"/
+  // "pause"/"debugstep"/"debugstatus" FIFO commands below, and their
+  // integration into the main per-frame loop further down (search for
+  // debugControlActive there). Inert (debugControlActive stays false, the
+  // per-frame loop behaves exactly as it always has) until the first
+  // debug command arrives -- once a debugger attaches, the per-frame
+  // loop's own free-running stepping is replaced by breakpoint-aware
+  // single-instruction stepping instead, for the rest of this process's
+  // lifetime.
+  bool debugControlActive = false;
+  bool debugRunning = false;
+  std::set<uint16_t> breakpoints;
+  std::string lastStopReason = "entry";
+
+  // Shared by `status`/`debugstatus` -- the same register/flag dump,
+  // without either command's own leading state line.
+  auto formatRegisters = [&]() {
+    std::ostringstream out;
+    out << std::hex << std::uppercase;
+    out << "P=" << cpu.p() << " A=" << static_cast<int>(cpu.a()) << " X=" << cpu.x()
+        << " Y=" << cpu.y() << " U=" << cpu.u() << " S=" << cpu.s() << "\n";
+    out << std::dec;
+    out << "halted=" << cpu.halted() << " bf=" << cpu.bf() << " disp=" << cpu.disp()
+        << " pu=" << cpu.pu() << " pv=" << cpu.pv() << " ie=" << cpu.flags().ie
+        << " timerCounter=" << cpu.timerCounter() << "\n";
+    uint8_t ind1 = bus.readME0(0x764E), ind2 = bus.readME0(0x764F);
+    out << "ind1(764E)=" << std::hex << static_cast<int>(ind1) << " ind2(764F)="
+        << static_cast<int>(ind2) << std::dec << " [busy=" << ((ind1 & 0x01) != 0)
+        << " shift=" << ((ind1 & 0x02) != 0) << " small=" << ((ind1 & 0x08) != 0)
+        << " def=" << ((ind1 & 0x80) != 0) << " run=" << ((ind2 & 0x40) != 0)
+        << " pro=" << ((ind2 & 0x20) != 0) << " reserve=" << ((ind2 & 0x10) != 0) << "]\n";
+    return out.str();
+  };
+  // Single-instruction step, updating the timer the same way every other
+  // debug/trace command in this file already does -- shared by the
+  // `continue`/`debugstep` command handlers below and the main loop's
+  // debug-mode stepping branch, so both advance cyclesSinceTimerTick
+  // consistently.
+  auto debugStepOne = [&]() {
+    int c = cpu.step();
+    int used = (c > 0) ? c : 1;
+    cyclesSinceTimerTick += used;
+    bus.advanceCycles(used);
+    while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+      cpu.tickTimer();
+      cyclesSinceTimerTick -= kCyclesPerTimerTick;
+    }
+    return used;
+  };
+
   // Tracks which action F10/F12 actually triggered on press, so release
   // matches it even if Shift/Ctrl changed state while the key was held
   // (otherwise a modifier change mid-hold could release the wrong
@@ -1347,22 +1399,47 @@ int main(int argc, char** argv) {
       writeResponse(out.str());
     } else if (cmd == "status") {
       std::ostringstream out;
-      out << std::hex << std::uppercase;
-      out << "P=" << cpu.p() << " A=" << static_cast<int>(cpu.a()) << " X=" << cpu.x()
-          << " Y=" << cpu.y() << " U=" << cpu.u() << " S=" << cpu.s() << "\n";
-      out << std::dec;
-      out << "halted=" << cpu.halted() << " bf=" << cpu.bf() << " disp=" << cpu.disp()
-          << " pu=" << cpu.pu() << " pv=" << cpu.pv() << " ie=" << cpu.flags().ie
-          << " timerCounter=" << cpu.timerCounter() << "\n";
-      uint8_t ind1 = bus.readME0(0x764E), ind2 = bus.readME0(0x764F);
-      out << "ind1(764E)=" << std::hex << static_cast<int>(ind1) << " ind2(764F)="
-          << static_cast<int>(ind2) << std::dec
-          << " [busy=" << ((ind1 & 0x01) != 0) << " shift=" << ((ind1 & 0x02) != 0)
-          << " small=" << ((ind1 & 0x08) != 0) << " def=" << ((ind1 & 0x80) != 0)
-          << " run=" << ((ind2 & 0x40) != 0) << " pro=" << ((ind2 & 0x20) != 0)
-          << " reserve=" << ((ind2 & 0x10) != 0) << "]\n";
+      out << formatRegisters();
       out << "cursorKeyHeld=" << bus.debugCursorKeyHeld()
           << " cursorRepeatCycles=" << bus.debugCursorRepeatCycles() << "\n";
+      writeResponse(out.str());
+    } else if (cmd == "setbreakpoints") {
+      // Replaces the full breakpoint set (no args clears it) -- this is
+      // what a debug adapter sends on every VS Code "set breakpoints for
+      // this file" request, which always supplies the complete desired
+      // set, not a delta.
+      breakpoints.clear();
+      long addr;
+      while (iss >> std::hex >> addr) breakpoints.insert(static_cast<uint16_t>(addr));
+      debugControlActive = true;
+      writeResponse("OK");
+    } else if (cmd == "continue") {
+      // Step past the current PC unconditionally first -- otherwise
+      // resuming from a breakpoint you're currently stopped at would
+      // re-trigger it instantly and never make progress. The main
+      // per-frame loop's debugControlActive branch (below) takes over
+      // from here, checking breakpoints before each subsequent
+      // instruction.
+      debugControlActive = true;
+      debugStepOne();
+      debugRunning = true;
+      lastStopReason.clear();
+      writeResponse("OK");
+    } else if (cmd == "pause") {
+      debugControlActive = true;
+      debugRunning = false;
+      lastStopReason = "paused";
+      writeResponse("OK");
+    } else if (cmd == "debugstep") {
+      debugControlActive = true;
+      debugRunning = false;
+      debugStepOne();
+      lastStopReason = "step";
+      writeResponse(formatRegisters());
+    } else if (cmd == "debugstatus") {
+      std::ostringstream out;
+      out << (debugRunning ? "RUNNING" : "STOPPED") << " reason=" << lastStopReason << "\n";
+      out << formatRegisters();
       writeResponse(out.str());
     } else if (cmd == "display") {
       std::ostringstream out;
@@ -2333,34 +2410,57 @@ int main(int argc, char** argv) {
     int cyclesRun = 0;
     int16_t audioSamples[kMaxAudioSamplesPerFrame];
     int audioSamplesEmitted = 0;
-    while (cyclesRun < kCyclesPerFrame) {
-      int c = cpu.step();
-      int used = (c > 0) ? c : 1;
-      cyclesRun += used;
-      cyclesSinceTimerTick += used;
-      bus.advanceCycles(used);
-      while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
-        cpu.tickTimer();
-        cyclesSinceTimerTick -= kCyclesPerTimerTick;
+    if (debugControlActive) {
+      // A debugger has attached (see the "setbreakpoints"/"continue"/etc.
+      // FIFO commands above) -- replace the normal free-running stepping
+      // below with breakpoint-aware single-instruction stepping, spread
+      // across real frames (so the GUI keeps rendering and a `pause`
+      // command takes effect within about one instruction, rather than
+      // this frame blocking until a whole continue's worth of cycles is
+      // done). No audio sampling in this mode -- a debug session doesn't
+      // care about the buzzer, and it'd have to be reworked to cope with
+      // stepping being interrupted mid-frame by a breakpoint anyway.
+      while (debugRunning && cyclesRun < kCyclesPerFrame) {
+        uint16_t pBefore = cpu.p();
+        if (breakpoints.count(pBefore)) {
+          debugRunning = false;
+          std::ostringstream reason;
+          reason << "breakpoint 0x" << std::hex << std::uppercase << pBefore;
+          lastStopReason = reason.str();
+          break;
+        }
+        cyclesRun += debugStepOne();
       }
+    } else {
+      while (cyclesRun < kCyclesPerFrame) {
+        int c = cpu.step();
+        int used = (c > 0) ? c : 1;
+        cyclesRun += used;
+        cyclesSinceTimerTick += used;
+        bus.advanceCycles(used);
+        while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+          cpu.tickTimer();
+          cyclesSinceTimerTick -= kCyclesPerTimerTick;
+        }
 
-      // Sample the buzzer bit cycle-accurately (not from an SDL audio
-      // callback thread -- see the buzzer comment above) so this frame's
-      // rendered CPU execution maps proportionally across however many
-      // samples this frame actually gets (samplesThisFrame, decided from
-      // real elapsed time above).
-      int targetSamples =
-          static_cast<int>((static_cast<int64_t>(cyclesRun) * samplesThisFrame) / kCyclesPerFrame);
-      if (targetSamples > samplesThisFrame) targetSamples = samplesThisFrame;
-      double rawLevel = bus.ioPort().buzzerOn() ? 1.0 : -1.0;
-      while (audioSamplesEmitted < targetSamples) {
-        // DC-blocking high-pass filter -- see buzzerDcEstimate's comment
-        // above. Applied per emitted sample (not per CPU step) since the
-        // filter's time constant is defined in real sample-rate terms.
-        buzzerDcEstimate += (rawLevel - buzzerDcEstimate) * kBuzzerDcBlockAlpha;
-        double filtered = rawLevel - buzzerDcEstimate;
-        audioSamples[audioSamplesEmitted++] =
-            static_cast<int16_t>(filtered * kBuzzerAmplitude);
+        // Sample the buzzer bit cycle-accurately (not from an SDL audio
+        // callback thread -- see the buzzer comment above) so this frame's
+        // rendered CPU execution maps proportionally across however many
+        // samples this frame actually gets (samplesThisFrame, decided from
+        // real elapsed time above).
+        int targetSamples =
+            static_cast<int>((static_cast<int64_t>(cyclesRun) * samplesThisFrame) / kCyclesPerFrame);
+        if (targetSamples > samplesThisFrame) targetSamples = samplesThisFrame;
+        double rawLevel = bus.ioPort().buzzerOn() ? 1.0 : -1.0;
+        while (audioSamplesEmitted < targetSamples) {
+          // DC-blocking high-pass filter -- see buzzerDcEstimate's comment
+          // above. Applied per emitted sample (not per CPU step) since the
+          // filter's time constant is defined in real sample-rate terms.
+          buzzerDcEstimate += (rawLevel - buzzerDcEstimate) * kBuzzerDcBlockAlpha;
+          double filtered = rawLevel - buzzerDcEstimate;
+          audioSamples[audioSamplesEmitted++] =
+              static_cast<int16_t>(filtered * kBuzzerAmplitude);
+        }
       }
     }
     if (audioDevice != 0) {

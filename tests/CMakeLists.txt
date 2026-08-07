@@ -41,3 +41,11 @@ add_test(NAME disasm_rom1_smoke_test COMMAND disasm_rom1_smoke_test)
 add_executable(known_symbols_test known_symbols_test.cpp)
 target_link_libraries(known_symbols_test PRIVATE pc1500disasm)
 add_test(NAME known_symbols_test COMMAND known_symbols_test)
+
+add_executable(dap_protocol_test dap_protocol_test.cpp)
+target_link_libraries(dap_protocol_test PRIVATE pc1500debugadapterlib)
+add_test(NAME dap_protocol_test COMMAND dap_protocol_test)
+
+add_executable(listing_file_test listing_file_test.cpp)
+target_link_libraries(listing_file_test PRIVATE pc1500debugadapterlib)
+add_test(NAME listing_file_test COMMAND listing_file_test)

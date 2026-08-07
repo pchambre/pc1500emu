@@ -308,6 +308,53 @@ Opening this repo in VS Code also picks up:
   its disassembly: open the `.BIN`/`.ROM` file, "Open With" → Hex Editor,
   then drag its tab into a split pane alongside the generated `.asm`.
 
+### Debugger
+
+`pc1500debugadapter` (built alongside the emulator, `src/debugadapter/`) is
+a [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/)
+server that lets VS Code's native debugging UI — breakpoints, step,
+call stack, variables — drive a running `pc1500emu` instance, via the same
+scriptable command pipe described above (`setbreakpoints`/`continue`/
+`pause`/`debugstep`/`debugstatus`).
+
+`tools/vscode-lh5801-asm/`'s `contributes.debuggers` entry wires this up as
+debug type `lh5801`; `.vscode/launch.json` has two ready-made
+configurations:
+
+- **"LH5801: Attach to running pc1500emu"** — launch `pc1500emu` yourself
+  first, then F5 to load a program into it and start debugging.
+- **"LH5801: Launch pc1500emu and debug"** — starts `pc1500emu` itself
+  (fill in `romPath` for your machine first).
+
+Both load a program (`program`/`loadAddress`/`loadMode` — raw binary via
+`loadbinary`, or a CE-150-style plug-in ROM via `loadrommodule`), set the
+entry point (`entry`), and, if a `listing` (`sdaslh5801 -l` output) is
+given, resolve source-line breakpoints and stack-frame source locations
+against it. Without a `listing`, debugging still works at the instruction
+level (breakpoints by address, stepping, registers, memory) — VS Code just
+won't be able to show a source line for the current position.
+
+Known limitations:
+
+- **Only one stack frame is ever reported.** The LH5801 has no easy
+  hardware call-stack walk (return addresses just live on the CPU's own
+  stack register `S`), so "Call Stack" always shows a single `PC` frame,
+  not a full unwind.
+- **Stop detection is poll-based, not a push notification.** The command
+  pipe is a plain request/response channel with no way for the emulator to
+  initiate a message, so after `continue` the adapter polls `debugstatus`
+  every ~75ms until it reports stopped. A `pause` typically takes effect
+  within that same window, not instantly.
+- **Full end-to-end use (F5 → hit a breakpoint → see the source line
+  highlighted) needs a built `sdaslh5801`** to produce the `.lst` listing
+  files this depends on for source-line mapping — not built on this
+  machine as of this writing. The adapter itself is fully working and
+  tested against hand-built binary+listing fixtures (see
+  `tests/listing_file_test.cpp`, `tests/dap_protocol_test.cpp`, and the
+  FIFO-driven breakpoint tests exercised directly against a live
+  `pc1500emu`); what's untested is specifically real `sdaslh5801 -l`
+  output.
+
 ## Layout
 
 - `src/cpu/` — LH5801 CPU core
@@ -318,8 +365,11 @@ Opening this repo in VS Code also picks up:
 - `src/basic/` — BASIC keyword tokenizer/detokenizer and keystroke-driven
   program load/save
 - `src/disasm/` — LH5801 ROM disassembler (`pc1500disasm`)
+- `src/debugadapter/` — DAP server bridging VS Code's debugging UI to a
+  running `pc1500emu` (`pc1500debugadapter`, see the Debugger section above)
 - `tools/vscode-lh5801-asm/` — local VS Code extension for editing
-  disassembly output (see the Disassembler section above)
+  disassembly output and debugging (see the Disassembler/Debugger
+  sections above)
 - `third_party/imgui/` — vendored Dear ImGui (menu bar UI), MIT licensed
 - `tests/` — unit tests
 - `docs/` — technical reference notes (ISA, hardware) backing the implementation

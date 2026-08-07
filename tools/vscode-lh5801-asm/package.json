@@ -8,7 +8,7 @@
   "engines": {
     "vscode": "^1.75.0"
   },
-  "categories": ["Programming Languages"],
+  "categories": ["Programming Languages", "Debuggers"],
   "contributes": {
     "languages": [
       {
@@ -22,6 +22,118 @@
         "language": "lh5801-asm",
         "scopeName": "source.lh5801asm",
         "path": "./syntaxes/lh5801.tmLanguage.json"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "lh5801",
+        "label": "LH5801/PC-1500",
+        "program": "${workspaceFolder}/build/src/debugadapter/RelWithDebInfo/pc1500debugadapter.exe",
+        "languages": ["lh5801-asm"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["program"],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the assembled binary or ROM module to load.",
+                "default": "${workspaceFolder}/build.bin"
+              },
+              "loadAddress": {
+                "type": "string",
+                "description": "Hex address (no 0x prefix) to load `program` at.",
+                "default": "4200"
+              },
+              "loadMode": {
+                "type": "string",
+                "enum": ["binary", "rommodule"],
+                "description": "\"binary\" writes program's bytes directly into memory (loadbinary); \"rommodule\" maps it as a CE-150/153/158-style plug-in ROM module (loadrommodule).",
+                "default": "binary"
+              },
+              "requirePv": {
+                "type": "boolean",
+                "description": "rommodule mode only: module requires the PV flag.",
+                "default": false
+              },
+              "usePuBank": {
+                "type": "boolean",
+                "description": "rommodule mode only: module is PU-banked (must be an even-sized file).",
+                "default": false
+              },
+              "entry": {
+                "type": "string",
+                "description": "Hex address (no 0x prefix) to set P to before running. Defaults to loadAddress.",
+                "default": "4200"
+              },
+              "listing": {
+                "type": "string",
+                "description": "Path to the sdaslh5801 -l listing (.lst) file, for source-line breakpoints and stepping. Omit to debug at the instruction level only.",
+                "default": "${workspaceFolder}/build.lst"
+              },
+              "sourcePath": {
+                "type": "string",
+                "description": "Path to the .asm source shown for stack frames. Defaults to the listing path."
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Stop at the entry point before running.",
+                "default": true
+              },
+              "emulatorPath": {
+                "type": "string",
+                "description": "Path to pc1500emu.exe. If given, the adapter launches it (and closes it on disconnect). If omitted, the adapter attaches to an already-running instance's command pipe instead."
+              },
+              "romPath": {
+                "type": "string",
+                "description": "Path to ROM1.BIN. Required if emulatorPath is given."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "lh5801",
+            "request": "launch",
+            "name": "Debug on running pc1500emu",
+            "program": "${workspaceFolder}/build.bin",
+            "loadAddress": "4200",
+            "entry": "4200",
+            "listing": "${workspaceFolder}/build.lst",
+            "stopOnEntry": true
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "LH5801: Attach to running pc1500emu",
+            "description": "Load a program into an already-running pc1500emu and debug it.",
+            "body": {
+              "type": "lh5801",
+              "request": "launch",
+              "name": "Debug on running pc1500emu",
+              "program": "^\"\\${workspaceFolder}/build.bin\"",
+              "loadAddress": "4200",
+              "entry": "4200",
+              "listing": "^\"\\${workspaceFolder}/build.lst\"",
+              "stopOnEntry": true
+            }
+          },
+          {
+            "label": "LH5801: Launch pc1500emu and debug",
+            "description": "Start pc1500emu itself, then load and debug a program in it.",
+            "body": {
+              "type": "lh5801",
+              "request": "launch",
+              "name": "Launch pc1500emu and debug",
+              "emulatorPath": "^\"\\${workspaceFolder}/build/src/host/RelWithDebInfo/pc1500emu.exe\"",
+              "romPath": "^\"C:/path/to/ROM1.BIN\"",
+              "program": "^\"\\${workspaceFolder}/build.bin\"",
+              "loadAddress": "4200",
+              "entry": "4200",
+              "listing": "^\"\\${workspaceFolder}/build.lst\"",
+              "stopOnEntry": true
+            }
+          }
+        ]
       }
     ]
   }

@@ -137,6 +137,81 @@ void testSyntheticModuleTraversal() {
   }
 }
 
+// A single-keyword module table is below kMinEntriesForConfidence on its
+// own, but should still be auto-accepted when a correctly-formed 52-byte
+// first-letter index sits immediately before it (mechanism doc §2) --
+// confirmed against a real single-keyword test ROM
+// (INVERT_minimal_8000_pvlow.ROM) this session, where exactly this
+// pattern occurs.
+void testSingleEntryTableAcceptedWithValidIndex() {
+  constexpr uint16_t kBase = 0x9000;
+  std::vector<uint8_t> image(0x800, 0xFF);
+  auto put = [&](uint16_t addr, std::initializer_list<uint8_t> bytes) {
+    uint16_t a = addr;
+    for (uint8_t b : bytes) image[a++ - kBase] = b;
+  };
+
+  image[0x9000 - kBase] = 0x55;  // sentinel
+
+  // One entry: "TEST" (marker low nibble = 4) -> code 0xE134, addr 0x9060.
+  put(0x9040, {0x94, 'T', 'E', 'S', 'T', 0xE1, 0x34, 0x90, 0x60});
+  put(0x9049, {0xD0});  // terminator right after -- only 1 entry total
+  put(0x9060, {0x9A});  // rtn, so the entry's address seeds into real code
+
+  // Index slot for 'T' (the 20th letter, 0-indexed 19), 52 bytes before
+  // the marker at 0x9040 -> indexAddr 0x900C, slot at 0x900C + 19*2 =
+  // 0x9032. Must point at the entry's *second* letter (0x9040 + 2).
+  put(0x9032, {0x90, 0x42});
+
+  auto r = analyzeModuleRom(image, kBase);
+
+  CHECK(r.lowConfidenceTables.empty());
+  CHECK(r.moduleKeywordTables.size() == 1);
+  if (r.moduleKeywordTables.size() == 1) {
+    const auto& kt = r.moduleKeywordTables[0];
+    CHECK(kt.entries.size() == 1);
+    if (kt.entries.size() == 1) {
+      CHECK(kt.entries[0].name == "TEST");
+      CHECK(kt.entries[0].code == 0xE134);
+      CHECK(kt.entries[0].address == 0x9060);
+    }
+  }
+  CHECK(r.kind[0x9060 - kBase] == ByteKind::CodeStart);
+}
+
+// Same single-entry table, but with no valid index backing it (the slot
+// that should point at the entry stays 0xFFFF, the image's fill value) --
+// must still be rejected as low-confidence, exactly as before this
+// session's index-validation addition. Guards against the new check
+// accidentally loosening the original CE-158.ROM false-positive
+// protection for the plain "too few entries, no index" case.
+void testSingleEntryTableRejectedWithoutValidIndex() {
+  constexpr uint16_t kBase = 0x9000;
+  std::vector<uint8_t> image(0x800, 0xFF);
+  auto put = [&](uint16_t addr, std::initializer_list<uint8_t> bytes) {
+    uint16_t a = addr;
+    for (uint8_t b : bytes) image[a++ - kBase] = b;
+  };
+
+  image[0x9000 - kBase] = 0x55;
+  put(0x9040, {0x94, 'T', 'E', 'S', 'T', 0xE1, 0x34, 0x90, 0x60});
+  put(0x9049, {0xD0});
+  put(0x9060, {0x9A});
+  // No index slot set -- 0x9032/0x9033 stay 0xFF/0xFF (neither 0x0000 nor
+  // the expected 0x9042 pointer).
+
+  auto r = analyzeModuleRom(image, kBase);
+
+  CHECK(r.moduleKeywordTables.empty());
+  CHECK(r.lowConfidenceTables.size() == 1);
+  if (r.lowConfidenceTables.size() == 1) {
+    CHECK(r.lowConfidenceTables[0].entries.size() == 1);
+    if (r.lowConfidenceTables[0].entries.size() == 1) {
+      CHECK(r.lowConfidenceTables[0].entries[0].name == "TEST");
+    }
+  }
+}
+
 std::vector<uint8_t> readFile(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) return {};
@@ -198,6 +273,8 @@ void testCe150RomKnownTable() {
 
 int main() {
   testSyntheticModuleTraversal();
+  testSingleEntryTableAcceptedWithValidIndex();
+  testSingleEntryTableRejectedWithoutValidIndex();
   testCe150RomKnownTable();
 
   if (g_failures == 0) {

@@ -277,7 +277,17 @@ Table buildFdTable() {
   set(0x48, "ldx", Operand::RegS); set(0x58, "ldx", Operand::RegP);
   // STX (X -> destination R)
   set(0x4A, "stx", Operand::RegX); set(0x5A, "stx", Operand::RegY); set(0x6A, "stx", Operand::RegU);
-  set(0x4E, "stx", Operand::RegS); set(0x5E, "stx", Operand::RegP);
+  set(0x4E, "stx", Operand::RegS);
+  // STX P (X -> P) is an indirect jump -- P *is* the program counter, so
+  // this unconditionally redirects control to whatever X holds. The target
+  // isn't statically resolvable in general (X's value only exists at
+  // runtime), so this is classified like RTN: no fall-through, no known
+  // target. Custom BASIC keyword routines are confirmed (real-hardware
+  // testing, this session) to use exactly this -- LDI X,<addr>; STX P --
+  // as their dispatch-back mechanism instead of RTN; without this
+  // classification the traverser fell through into whatever follows in
+  // memory (often padding) and decoded garbage as more instructions.
+  set(0x5E, "stx", Operand::RegP, Operand::None, ControlFlow::Return);
   // PSH / POP
   set(0xC8, "psh", Operand::RegA); set(0x88, "psh", Operand::RegX); set(0x98, "psh", Operand::RegY);
   set(0xA8, "psh", Operand::RegU);

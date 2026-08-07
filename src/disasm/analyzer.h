@@ -54,6 +54,17 @@ struct AnalysisResult {
   std::vector<VectorTableEntry> vectorEntries;  // fixed vectors (base mode) + any FF00H-page slots referenced
   KeywordTable baseKeywordTable;                 // valid (non-empty entries) only in base mode
   std::vector<KeywordTable> moduleKeywordTables;  // valid only in module mode
+  // Module mode only: for each 0x55-sentinel page where no candidate table
+  // reached kMinEntriesForConfidence (analyzer.cpp), the single
+  // highest-entry-count candidate found anyway (which may have as few as 1
+  // entry) -- lets a caller report "found X but didn't trust it" rather
+  // than silently rendering the whole page as data, for small/hand-built
+  // module ROMs (e.g. a single-keyword test build) that are real but too
+  // short to clear the false-positive-avoidance bar. Not auto-applied
+  // (that bar exists for a real reason -- see findKeywordTableInPage's
+  // comment); a caller that trusts one of these should pass its entries'
+  // addresses back in via analyzeModuleRom's extraSeeds.
+  std::vector<KeywordTable> lowConfidenceTables;
 };
 
 // Base ROM's built-in keyword table's first-letter index address --
@@ -66,14 +77,20 @@ constexpr uint16_t kBaseKeywordIndexAddr = 0xC01E;
 // built-in keyword table at kBaseKeywordIndexAddr, then traverses. VEJ/VMJ/
 // conditional-vector-call targets (FF00H-FFF7H) are resolved lazily, only
 // for slots actually referenced by code found during traversal.
-AnalysisResult analyzeBaseRom(const std::vector<uint8_t>& image, uint16_t base);
+// `extraSeeds` are additional entry-point addresses to traverse from and
+// label, on top of the above -- for known-good entry points a caller wants
+// disassembled that nothing else here would discover (see
+// AnalysisResult::lowConfidenceTables).
+AnalysisResult analyzeBaseRom(const std::vector<uint8_t>& image, uint16_t base,
+                               const std::vector<uint16_t>& extraSeeds = {});
 
 // Module-ROM mode: scans for a 0x55 sentinel byte at every 2KB-aligned page
 // boundary within [base, base+image.size()); for each page found, runs a
 // validating scan for a keyword-table entry chain (see analyzer.cpp's
 // findKeywordTableInPage), seeds every entry's address field, then
 // traverses the same way as base mode (minus the base-specific table/
-// vectors).
-AnalysisResult analyzeModuleRom(const std::vector<uint8_t>& image, uint16_t base);
+// vectors). `extraSeeds`: see analyzeBaseRom.
+AnalysisResult analyzeModuleRom(const std::vector<uint8_t>& image, uint16_t base,
+                                 const std::vector<uint16_t>& extraSeeds = {});
 
 }  // namespace pc1500::disasm

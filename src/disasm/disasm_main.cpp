@@ -27,6 +27,13 @@ void printUsage(const char* argv0) {
                "                 every 2KB-aligned page and auto-detects its keyword\n"
                "                 table(s). Default load address 0x8000.\n"
                "  --base 0xNNNN  Override the default load address for the chosen mode.\n"
+               "  --seed 0xNNNN  Traverse from this address too, in addition to whatever\n"
+               "                 vectors/keyword tables are found automatically (repeatable).\n"
+               "                 Useful for small/hand-built module ROMs with too few\n"
+               "                 keyword-table entries to pass the auto-detector's\n"
+               "                 false-positive-avoidance confidence check -- pc1500disasm\n"
+               "                 reports these to stderr as 'low-confidence' candidates,\n"
+               "                 each entry's address is exactly what --seed wants.\n"
                "  -o out.asm     Write the listing here instead of stdout.\n"
                "  --annotate     Add a trailing '; 0xNNNN: XX XX ...' comment per line.\n",
                argv0);
@@ -47,6 +54,7 @@ int main(int argc, char** argv) {
   std::string outPath;
   bool annotate = false;
   std::string romPath;
+  std::vector<uint16_t> seeds;
 
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
@@ -55,6 +63,8 @@ int main(int argc, char** argv) {
     } else if (arg == "--base" && i + 1 < argc) {
       base = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 16));
       baseGiven = true;
+    } else if (arg == "--seed" && i + 1 < argc) {
+      seeds.push_back(static_cast<uint16_t>(std::strtoul(argv[++i], nullptr, 16)));
     } else if (arg == "-o" && i + 1 < argc) {
       outPath = argv[++i];
     } else if (arg == "--annotate") {
@@ -97,8 +107,19 @@ int main(int argc, char** argv) {
   }
 
   pc1500::disasm::AnalysisResult result =
-      (mode == "base") ? pc1500::disasm::analyzeBaseRom(image, static_cast<uint16_t>(base))
-                        : pc1500::disasm::analyzeModuleRom(image, static_cast<uint16_t>(base));
+      (mode == "base") ? pc1500::disasm::analyzeBaseRom(image, static_cast<uint16_t>(base), seeds)
+                        : pc1500::disasm::analyzeModuleRom(image, static_cast<uint16_t>(base), seeds);
+
+  for (const auto& kt : result.lowConfidenceTables) {
+    std::fprintf(stderr,
+                  "pc1500disasm: found a %zu-entry keyword-table candidate at 0x%04X, below the "
+                  "auto-detector's confidence threshold (needs 2+) -- not applied automatically:\n",
+                  kt.entries.size(), kt.tableAddr);
+    for (const auto& e : kt.entries) {
+      std::fprintf(stderr, "  %s -> 0x%04X (add with --seed 0x%04X)\n", e.name.c_str(), e.address,
+                    e.address);
+    }
+  }
 
   pc1500::disasm::FormatOptions options;
   options.annotate = annotate;
