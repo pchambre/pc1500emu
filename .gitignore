@@ -3,6 +3,12 @@ build/
 *.obj
 .cache/
 compile_commands.json
+
+# Local runtime artifacts (state save/load feature) -- a conf file and/or
+# state file dropped in the repo root or build dir by running pc1500emu.exe
+# from here during dev/testing, not source.
+/pc1500emu.json
+*.state
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json

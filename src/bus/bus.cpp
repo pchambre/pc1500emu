@@ -2,6 +2,8 @@
 // Version 2.0 -- see LICENSE.
 #include "bus.h"
 
+#include "serialize_io.h"
+
 namespace {
 inline std::tm portable_localtime(std::time_t t) {
   std::tm result{};
@@ -363,6 +365,49 @@ void Bus::loadME0(uint16_t addr, const uint8_t* data, size_t size) {
     if (target > 0xFFFF) break;
     me0_[static_cast<uint16_t>(target)] = data[i];
   }
+}
+
+namespace {
+constexpr size_t kSavedRamSize = 0x8000;  // me0_[0x0000,0x8000) -- see Bus::saveState's comment
+
+void saveRomModule(std::ostream& os, const Bus::RomModule& m) {
+  using namespace pc1500state;
+  writeU32(os, static_cast<uint32_t>(m.data.size()));
+  writeBytes(os, m.data.data(), m.data.size());
+  writeU16(os, m.base);
+  writeBool(os, m.requirePv);
+  writeBool(os, m.usePuBank);
+}
+
+bool loadRomModuleState(std::istream& is, Bus::RomModule& m) {
+  using namespace pc1500state;
+  uint32_t size = readU32(is);
+  m.data.assign(size, 0);
+  readBytes(is, m.data.data(), m.data.size());
+  m.base = readU16(is);
+  m.requirePv = readBool(is);
+  m.usePuBank = readBool(is);
+  return !is.fail();
+}
+}  // namespace
+
+void Bus::saveState(std::ostream& os) const {
+  using namespace pc1500state;
+  writeBytes(os, me0_.data(), kSavedRamSize);
+  writeU32(os, static_cast<uint32_t>(extRam4800Size_));
+  writeU32(os, static_cast<uint32_t>(extRam0000Size_));
+  saveRomModule(os, module_);
+  saveRomModule(os, module2_);
+}
+
+bool Bus::loadState(std::istream& is) {
+  using namespace pc1500state;
+  readBytes(is, me0_.data(), kSavedRamSize);
+  extRam4800Size_ = readU32(is);
+  extRam0000Size_ = readU32(is);
+  bool ok = loadRomModuleState(is, module_);
+  ok = loadRomModuleState(is, module2_) && ok;
+  return ok && !is.fail();
 }
 
 }  // namespace pc1500

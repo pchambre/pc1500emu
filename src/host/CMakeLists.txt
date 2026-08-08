@@ -32,4 +32,4 @@ add_executable(pc1500emu
 target_include_directories(pc1500emu PRIVATE
   ${IMGUI_DIR} ${IMGUI_DIR}/backends
 )
-target_link_libraries(pc1500emu PRIVATE lh5801cpu pc1500bus pc1500keyboard pc1500lcd pc1500basic ${SDL2_TARGETS} ${SDL2_TTF_TARGETS})
+target_link_libraries(pc1500emu PRIVATE lh5801cpu pc1500bus pc1500keyboard pc1500lcd pc1500basic pc1500hoststate ${SDL2_TARGETS} ${SDL2_TTF_TARGETS})

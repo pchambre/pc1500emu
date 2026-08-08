@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <iosfwd>
 #include <vector>
 
 #include "keyboard.h"
@@ -426,6 +427,24 @@ class Bus : public lh5801::MemoryBus {
   // real elapsed wall-clock seconds (main.cpp already computes this for
   // its audio sample accumulator).
   void advanceRealTime(double elapsedSeconds) { io_.advanceRealTime(elapsedSeconds); }
+
+  // Session state save/load -- deliberately narrow scope: RAM contents
+  // (me0_[0x0000,0x8000) only -- covers both extension-RAM windows, the
+  // built-in 2K RAM, and the LCD buffer/system RAM/their mirrors, all
+  // backed by the same array), extension-RAM window sizes, and both ROM
+  // module slots (raw bytes + base/requirePv/usePuBank -- module ROM isn't
+  // stored in me0_ at all, see RomModule::tryRead). Deliberately excludes
+  // 0x8000H-0xFFFFH (module-ROM range isn't backed by me0_; the base
+  // system ROM at 0xC000H-0xFFFFH is always reloaded fresh from the
+  // command-line/conf-file ROM path, not duplicated into the state file),
+  // CPU registers (restore instead relies on a normal cpu.reset() cold
+  // boot, matching how a real PC-1500 resumes after a power cycle -- RAM
+  // is battery-backed but the CPU always resets), and IoPortController/RTC
+  // state (left to the ROM's own boot-time reinitialization, same
+  // reasoning). See src/hoststate/state_file.h for the file-level
+  // magic/version header this is embedded in.
+  void saveState(std::ostream& os) const;
+  bool loadState(std::istream& is);
 
  private:
   // Applies a release that setKeyState deferred: updates Keyboard, and (for

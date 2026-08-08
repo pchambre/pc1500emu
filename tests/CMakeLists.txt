@@ -49,3 +49,11 @@ add_test(NAME dap_protocol_test COMMAND dap_protocol_test)
 add_executable(listing_file_test listing_file_test.cpp)
 target_link_libraries(listing_file_test PRIVATE pc1500debugadapterlib)
 add_test(NAME listing_file_test COMMAND listing_file_test)
+
+add_executable(state_roundtrip_test state_roundtrip_test.cpp)
+target_link_libraries(state_roundtrip_test PRIVATE pc1500hoststate pc1500bus pc1500keyboard)
+add_test(NAME state_roundtrip_test COMMAND state_roundtrip_test)
+
+add_executable(app_config_test app_config_test.cpp)
+target_link_libraries(app_config_test PRIVATE pc1500hoststate)
+add_test(NAME app_config_test COMMAND app_config_test)

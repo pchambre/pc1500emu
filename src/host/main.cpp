@@ -26,20 +26,24 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "app_config.h"
 #include "basic_text.h"
 #include "basic_tokens.h"
 #include "bus.h"
 #include "keyboard.h"
 #include "lcd.h"
 #include "lh5801.h"
+#include "state_file.h"
 #include "text_loader.h"
 
 namespace {
@@ -1022,9 +1026,32 @@ bool typeImmediateLineWithTrace(pc1500::Bus& bus, lh5801::CPU& cpu, const std::s
   return true;
 }
 
+void printUsage(const char* argv0) {
+  std::printf(
+      "Usage: %s [options] [<rom.bin>]\n"
+      "\n"
+      "  <rom.bin>            Path to the PC-1500 system ROM to load at 0xC000\n"
+      "                       (16KB). Optional if a --conf file specifies its own\n"
+      "                       romPath; a path given here always overrides that.\n"
+      "  --conf <path>        Load settings (ROM path, state-file path, auto-load/\n"
+      "                       auto-save preferences) from a JSON conf file. See\n"
+      "                       README.md's state save/load section for the schema.\n"
+      "  -h, --help, /h, /?   Show this help and exit.\n",
+      argv0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    if (arg == "-h" || arg == "--help" || arg == "/h" || arg == "/?") {
+      printUsage(argv[0]);
+      return 0;
+    }
+  }
+
+
   pc1500::Keyboard keyboard;
   pc1500::Bus bus(keyboard);
   lh5801::CPU cpu(bus);
@@ -1037,19 +1064,83 @@ int main(int argc, char** argv) {
   // which would already show correct time on power-up.
   bus.ioPort().syncRtcToHostClock();
 
-  if (argc > 1) {
-    std::vector<uint8_t> rom = readFile(argv[1]);
+  // Command-line: `--conf <path>` may appear anywhere; the first other
+  // token is the positional ROM path (unchanged from before this feature
+  // existed). A given positional ROM path always wins over the conf
+  // file's own romPath -- the more immediate/explicit signal takes
+  // precedence.
+  std::string confPath;
+  std::string positionalRomPath;
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    if (arg == "--conf") {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "pc1500emu: --conf requires a path argument\n");
+        return 1;
+      }
+      confPath = argv[++i];
+    } else if (positionalRomPath.empty()) {
+      positionalRomPath = arg;
+    }
+  }
+
+  // No --conf given: look for a default conf file (pc1500emu.json) in the
+  // current directory, then next to the executable, then in the user's
+  // home directory -- so settings persist across launches with zero
+  // command-line involvement, not just when --conf is spelled out.
+  if (confPath.empty()) {
+    auto found = pc1500host::findDefaultConfFile(argv[0]);
+    if (found) confPath = *found;
+  }
+
+  pc1500host::AppConfig appConfig;
+  if (!confPath.empty()) {
+    std::string confErr;
+    if (!pc1500host::loadAppConfig(confPath, &appConfig, &confErr)) {
+      std::fprintf(stderr, "pc1500emu: could not read conf file '%s': %s\n", confPath.c_str(),
+                   confErr.c_str());
+      return 1;
+    }
+  }
+
+  std::string effectiveRomPath =
+      !positionalRomPath.empty() ? positionalRomPath : appConfig.romPath.value_or(std::string());
+  if (!effectiveRomPath.empty()) {
+    std::vector<uint8_t> rom = readFile(effectiveRomPath.c_str());
     if (rom.empty()) {
-      std::fprintf(stderr, "pc1500emu: could not read ROM file '%s'\n", argv[1]);
+      std::fprintf(stderr, "pc1500emu: could not read ROM file '%s'\n", effectiveRomPath.c_str());
       return 1;
     }
     bus.loadME0(0xC000, rom.data(), rom.size());
-    std::printf("pc1500emu: loaded %zu-byte ROM from %s\n", rom.size(), argv[1]);
+    std::printf("pc1500emu: loaded %zu-byte ROM from %s\n", rom.size(), effectiveRomPath.c_str());
   } else {
     std::printf(
-        "pc1500emu: no ROM given (usage: %s <rom.bin>) -- running with "
-        "ROM area 0xFF-filled\n",
+        "pc1500emu: no ROM given (run '%s -h' for usage) -- running with ROM area "
+        "0xFF-filled\n",
         argv[0]);
+  }
+
+  // State-file restore happens before cpu.reset() -- i.e. before the PC
+  // "boots" -- so the ROM's own startup code sees the fully-resumed RAM/
+  // module state from its very first instruction, matching real hardware
+  // (RAM is already battery-backed and modules already plugged in before
+  // power turns on). A missing file at the configured path isn't an error
+  // (first run, nothing saved yet); a present-but-corrupt one is a
+  // non-fatal warning -- the freshly-loaded ROM's default state is still
+  // usable.
+  std::string configuredStateFilePath = appConfig.stateFilePath.value_or(std::string());
+  if (!configuredStateFilePath.empty() && appConfig.autoLoadOnStart) {
+    std::ifstream probe(configuredStateFilePath, std::ios::binary);
+    if (probe.good()) {
+      probe.close();
+      std::string stateErr;
+      if (pc1500host::loadStateFile(bus, configuredStateFilePath, &stateErr)) {
+        std::printf("pc1500emu: restored state from %s\n", configuredStateFilePath.c_str());
+      } else {
+        std::fprintf(stderr, "pc1500emu: could not load state file '%s': %s\n",
+                     configuredStateFilePath.c_str(), stateErr.c_str());
+      }
+    }
   }
   cpu.reset();
 
@@ -1821,7 +1912,9 @@ int main(int argc, char** argv) {
     SaveBinary,
     LoadRomModule,
     LoadBasicText,
-    SaveBasicText
+    SaveBasicText,
+    LoadState,
+    SaveState
   };
   ActiveDialog activeDialog = ActiveDialog::None;
   char filenameBuf[512] = "";
@@ -1842,6 +1935,16 @@ int main(int argc, char** argv) {
   bool romRequirePv = false;
   bool romUsePuBank = false;
   std::string dialogError;
+  // Session-wide state-file/conf-file settings. configuredStateFilePath is
+  // set up earlier in main(), before the SDL/ImGui init (see the
+  // command-line-parsing block above); activeConfPath starts at whatever
+  // --conf gave (or findDefaultConfFile discovered) and is filled in
+  // lazily by persistActiveConf the first time any state-related setting
+  // actually needs saving, if it's still empty at that point.
+  std::string activeConfPath = confPath;
+  std::string stateActionStatus;
+  int stateActionStatusFramesRemaining = 0;
+  constexpr int kStateActionStatusFrames = kFramesPerSecond * 3;
   SDL_Window* dialogWindow = nullptr;
   SDL_Renderer* dialogRenderer = nullptr;
   ImGuiContext* dialogImguiCtx = nullptr;
@@ -1870,6 +1973,48 @@ int main(int argc, char** argv) {
     ImGui_ImplSDL2_InitForSDLRenderer(dialogWindow, dialogRenderer);
     ImGui_ImplSDLRenderer2_Init(dialogRenderer);
     ImGui::SetCurrentContext(mainImguiCtx);
+  };
+  // Hoisted out of the File menu's own BeginMenu block (unlike the other
+  // dialog helpers above, this used to be declared inside it) so the
+  // keyboard-shortcut polling block below -- which runs every frame,
+  // regardless of whether the File menu happens to be open -- can call it
+  // too.
+  auto startDialog = [&](ActiveDialog which, const char* title, int width = 440,
+                          int height = 260, const char* prefill = nullptr) {
+    activeDialog = which;
+    if (prefill != nullptr) {
+      std::strncpy(filenameBuf, prefill, sizeof(filenameBuf) - 1);
+      filenameBuf[sizeof(filenameBuf) - 1] = '\0';
+    } else {
+      filenameBuf[0] = '\0';
+    }
+    dialogError.clear();
+    callAddrTouched = false;
+    std::strncpy(callAddrBuf, addrBuf, sizeof(callAddrBuf));
+    openDialogWindow(title, width, height);
+  };
+  // Writes appConfig to activeConfPath, so any state-related setting
+  // change (Load/Save State succeeding, either auto-load/auto-save toggle)
+  // is remembered across launches -- not just when the user has explicitly
+  // wired up a --conf file. If nothing's active yet (fresh run, no --conf
+  // and findDefaultConfFile found nothing), this is the point a conf file
+  // first comes into existence: defaults to kDefaultConfFileName in the
+  // current directory, which is also the first place findDefaultConfFile
+  // looks on a future launch, so it's picked up automatically from then on
+  // with no further action needed.
+  auto persistActiveConf = [&]() {
+    bool isNew = activeConfPath.empty();
+    if (isNew) {
+      activeConfPath =
+          (std::filesystem::current_path() / pc1500host::kDefaultConfFileName).string();
+    }
+    std::string err;
+    if (!pc1500host::saveAppConfig(appConfig, activeConfPath, &err)) {
+      stateActionStatus = "Could not save settings to " + activeConfPath + ": " + err;
+    } else if (isNew) {
+      stateActionStatus += " (settings will be remembered in " + activeConfPath + ")";
+    }
+    stateActionStatusFramesRemaining = kStateActionStatusFrames;
   };
   // Temporary: logs every real key event with a precise timestamp, so a
   // captured typing sample can be replayed against the C++ core exactly
@@ -1982,7 +2127,7 @@ int main(int argc, char** argv) {
         // key's TEXTINPUT immediately after its KEYDOWN, never reordered.
         if (pressed) {
           suppressNextTextInput = event.key.repeat || kc == SDLK_F10 || kc == SDLK_F12 ||
-                                   kc == SDLK_INSERT || kc == SDLK_DELETE;
+                                   kc == SDLK_INSERT || kc == SDLK_DELETE || ctrlHeld;
           if (!suppressNextTextInput) {
             for (const KeyMapping& m : kKeyMap) {
               if (m.keycode == kc) {
@@ -1992,7 +2137,13 @@ int main(int argc, char** argv) {
             }
           }
         }
-        if (kc == SDLK_F12) {
+        if (ctrlHeld && kc != SDLK_F12) {
+          // Reserved for host-level menu shortcuts (see the
+          // ImGui::Shortcut(...) polling block near BeginMainMenuBar) --
+          // never forward a Ctrl-held combo to the emulated keyboard. F12
+          // is excluded: Ctrl+F12 is the existing raw-SDL reset hotkey and
+          // already handles ctrlHeld itself, immediately below.
+        } else if (kc == SDLK_F12) {
           if (pressed && ctrlHeld) {
             cpu.reset();
           } else if (pressed && shiftHeld) {
@@ -2089,18 +2240,42 @@ int main(int argc, char** argv) {
     ImGui::NewFrame();
 
     if (ImGui::BeginMainMenuBar()) {
+      // Real keyboard shortcuts for the most-used menu actions -- polled
+      // every frame regardless of which (if any) menu is currently open,
+      // calling the exact same action each corresponding MenuItem does.
+      // RouteGlobal (not RouteAlways) is deliberate: it's a registered
+      // route ImGui resolves against other active routes each frame, so a
+      // focused InputText's own built-in Ctrl+C/V/X/A/Z/Y handling still
+      // wins -- no manual conflict-avoidance needed. The SDL keydown
+      // handler above (see the `ctrlHeld && kc != SDLK_F12` guard) already
+      // ensures none of these also leak through to the emulated keyboard.
+      if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_O, ImGuiInputFlags_RouteGlobal)) {
+        startDialog(ActiveDialog::LoadBinary, "Load Binary");
+      }
+      if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
+        startDialog(ActiveDialog::SaveBinary, "Save Binary");
+      }
+      if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_O, ImGuiInputFlags_RouteGlobal)) {
+        startDialog(ActiveDialog::LoadBasic, "Load BASIC");
+      }
+      if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
+        startDialog(ActiveDialog::SaveBasic, "Save BASIC");
+      }
+      if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_L, ImGuiInputFlags_RouteGlobal)) {
+        startDialog(ActiveDialog::LoadState, "Load State", 440, 260,
+                    configuredStateFilePath.c_str());
+      }
+      if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_L, ImGuiInputFlags_RouteGlobal)) {
+        startDialog(ActiveDialog::SaveState, "Save State", 440, 260,
+                    configuredStateFilePath.c_str());
+      }
       if (ImGui::BeginMenu("File")) {
-        auto startDialog = [&](ActiveDialog which, const char* title, int width = 440,
-                                int height = 260) {
-          activeDialog = which;
-          filenameBuf[0] = '\0';
-          dialogError.clear();
-          callAddrTouched = false;
-          std::strncpy(callAddrBuf, addrBuf, sizeof(callAddrBuf));
-          openDialogWindow(title, width, height);
-        };
-        if (ImGui::MenuItem("Load BASIC...")) startDialog(ActiveDialog::LoadBasic, "Load BASIC");
-        if (ImGui::MenuItem("Save BASIC...")) startDialog(ActiveDialog::SaveBasic, "Save BASIC");
+        if (ImGui::MenuItem("Load BASIC...", "Ctrl+Shift+O")) {
+          startDialog(ActiveDialog::LoadBasic, "Load BASIC");
+        }
+        if (ImGui::MenuItem("Save BASIC...", "Ctrl+Shift+S")) {
+          startDialog(ActiveDialog::SaveBasic, "Save BASIC");
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Load BASIC Text...")) {
           startDialog(ActiveDialog::LoadBasicText, "Load BASIC Text", 700, 500);
@@ -2119,8 +2294,12 @@ int main(int argc, char** argv) {
           }
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Load Binary...")) startDialog(ActiveDialog::LoadBinary, "Load Binary");
-        if (ImGui::MenuItem("Save Binary...")) startDialog(ActiveDialog::SaveBinary, "Save Binary");
+        if (ImGui::MenuItem("Load Binary...", "Ctrl+O")) {
+          startDialog(ActiveDialog::LoadBinary, "Load Binary");
+        }
+        if (ImGui::MenuItem("Save Binary...", "Ctrl+S")) {
+          startDialog(ActiveDialog::SaveBinary, "Save Binary");
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Load ROM Module...")) {
           startDialog(ActiveDialog::LoadRomModule, "Load ROM Module");
@@ -2130,6 +2309,15 @@ int main(int argc, char** argv) {
         }
         if (ImGui::MenuItem("Eject ROM Module", nullptr, false, bus.romModuleLoaded())) {
           bus.unloadRomModule();
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Load State...", "Ctrl+L")) {
+          startDialog(ActiveDialog::LoadState, "Load State", 440, 260,
+                      configuredStateFilePath.c_str());
+        }
+        if (ImGui::MenuItem("Save State...", "Ctrl+Shift+L")) {
+          startDialog(ActiveDialog::SaveState, "Save State", 440, 260,
+                      configuredStateFilePath.c_str());
         }
         ImGui::EndMenu();
       }
@@ -2162,6 +2350,14 @@ int main(int argc, char** argv) {
         if (ImGui::MenuItem("Automation Mode (ignore host keyboard)", nullptr, automationMode)) {
           automationMode = !automationMode;
         }
+        if (ImGui::MenuItem("Auto-Load State on Start", nullptr, appConfig.autoLoadOnStart)) {
+          appConfig.autoLoadOnStart = !appConfig.autoLoadOnStart;
+          persistActiveConf();
+        }
+        if (ImGui::MenuItem("Auto-Save State on Exit", nullptr, appConfig.autoSaveOnExit)) {
+          appConfig.autoSaveOnExit = !appConfig.autoSaveOnExit;
+          persistActiveConf();
+        }
         ImGui::EndMenu();
       }
       if (automationMode) {
@@ -2169,6 +2365,10 @@ int main(int argc, char** argv) {
         // emulator -- deliberately in the menu bar itself, not just the
         // menu checkbox, so it's seen without opening Settings.
         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.1f, 1.0f), "  [AUTOMATION MODE -- host keyboard ignored]");
+      }
+      if (stateActionStatusFramesRemaining > 0) {
+        --stateActionStatusFramesRemaining;
+        ImGui::TextColored(ImVec4(0.6f, 0.9f, 0.6f, 1.0f), "  %s", stateActionStatus.c_str());
       }
       ImGui::EndMainMenuBar();
     }
@@ -2219,6 +2419,13 @@ int main(int argc, char** argv) {
         case ActiveDialog::SaveBasicText:
           actionLabel = "Save";
           isBasicText = true;
+          break;
+        case ActiveDialog::LoadState:
+          actionLabel = "Load";
+          isLoad = true;
+          break;
+        case ActiveDialog::SaveState:
+          actionLabel = "Save";
           break;
         case ActiveDialog::None:
           break;
@@ -2356,6 +2563,39 @@ int main(int argc, char** argv) {
               size_t len = std::strlen(basicTextBuf.get());
               f.write(basicTextBuf.get(), static_cast<std::streamsize>(len));
               ok = true;
+              break;
+            }
+            case ActiveDialog::LoadState: {
+              std::string err;
+              ok = pc1500host::loadStateFile(bus, filenameBuf, &err);
+              if (ok) {
+                // Mid-session load simulates a fresh power-on, same as
+                // startup: RAM/module state must be fully in place before
+                // the CPU "boots" so the ROM's own code sees it from its
+                // first post-reset instruction, rather than hot-swapping
+                // RAM out from under a still-running BASIC session with
+                // now-mismatched interpreter state.
+                cpu.reset();
+                configuredStateFilePath = filenameBuf;
+                appConfig.stateFilePath = configuredStateFilePath;
+                stateActionStatus = "State loaded.";
+                persistActiveConf();
+              } else {
+                dialogError = err;
+              }
+              break;
+            }
+            case ActiveDialog::SaveState: {
+              std::string err;
+              ok = pc1500host::saveStateFile(bus, filenameBuf, &err);
+              if (ok) {
+                configuredStateFilePath = filenameBuf;
+                appConfig.stateFilePath = configuredStateFilePath;
+                stateActionStatus = "State saved.";
+                persistActiveConf();
+              } else {
+                dialogError = err;
+              }
               break;
             }
             case ActiveDialog::None:
@@ -2542,6 +2782,13 @@ int main(int argc, char** argv) {
     SDL_RenderPresent(renderer);
 
     SDL_Delay(1000 / kFramesPerSecond);
+  }
+
+  if (appConfig.autoSaveOnExit && !configuredStateFilePath.empty()) {
+    std::string err;
+    if (!pc1500host::saveStateFile(bus, configuredStateFilePath, &err)) {
+      std::fprintf(stderr, "pc1500emu: auto-save on exit failed: %s\n", err.c_str());
+    }
   }
 
   closeDialogWindow();
