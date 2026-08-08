@@ -15,11 +15,20 @@
 // running target's stop is detected by polling `debugstatus` rather than
 // a push notification, since the command pipe is a plain request/
 // response channel with no way for the emulator to initiate a message.
+#if defined(_WIN32)
 #include <fcntl.h>
 #include <io.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char** environ;
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -39,6 +48,20 @@
 using namespace pc1500::dap;
 
 namespace {
+
+// A launched-emulator process handle -- HANDLE on Windows, pid_t on
+// POSIX. kInvalidProcess is the "not launched (attached to an
+// already-running instance instead)" sentinel both onLaunch/onDisconnect
+// compare against explicitly, rather than relying on truthiness (which
+// works for a pointer-like HANDLE but not for pid_t, where 0 is not an
+// invalid value).
+#if defined(_WIN32)
+using ProcessHandle = HANDLE;
+constexpr ProcessHandle kInvalidProcess = nullptr;
+#else
+using ProcessHandle = pid_t;
+constexpr ProcessHandle kInvalidProcess = -1;
+#endif
 
 // ---- base64, for readMemory/writeMemory's `data` fields ----
 
@@ -297,7 +320,7 @@ class Adapter {
   std::string sourcePath_;
   bool stopOnEntry_ = true;
 
-  HANDLE emulatorProcess_ = nullptr;
+  ProcessHandle emulatorProcess_ = kInvalidProcess;
 
   std::atomic<bool> polling_{false};
   std::thread pollThread_;
@@ -367,6 +390,8 @@ void Adapter::onLaunch(const Json& req) {
   if (args.contains("emulatorPath")) {
     std::string emulatorPath = args.value("emulatorPath", "");
     std::string romPath = args.value("romPath", "");
+
+#if defined(_WIN32)
     std::string cmdLine = "\"" + emulatorPath + "\" \"" + romPath + "\"";
     std::vector<char> cmdLineBuf(cmdLine.begin(), cmdLine.end());
     cmdLineBuf.push_back('\0');
@@ -381,6 +406,21 @@ void Adapter::onLaunch(const Json& req) {
     }
     CloseHandle(pi.hThread);
     emulatorProcess_ = pi.hProcess;
+#else
+    std::vector<char> exeBuf(emulatorPath.begin(), emulatorPath.end());
+    exeBuf.push_back('\0');
+    std::vector<char> romBuf(romPath.begin(), romPath.end());
+    romBuf.push_back('\0');
+    char* argv[] = {exeBuf.data(), romBuf.data(), nullptr};
+
+    pid_t pid = kInvalidProcess;
+    int rc = posix_spawn(&pid, exeBuf.data(), nullptr, nullptr, argv, environ);
+    if (rc != 0) {
+      sendResponse(req, false, nullptr, "failed to launch emulator: " + emulatorPath);
+      return;
+    }
+    emulatorProcess_ = pid;
+#endif
 
     // Wait for the emulator's command pipe to come up (it's created once
     // SDL/window init finishes -- see cmdPipeInit's call site in
@@ -650,11 +690,17 @@ void Adapter::onWriteMemory(const Json& req) {
 
 void Adapter::onDisconnect(const Json& req) {
   stopPolling();
-  if (emulatorProcess_) {
+  if (emulatorProcess_ != kInvalidProcess) {
     bool terminateDebuggee = req.value("arguments", Json::object()).value("terminateDebuggee", true);
+#if defined(_WIN32)
     if (terminateDebuggee) TerminateProcess(emulatorProcess_, 0);
     CloseHandle(emulatorProcess_);
-    emulatorProcess_ = nullptr;
+#else
+    if (terminateDebuggee) kill(emulatorProcess_, SIGTERM);
+    int status = 0;
+    waitpid(emulatorProcess_, &status, 0);  // reap regardless, or it stays a zombie
+#endif
+    emulatorProcess_ = kInvalidProcess;
   }
   sendResponse(req, true);
   shouldExit_ = true;
@@ -707,8 +753,13 @@ int Adapter::run() {
 }  // namespace
 
 int main() {
+#if defined(_WIN32)
+  // stdin/stdout default to text mode on Windows, which would silently
+  // translate "\n" <-> "\r\n" inside DAP's Content-Length-framed bodies --
+  // POSIX has no such distinction, so nothing to do there.
   _setmode(_fileno(stdin), _O_BINARY);
   _setmode(_fileno(stdout), _O_BINARY);
+#endif
 
   Adapter adapter;
   return adapter.run();
