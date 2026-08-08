@@ -1120,29 +1120,34 @@ int main(int argc, char** argv) {
         argv[0]);
   }
 
-  // State-file restore happens before cpu.reset() -- i.e. before the PC
-  // "boots" -- so the ROM's own startup code sees the fully-resumed RAM/
-  // module state from its very first instruction, matching real hardware
-  // (RAM is already battery-backed and modules already plugged in before
-  // power turns on). A missing file at the configured path isn't an error
-  // (first run, nothing saved yet); a present-but-corrupt one is a
-  // non-fatal warning -- the freshly-loaded ROM's default state is still
-  // usable.
+  // State-file restore happens instead of cpu.reset() -- resuming a saved
+  // session should land exactly where OFF left the machine, the same way
+  // a real PC-1500's OFF/ON cycle just halts and wakes the CPU in place
+  // rather than resetting it (see state_file.h's comment: an earlier
+  // version of this called cpu.reset() after restoring, which made every
+  // resume incorrectly show the ROM's "NEW0?:CHECK" cold-start prompt --
+  // real hardware only ever shows that after an actual RESET/battery-
+  // change/module-change, never a plain OFF/ON). A missing file at the
+  // configured path isn't an error (first run, nothing saved yet) --
+  // cpu.reset() still runs in that case, same as always. A present-but-
+  // corrupt one is a non-fatal warning, also falling back to reset().
   std::string configuredStateFilePath = appConfig.stateFilePath.value_or(std::string());
+  bool stateRestored = false;
   if (!configuredStateFilePath.empty() && appConfig.autoLoadOnStart) {
     std::ifstream probe(configuredStateFilePath, std::ios::binary);
     if (probe.good()) {
       probe.close();
       std::string stateErr;
-      if (pc1500host::loadStateFile(bus, configuredStateFilePath, &stateErr)) {
+      if (pc1500host::loadStateFile(cpu, bus, configuredStateFilePath, &stateErr)) {
         std::printf("pc1500emu: restored state from %s\n", configuredStateFilePath.c_str());
+        stateRestored = true;
       } else {
         std::fprintf(stderr, "pc1500emu: could not load state file '%s': %s\n",
                      configuredStateFilePath.c_str(), stateErr.c_str());
       }
     }
   }
-  cpu.reset();
+  if (!stateRestored) cpu.reset();
 
   // Known limitation: HLT sets a one-way halted flag. Real hardware wakes
   // from HLT via interrupt, but this core doesn't implement interrupt
@@ -2567,15 +2572,12 @@ int main(int argc, char** argv) {
             }
             case ActiveDialog::LoadState: {
               std::string err;
-              ok = pc1500host::loadStateFile(bus, filenameBuf, &err);
+              ok = pc1500host::loadStateFile(cpu, bus, filenameBuf, &err);
               if (ok) {
-                // Mid-session load simulates a fresh power-on, same as
-                // startup: RAM/module state must be fully in place before
-                // the CPU "boots" so the ROM's own code sees it from its
-                // first post-reset instruction, rather than hot-swapping
-                // RAM out from under a still-running BASIC session with
-                // now-mismatched interpreter state.
-                cpu.reset();
+                // No cpu.reset() -- restoring full CPU state (including P
+                // and halted) resumes exactly where the saved session left
+                // off, matching a real PC-1500's OFF/ON cycle (see
+                // state_file.h's comment for why a reset here was wrong).
                 configuredStateFilePath = filenameBuf;
                 appConfig.stateFilePath = configuredStateFilePath;
                 stateActionStatus = "State loaded.";
@@ -2587,7 +2589,7 @@ int main(int argc, char** argv) {
             }
             case ActiveDialog::SaveState: {
               std::string err;
-              ok = pc1500host::saveStateFile(bus, filenameBuf, &err);
+              ok = pc1500host::saveStateFile(cpu, bus, filenameBuf, &err);
               if (ok) {
                 configuredStateFilePath = filenameBuf;
                 appConfig.stateFilePath = configuredStateFilePath;
@@ -2785,8 +2787,49 @@ int main(int argc, char** argv) {
   }
 
   if (appConfig.autoSaveOnExit && !configuredStateFilePath.empty()) {
+    // Real hardware refuses OFF while a program is running -- BREAK first
+    // is mandatory, so any state a real user could actually power off
+    // from is always a break'd/idle one, never mid-run. Match that here:
+    // send BREAK (same press/step/release sequence as the interactive
+    // F12 key and the "break" FIFO command) before saving, so a resumed
+    // session always lands somewhere the ROM's own state machine expects,
+    // not frozen at an arbitrary mid-instruction point.
+    //
+    // BREAK alone isn't quite enough, though: even with nothing running,
+    // it leaves the ROM's own "BREAK IN <line>" message on screen (real
+    // hardware's ON/BREAK key always prints this on a genuine break,
+    // whether or not a program actually was running when it fired), which
+    // would otherwise resume looking like a program just got interrupted.
+    // Sending CL afterward is how a real user would clear that back to a
+    // plain command-line prompt before powering off -- so BREAK, then CL,
+    // then save.
+    auto stepCyclesForShutdown = [&](long cycles) {
+      while (cycles > 0) {
+        int used = cpu.step();
+        if (used <= 0) used = 1;
+        cycles -= used;
+        cyclesSinceTimerTick += used;
+        bus.advanceCycles(used);
+        while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+          cpu.tickTimer();
+          cyclesSinceTimerTick -= kCyclesPerTimerTick;
+        }
+      }
+    };
+
+    cpu.pressOnKey();
+    bus.ioPort().setOnKeyLine(true);
+    cpu.requestMI();
+    stepCyclesForShutdown(kCyclesPerSecond);  // generous, bounded budget
+    bus.setKeyState(pc1500::Key::Off, false);
+    bus.ioPort().setOnKeyLine(false);
+
+    bus.setKeyState(pc1500::Key::Cl, true);
+    stepCyclesForShutdown(kCyclesPerSecond);
+    bus.setKeyState(pc1500::Key::Cl, false);
+
     std::string err;
-    if (!pc1500host::saveStateFile(bus, configuredStateFilePath, &err)) {
+    if (!pc1500host::saveStateFile(cpu, bus, configuredStateFilePath, &err)) {
       std::fprintf(stderr, "pc1500emu: auto-save on exit failed: %s\n", err.c_str());
     }
   }

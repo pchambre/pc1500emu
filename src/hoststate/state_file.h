@@ -1,34 +1,44 @@
 // Copyright (c) 2026 Paul Chambre. Licensed under the Apache License,
 // Version 2.0 -- see LICENSE.
 //
-// File-level framing (magic + format version) around Bus::saveState/
-// loadState -- see bus.h's own comment on that pair for exactly what's
-// captured (RAM contents + ROM module config/data + extension-RAM sizes;
-// deliberately not CPU registers or IoPortController/RTC state).
+// File-level framing (magic + format version) around CPU::saveState/
+// loadState and Bus::saveState/loadState -- see each's own comment for
+// exactly what's captured. Deliberately includes full CPU register/flag/
+// interrupt-latch state (format version 2; version 1 didn't) -- restoring
+// a session is meant to resume exactly where OFF left the machine, the
+// same way real hardware's OFF/ON cycle just halts and wakes the CPU in
+// place rather than resetting it, so the caller must NOT call cpu.reset()
+// after a successful loadStateFile.
 #pragma once
 
 #include <cstdint>
 #include <string>
 
 #include "bus.h"
+#include "lh5801.h"
 
 namespace pc1500host {
 
 inline constexpr char kStateFileMagic[4] = {'P', 'C', '1', 'S'};
-inline constexpr uint16_t kStateFileVersion = 1;
+inline constexpr uint16_t kStateFileVersion = 2;
 
-// Writes an 8-byte header (4-byte magic, u16 version, 2 reserved bytes)
-// followed by bus.saveState(). Returns false with *error set if `path`
-// can't be opened for writing.
-bool saveStateFile(const pc1500::Bus& bus, const std::string& path, std::string* error);
+// Writes an 8-byte header (4-byte magic, u16 version, 2 reserved bytes),
+// then cpu.saveState(), then bus.saveState(). Returns false with *error
+// set if `path` can't be opened for writing.
+bool saveStateFile(const lh5801::CPU& cpu, const pc1500::Bus& bus, const std::string& path,
+                    std::string* error);
 
-// Validates the header (magic must match; formatVersion must be
-// <= kStateFileVersion, so a state file from a newer build than this one
-// understands is rejected rather than partially misread) before calling
-// bus.loadState(). Returns false -- with *error set, and `bus` possibly
-// partially modified, so callers should treat any false return as fatal
-// to this restore attempt -- if the file is missing/unreadable, too
-// short, has the wrong magic, or an unsupported version.
-bool loadStateFile(pc1500::Bus& bus, const std::string& path, std::string* error);
+// Validates the header (magic must match; formatVersion must equal
+// kStateFileVersion exactly -- this is early-stage software with no
+// installed base to keep old state files compatible with, so a version
+// mismatch in either direction is simply rejected rather than partially
+// misread) before calling cpu.loadState()/bus.loadState(). Returns false
+// -- with *error set, and cpu/bus possibly partially modified, so callers
+// should treat any false return as fatal to this restore attempt -- if
+// the file is missing/unreadable, too short, has the wrong magic, or a
+// different version. On success, the caller must NOT follow up with
+// cpu.reset() -- see the file header comment.
+bool loadStateFile(lh5801::CPU& cpu, pc1500::Bus& bus, const std::string& path,
+                    std::string* error);
 
 }  // namespace pc1500host

@@ -428,7 +428,7 @@ class Bus : public lh5801::MemoryBus {
   // its audio sample accumulator).
   void advanceRealTime(double elapsedSeconds) { io_.advanceRealTime(elapsedSeconds); }
 
-  // Session state save/load -- deliberately narrow scope: RAM contents
+  // Session state save/load -- narrow scope: RAM contents
   // (me0_[0x0000,0x8000) only -- covers both extension-RAM windows, the
   // built-in 2K RAM, and the LCD buffer/system RAM/their mirrors, all
   // backed by the same array), extension-RAM window sizes, and both ROM
@@ -436,13 +436,14 @@ class Bus : public lh5801::MemoryBus {
   // stored in me0_ at all, see RomModule::tryRead). Deliberately excludes
   // 0x8000H-0xFFFFH (module-ROM range isn't backed by me0_; the base
   // system ROM at 0xC000H-0xFFFFH is always reloaded fresh from the
-  // command-line/conf-file ROM path, not duplicated into the state file),
-  // CPU registers (restore instead relies on a normal cpu.reset() cold
-  // boot, matching how a real PC-1500 resumes after a power cycle -- RAM
-  // is battery-backed but the CPU always resets), and IoPortController/RTC
-  // state (left to the ROM's own boot-time reinitialization, same
-  // reasoning). See src/hoststate/state_file.h for the file-level
-  // magic/version header this is embedded in.
+  // command-line/conf-file ROM path, not duplicated into the state file)
+  // and IoPortController/RTC state (left to the ROM's own boot-time
+  // reinitialization). CPU registers are saved separately (CPU::saveState/
+  // loadState) and composed with this at the src/hoststate/state_file.h
+  // level, which also holds the file-level magic/version header -- see
+  // that header's comment for why restoring CPU state (and *not* calling
+  // cpu.reset() afterward) is the correct model of a real PC-1500's OFF/ON
+  // cycle, not a reset.
   void saveState(std::ostream& os) const;
   bool loadState(std::istream& is);
 

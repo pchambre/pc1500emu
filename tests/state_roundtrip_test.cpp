@@ -12,6 +12,7 @@
 
 #include "bus.h"
 #include "keyboard.h"
+#include "lh5801.h"
 #include "state_file.h"
 
 namespace {
@@ -41,6 +42,7 @@ std::string tempPath(const char* name) {
 void testRoundTrip() {
   pc1500::Keyboard kb;
   pc1500::Bus bus(kb);
+  lh5801::CPU cpu(bus);
 
   // Ext-RAM windows must be sized *before* writing into them --
   // writeME0 drops writes to an unmapped (size-0) window (see
@@ -62,15 +64,28 @@ void testRoundTrip() {
   bus.loadRomModule2(module2Data, sizeof(module2Data), 0x8000, /*requirePv=*/true,
                       /*usePuBank=*/true);
 
+  // Distinguishing CPU state -- this is the whole point of the redesign
+  // that dropped cpu.reset() from the restore path: a resumed session
+  // must land exactly on these values, not a freshly-reset CPU.
+  cpu.setP(0x1234);
+  cpu.setS(0x7A00);
+  cpu.setX(0x1111);
+  cpu.setY(0x2222);
+  cpu.setU(0x3333);
+  cpu.setHalted(true);
+  cpu.requestMI();
+  cpu.tickTimer();  // nudges timerCounter_ off its 0 fixed-point, per tickTimer()'s own comment
+
   std::string path = tempPath("pc1500emu_state_roundtrip_test.state");
   std::string err;
-  CHECK(pc1500host::saveStateFile(bus, path, &err));
+  CHECK(pc1500host::saveStateFile(cpu, bus, path, &err));
   CHECK(err.empty());
 
   pc1500::Keyboard kb2;
   pc1500::Bus bus2(kb2);
+  lh5801::CPU cpu2(bus2);
   err.clear();
-  CHECK(pc1500host::loadStateFile(bus2, path, &err));
+  CHECK(pc1500host::loadStateFile(cpu2, bus2, path, &err));
   CHECK(err.empty());
 
   CHECK(bus2.readME0(0x0010) == 0xAB);
@@ -84,17 +99,26 @@ void testRoundTrip() {
   CHECK(bus2.romModuleLoaded());
   CHECK(bus2.romModule2Loaded());
 
+  CHECK(cpu2.p() == 0x1234);
+  CHECK(cpu2.s() == 0x7A00);
+  CHECK(cpu2.x() == 0x1111);
+  CHECK(cpu2.y() == 0x2222);
+  CHECK(cpu2.u() == 0x3333);
+  CHECK(cpu2.halted() == true);
+  CHECK(cpu2.timerCounter() == cpu.timerCounter());
+
   std::remove(path.c_str());
 }
 
 void testCorruptMagicRejected() {
   pc1500::Keyboard kb;
   pc1500::Bus bus(kb);
+  lh5801::CPU cpu(bus);
   bus.setExtRam4800Size(0x1000);
 
   std::string path = tempPath("pc1500emu_state_roundtrip_test_badmagic.state");
   std::string err;
-  CHECK(pc1500host::saveStateFile(bus, path, &err));
+  CHECK(pc1500host::saveStateFile(cpu, bus, path, &err));
 
   // Corrupt the magic bytes.
   {
@@ -105,8 +129,9 @@ void testCorruptMagicRejected() {
 
   pc1500::Keyboard kb2;
   pc1500::Bus bus2(kb2);
+  lh5801::CPU cpu2(bus2);
   err.clear();
-  CHECK(!pc1500host::loadStateFile(bus2, path, &err));
+  CHECK(!pc1500host::loadStateFile(cpu2, bus2, path, &err));
   CHECK(!err.empty());
   // A fresh Bus's defaults must be untouched by the rejected load.
   CHECK(bus2.extRam4800Size() == 0);
@@ -117,11 +142,12 @@ void testCorruptMagicRejected() {
 void testTruncatedFileRejected() {
   pc1500::Keyboard kb;
   pc1500::Bus bus(kb);
+  lh5801::CPU cpu(bus);
   bus.setExtRam0000Size(0x4000);
 
   std::string fullPath = tempPath("pc1500emu_state_roundtrip_test_full.state");
   std::string err;
-  CHECK(pc1500host::saveStateFile(bus, fullPath, &err));
+  CHECK(pc1500host::saveStateFile(cpu, bus, fullPath, &err));
 
   // Truncate to just the header -- well short of a full RAM dump.
   std::string truncPath = tempPath("pc1500emu_state_roundtrip_test_trunc.state");
@@ -135,8 +161,9 @@ void testTruncatedFileRejected() {
 
   pc1500::Keyboard kb2;
   pc1500::Bus bus2(kb2);
+  lh5801::CPU cpu2(bus2);
   err.clear();
-  CHECK(!pc1500host::loadStateFile(bus2, truncPath, &err));
+  CHECK(!pc1500host::loadStateFile(cpu2, bus2, truncPath, &err));
   CHECK(!err.empty());
 
   std::remove(fullPath.c_str());

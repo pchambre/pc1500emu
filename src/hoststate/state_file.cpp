@@ -9,7 +9,8 @@
 
 namespace pc1500host {
 
-bool saveStateFile(const pc1500::Bus& bus, const std::string& path, std::string* error) {
+bool saveStateFile(const lh5801::CPU& cpu, const pc1500::Bus& bus, const std::string& path,
+                    std::string* error) {
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) {
     if (error) *error = "could not open '" + path + "' for writing";
@@ -18,6 +19,7 @@ bool saveStateFile(const pc1500::Bus& bus, const std::string& path, std::string*
   f.write(kStateFileMagic, sizeof(kStateFileMagic));
   pc1500state::writeU16(f, kStateFileVersion);
   pc1500state::writeU16(f, 0);  // reserved
+  cpu.saveState(f);
   bus.saveState(f);
   if (!f) {
     if (error) *error = "write failed for '" + path + "'";
@@ -26,7 +28,8 @@ bool saveStateFile(const pc1500::Bus& bus, const std::string& path, std::string*
   return true;
 }
 
-bool loadStateFile(pc1500::Bus& bus, const std::string& path, std::string* error) {
+bool loadStateFile(lh5801::CPU& cpu, pc1500::Bus& bus, const std::string& path,
+                    std::string* error) {
   std::ifstream f(path, std::ios::binary);
   if (!f) {
     if (error) *error = "could not open '" + path + "' for reading";
@@ -40,14 +43,15 @@ bool loadStateFile(pc1500::Bus& bus, const std::string& path, std::string* error
   }
   uint16_t version = pc1500state::readU16(f);
   pc1500state::readU16(f);  // reserved
-  if (!f || version > kStateFileVersion) {
+  if (!f || version != kStateFileVersion) {
     if (error) {
       *error = "'" + path + "' has state-file format version " + std::to_string(version) +
-                ", newer than this build understands (" + std::to_string(kStateFileVersion) + ")";
+                ", this build expects version " + std::to_string(kStateFileVersion);
     }
     return false;
   }
-  if (!bus.loadState(f)) {
+  cpu.loadState(f);
+  if (!bus.loadState(f) || !f) {
     if (error) *error = "'" + path + "' is truncated or corrupt";
     return false;
   }

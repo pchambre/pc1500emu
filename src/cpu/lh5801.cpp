@@ -3,6 +3,7 @@
 #include "lh5801.h"
 
 #include "lh5801_timer_table.h"
+#include "serialize_io.h"
 
 // Every opcode byte, addressing mode, and flag-effect below is taken from
 // docs/lh5801_opcode_reference.md. Comments below only note the handful of
@@ -54,6 +55,48 @@ void CPU::tickTimer() {
 void CPU::setTimerCounter(uint16_t v) {
   timerCounter_ = v;
   if (v != 0) timerStep_ = kPolyCounterReverse[v];
+}
+
+void CPU::saveState(std::ostream& os) const {
+  using namespace pc1500state;
+  writeU8(os, a_);
+  writeU16(os, x_);
+  writeU16(os, y_);
+  writeU16(os, u_);
+  writeU16(os, s_);
+  writeU16(os, p_);
+  writeU8(os, packFlags());
+  writeBool(os, halted_);
+  writeBool(os, bf_);
+  writeBool(os, disp_);
+  writeBool(os, pu_);
+  writeBool(os, pv_);
+  writeBool(os, miPending_);
+  writeBool(os, nmiPending_);
+  writeBool(os, timerInterruptPending_);
+  writeU16(os, timerCounter_);  // timerStep_ not written -- rederived below
+}
+
+void CPU::loadState(std::istream& is) {
+  using namespace pc1500state;
+  a_ = readU8(is);
+  x_ = readU16(is);
+  y_ = readU16(is);
+  u_ = readU16(is);
+  s_ = readU16(is);
+  p_ = readU16(is);
+  unpackFlags(readU8(is));
+  halted_ = readBool(is);
+  bf_ = readBool(is);
+  disp_ = readBool(is);
+  pu_ = readBool(is);
+  pv_ = readBool(is);
+  bus_.setPu(pu_);  // keep Bus's own mirrored copy in sync, same as reset() does
+  bus_.setPv(pv_);
+  miPending_ = readBool(is);
+  nmiPending_ = readBool(is);
+  timerInterruptPending_ = readBool(is);
+  setTimerCounter(readU16(is));  // derives timerStep_, not a raw field write
 }
 
 // Entry sequence for MI/NMI/timer interrupts. Derived from RTI's documented

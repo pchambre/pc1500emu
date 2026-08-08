@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <iosfwd>
 
 namespace lh5801 {
 
@@ -112,6 +113,18 @@ class CPU {
   // any code that relies on it, not just a cosmetic detail.
   void tickTimer();
   uint16_t timerCounter() const { return timerCounter_; }
+
+  // Full register/flag/interrupt-latch state, for the emulator's session
+  // save/load feature (see src/hoststate/state_file.h). Deliberately
+  // symmetric with a real PC-1500's OFF/ON behavior: OFF halts the CPU in
+  // place (see HLT/bf_) rather than resetting it, so resuming a saved
+  // session should restore this and *not* call reset() -- doing a reset
+  // on restore was an earlier design mistake that made every resume show
+  // the ROM's "NEW0?:CHECK" cold-start prompt, which real hardware only
+  // ever shows after an actual RESET button press, battery change, or
+  // module install/removal, never a plain OFF/ON cycle.
+  void saveState(std::ostream& os) const;
+  void loadState(std::istream& is);
 
  private:
   MemoryBus& bus_;
