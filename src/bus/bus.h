@@ -285,6 +285,17 @@ class Bus : public lh5801::MemoryBus {
   void writeME1(uint16_t addr, uint8_t value) override;
   uint8_t readInputPort() override;
 
+  // Which of the CPU's two independent memory spaces the most recent
+  // readME0/writeME0/readME1/writeME1 call touched -- for display only
+  // (e.g. the host UI's status panel). There's no real hardware register
+  // this reads back; ME0 vs ME1 selection is purely a property of each
+  // instruction's own addressing mode ((Rreg)/(ab) -> ME0, #(Rreg)/#(ab)
+  // -> ME1 -- see docs/lh5801_opcode_reference.md), not a persistent CPU
+  // state bit, so this is new bookkeeping rather than exposing something
+  // that already existed.
+  enum class MemorySpace { ME0, ME1 };
+  MemorySpace lastAccessedSpace() const { return lastAccessedSpace_; }
+
   // Loads `size` bytes at `addr` into ME0 (e.g. a real PC-1500 ROM dump at
   // 0xC000, once the caller has one -- none is bundled here, for obvious
   // licensing reasons). Bytes beyond the target region's bounds are not
@@ -293,21 +304,26 @@ class Bus : public lh5801::MemoryBus {
 
   IoPortController& ioPort() { return io_; }
 
-  // CE-150/153/158-style plug-in ROM module at 0x8000-0xBFFF, selected by
+  // CE-150/153/158-style plug-in ROM modules at 0x8000-0xBFFF, selected by
   // the CPU's PV flip-flop (and, for modules whose ROM is bigger than the
   // 16K window, banked by PU) -- see PU/PV's own class comment in
   // lh5801.h. PV/PU only affect this region; everything else (SPU/RPU/
   // SPV/RPV's other historical uses, if any) is out of scope here.
   //
-  // `data` is the module's raw ROM dump, `base` is where it appears in
-  // the address space, `requirePv` is the PV level the CPU must have set
-  // for the module to respond at all (CE-150 defaults to PV=0/low,
-  // CE-158 to PV=1/high -- i.e. the two module *families* are
-  // distinguished by which PV level they answer to), and `usePuBank`
-  // splits `data` into two equal halves (PU=0 selects the first,
-  // PU=1 the second) for modules whose real ROM exceeds the 16K window
-  // (CE-158) -- false for modules that fit in one 16K bank regardless of
-  // PU (CE-150).
+  // Four independent slots: a real machine can have a module plugged in at
+  // both the 0x8000 and 0xA000 bases simultaneously, and -- since PV is a
+  // single global flip-flop shared by the whole machine -- a *different*
+  // module at each base for each PV level, so all four (base, PV)
+  // combinations can be loaded and live at once.
+  //
+  // `data` is a slot's raw ROM dump, `base` is where it appears in the
+  // address space, `requirePv` is the PV level the CPU must have set for
+  // it to respond at all (CE-150 defaults to PV=0/low, CE-158 to PV=1/
+  // high -- i.e. the two module *families* are distinguished by which PV
+  // level they answer to), and `usePuBank` splits `data` into two equal
+  // halves (PU=0 selects the first, PU=1 the second) for modules whose
+  // real ROM exceeds the 16K window (CE-158) -- false for modules that fit
+  // in one 16K bank regardless of PU (CE-150).
   struct RomModule {
     std::vector<uint8_t> data;
     uint16_t base = 0xA000;
@@ -325,29 +341,18 @@ class Bus : public lh5801::MemoryBus {
       return true;
     }
   };
-  void loadRomModule(const uint8_t* data, size_t size, uint16_t base, bool requirePv,
+  static constexpr int kNumRomModules = 4;
+  void loadRomModule(int slot, const uint8_t* data, size_t size, uint16_t base, bool requirePv,
                       bool usePuBank) {
-    module_.data.assign(data, data + size);
-    module_.base = base;
-    module_.requirePv = requirePv;
-    module_.usePuBank = usePuBank;
+    RomModule& m = romModules_[slot];
+    m.data.assign(data, data + size);
+    m.base = base;
+    m.requirePv = requirePv;
+    m.usePuBank = usePuBank;
   }
-  void unloadRomModule() { module_ = RomModule{}; }
-  bool romModuleLoaded() const { return !module_.data.empty(); }
-
-  // Second, independent module slot -- e.g. testing a candidate PSoC-style
-  // card concurrently with a real CE-158 dump, one per PV level, both
-  // answering in 0x8000-0xBFFF at once. Same semantics as the primary slot
-  // above, just a second instance so the two don't clobber each other.
-  void loadRomModule2(const uint8_t* data, size_t size, uint16_t base, bool requirePv,
-                       bool usePuBank) {
-    module2_.data.assign(data, data + size);
-    module2_.base = base;
-    module2_.requirePv = requirePv;
-    module2_.usePuBank = usePuBank;
-  }
-  void unloadRomModule2() { module2_ = RomModule{}; }
-  bool romModule2Loaded() const { return !module2_.data.empty(); }
+  void unloadRomModule(int slot) { romModules_[slot] = RomModule{}; }
+  bool romModuleLoaded(int slot) const { return !romModules_[slot].data.empty(); }
+  const RomModule& romModule(int slot) const { return romModules_[slot]; }
 
   // Forwarded from the CPU's own SPU/RPU/SPV/RPV opcode handlers (see
   // lh5801.cpp) -- Bus is the single source of truth for the *current*
@@ -431,7 +436,7 @@ class Bus : public lh5801::MemoryBus {
   // Session state save/load -- narrow scope: RAM contents
   // (me0_[0x0000,0x8000) only -- covers both extension-RAM windows, the
   // built-in 2K RAM, and the LCD buffer/system RAM/their mirrors, all
-  // backed by the same array), extension-RAM window sizes, and both ROM
+  // backed by the same array), extension-RAM window sizes, and all four ROM
   // module slots (raw bytes + base/requirePv/usePuBank -- module ROM isn't
   // stored in me0_ at all, see RomModule::tryRead). Deliberately excludes
   // 0x8000H-0xFFFFH (module-ROM range isn't backed by me0_; the base
@@ -486,10 +491,10 @@ class Bus : public lh5801::MemoryBus {
   std::array<uint8_t, 65536> me0_{};
   IoPortController io_;
   Keyboard& keyboard_;
+  MemorySpace lastAccessedSpace_ = MemorySpace::ME0;
   size_t extRam4800Size_ = 0;
   size_t extRam0000Size_ = 0;
-  RomModule module_;
-  RomModule module2_;
+  std::array<RomModule, kNumRomModules> romModules_;
   bool pv_ = false;  // matches CPU::reset()'s own pv_/pu_ default
   bool pu_ = false;
 

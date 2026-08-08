@@ -4,11 +4,12 @@
 // File-level framing (magic + format version) around CPU::saveState/
 // loadState and Bus::saveState/loadState -- see each's own comment for
 // exactly what's captured. Deliberately includes full CPU register/flag/
-// interrupt-latch state (format version 2; version 1 didn't) -- restoring
-// a session is meant to resume exactly where OFF left the machine, the
-// same way real hardware's OFF/ON cycle just halts and wakes the CPU in
-// place rather than resetting it, so the caller must NOT call cpu.reset()
-// after a successful loadStateFile.
+// interrupt-latch state (format version 2; version 1 didn't; version 3
+// widened Bus::saveState/loadState from two ROM module slots to four) --
+// restoring a session is meant to resume exactly where OFF left the
+// machine, the same way real hardware's OFF/ON cycle just halts and wakes
+// the CPU in place rather than resetting it, so the caller must NOT call
+// cpu.reset() after a successful loadStateFile.
 #pragma once
 
 #include <cstdint>
@@ -20,7 +21,7 @@
 namespace pc1500host {
 
 inline constexpr char kStateFileMagic[4] = {'P', 'C', '1', 'S'};
-inline constexpr uint16_t kStateFileVersion = 2;
+inline constexpr uint16_t kStateFileVersion = 3;
 
 // Writes an 8-byte header (4-byte magic, u16 version, 2 reserved bytes),
 // then cpu.saveState(), then bus.saveState(). Returns false with *error

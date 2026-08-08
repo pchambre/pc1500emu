@@ -233,10 +233,12 @@ uint8_t IoPortController::opaOutput() const {
 }
 
 uint8_t Bus::readME0(uint16_t addr) {
+  lastAccessedSpace_ = MemorySpace::ME0;
   if (addr >= 0x8000 && addr <= 0xBFFF) {
     uint8_t v;
-    if (module_.tryRead(addr, pv_, pu_, v)) return v;
-    if (module2_.tryRead(addr, pv_, pu_, v)) return v;
+    for (const RomModule& m : romModules_) {
+      if (m.tryRead(addr, pv_, pu_, v)) return v;
+    }
     return 0xFF;  // empty socket, or a module present but not selected by the current PV level
   }
   if (isUnmapped(addr)) return 0xFF;
@@ -244,6 +246,7 @@ uint8_t Bus::readME0(uint16_t addr) {
 }
 
 void Bus::writeME0(uint16_t addr, uint8_t value) {
+  lastAccessedSpace_ = MemorySpace::ME0;
   if (isUnmapped(addr) || isRom(addr)) return;
   me0_[effectiveAddr(addr)] = value;
 }
@@ -259,11 +262,13 @@ bool IoControllerSelected(uint16_t addr) { return (addr & 0x3000) == 0x3000; }
 }  // namespace
 
 uint8_t Bus::readME1(uint16_t addr) {
+  lastAccessedSpace_ = MemorySpace::ME1;
   if (IoControllerSelected(addr)) return io_.read(static_cast<uint8_t>(addr & 0x0F));
   return 0xFF;
 }
 
 void Bus::writeME1(uint16_t addr, uint8_t value) {
+  lastAccessedSpace_ = MemorySpace::ME1;
   if (IoControllerSelected(addr)) io_.write(static_cast<uint8_t>(addr & 0x0F), value);
 }
 
@@ -396,8 +401,9 @@ void Bus::saveState(std::ostream& os) const {
   writeBytes(os, me0_.data(), kSavedRamSize);
   writeU32(os, static_cast<uint32_t>(extRam4800Size_));
   writeU32(os, static_cast<uint32_t>(extRam0000Size_));
-  saveRomModule(os, module_);
-  saveRomModule(os, module2_);
+  for (const RomModule& m : romModules_) {
+    saveRomModule(os, m);
+  }
 }
 
 bool Bus::loadState(std::istream& is) {
@@ -405,8 +411,10 @@ bool Bus::loadState(std::istream& is) {
   readBytes(is, me0_.data(), kSavedRamSize);
   extRam4800Size_ = readU32(is);
   extRam0000Size_ = readU32(is);
-  bool ok = loadRomModuleState(is, module_);
-  ok = loadRomModuleState(is, module2_) && ok;
+  bool ok = true;
+  for (RomModule& m : romModules_) {
+    ok = loadRomModuleState(is, m) && ok;
+  }
   return ok && !is.fail();
 }
 

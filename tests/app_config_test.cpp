@@ -43,6 +43,7 @@ void testRoundTrip() {
   config.stateFilePath = "C:/saves/session1.state";
   config.autoLoadOnStart = false;
   config.autoSaveOnExit = true;
+  config.showStatusPanel = true;
 
   std::string path = tempPath("pc1500emu_app_config_test.json");
   std::string err;
@@ -60,6 +61,7 @@ void testRoundTrip() {
   if (loaded.stateFilePath) CHECK(*loaded.stateFilePath == "C:/saves/session1.state");
   CHECK(loaded.autoLoadOnStart == false);
   CHECK(loaded.autoSaveOnExit == true);
+  CHECK(loaded.showStatusPanel == true);
 
   std::remove(path.c_str());
 }
@@ -78,6 +80,7 @@ void testEmptyConfigRoundTrip() {
   CHECK(!loaded.stateFilePath.has_value());
   CHECK(loaded.autoLoadOnStart == true);   // AppConfig{}'s own default
   CHECK(loaded.autoSaveOnExit == false);
+  CHECK(loaded.showStatusPanel == false);
 
   std::remove(path.c_str());
 }
@@ -91,6 +94,28 @@ void testMissingFileReturnsDefaults() {
   CHECK(err == "unset");  // loadAppConfig shouldn't touch *error on the not-an-error path
   CHECK(!loaded.romPath.has_value());
   CHECK(loaded.autoLoadOnStart == true);  // back to AppConfig{}'s default
+}
+
+// Simulates a conf file written by an older build, before showStatusPanel
+// (or any future setting) existed: loading it must not fail, and the
+// missing key must fall back to AppConfig{}'s own default rather than
+// some arbitrary/zeroed value -- the whole point of using nlohmann::json's
+// j.value(key, default) instead of j[key] in loadAppConfig.
+void testOldConfigMissingNewFieldUsesDefault() {
+  std::string path = tempPath("pc1500emu_app_config_test_old.json");
+  {
+    std::ofstream f(path, std::ios::binary);
+    f << R"({"romPath": "C:/roms/rom1.bin", "autoLoadOnStart": false})";
+  }
+  pc1500host::AppConfig loaded;
+  std::string err;
+  CHECK(pc1500host::loadAppConfig(path, &loaded, &err));
+  CHECK(err.empty());
+  CHECK(loaded.romPath.has_value());
+  CHECK(loaded.autoLoadOnStart == false);        // present in the old file
+  CHECK(loaded.autoSaveOnExit == false);         // absent -- AppConfig{}'s default
+  CHECK(loaded.showStatusPanel == false);        // absent -- AppConfig{}'s default
+  std::remove(path.c_str());
 }
 
 void testInvalidJsonRejected() {
@@ -194,6 +219,7 @@ int main() {
   testRoundTrip();
   testEmptyConfigRoundTrip();
   testMissingFileReturnsDefaults();
+  testOldConfigMissingNewFieldUsesDefault();
   testInvalidJsonRejected();
   testFindsInCwdFirst();
   testFallsBackToExeDir();

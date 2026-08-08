@@ -51,6 +51,7 @@ bool loadAppConfig(const std::string& path, AppConfig* out, std::string* error) 
   }
   out->autoLoadOnStart = j.value("autoLoadOnStart", true);
   out->autoSaveOnExit = j.value("autoSaveOnExit", false);
+  out->showStatusPanel = j.value("showStatusPanel", false);
   return true;
 }
 
@@ -60,6 +61,7 @@ bool saveAppConfig(const AppConfig& config, const std::string& path, std::string
   if (config.stateFilePath) j["stateFilePath"] = *config.stateFilePath;
   j["autoLoadOnStart"] = config.autoLoadOnStart;
   j["autoSaveOnExit"] = config.autoSaveOnExit;
+  j["showStatusPanel"] = config.showStatusPanel;
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) {

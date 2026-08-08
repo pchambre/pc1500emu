@@ -4,6 +4,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <shobjidl.h>
 #endif
 
 #include <SDL2/SDL.h>
@@ -28,11 +29,14 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -45,6 +49,7 @@
 #include "lh5801.h"
 #include "state_file.h"
 #include "text_loader.h"
+#include "tinyfiledialogs.h"
 
 namespace {
 
@@ -67,6 +72,197 @@ using pc1500::basic::readBasicProgramBytes;
 using pc1500::basic::saveBasicProgram;
 using pc1500::basic::saveBasicTextFile;
 using pc1500::basic::typeBasicProgramText;
+
+#if defined(_WIN32)
+std::wstring utf8ToWide(const std::string& s) {
+  if (s.empty()) return std::wstring();
+  int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+  std::wstring w(len > 0 ? len - 1 : 0, L'\0');
+  if (len > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), len);
+  return w;
+}
+
+std::string wideToUtf8(const wchar_t* w) {
+  if (!w || !*w) return std::string();
+  int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+  std::string s(len > 0 ? len - 1 : 0, '\0');
+  if (len > 0) WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), len, nullptr, nullptr);
+  return s;
+}
+
+// Modern Explorer-style file picker (IFileOpenDialog/IFileSaveDialog, the
+// "Common Item Dialog" available since Vista) -- NOT tinyfiledialogs'
+// GetOpenFileName/GetSaveFileName (comdlg32), which is what it uses on
+// Windows. tinyfiledialogs (vendored, third_party/tinyfiledialogs/) is
+// v2.9.3 and has no IFileOpenDialog backend, so Windows bypasses it
+// entirely rather than patching vendored code; non-Windows builds still go
+// through tinyfiledialogs (requestPick's #else branch, in main()).
+//
+// A naive Show()-then-GetResult() implementation (an earlier version of
+// this function) confirmed via timing instrumentation that Show() itself
+// can block for several seconds on this machine -- unaffected by
+// FOS_DONTADDTORECENT, and identical whether comdlg32 or IFileOpenDialog is
+// used, so not just legacy-dialog-API overhead. Three disconnected mapped
+// network drives are the suspected cause (Explorer's Common Item Dialog
+// populates/refreshes "This PC" in its nav pane, including a status check
+// per drive letter, as part of showing/closing), but that's not fully
+// root-caused.
+//
+// So instead of waiting for Show() to return at all, this hooks
+// IFileDialogEvents::OnFileOk -- which fires the instant the user's
+// selection is *accepted* (double-click, or the Open/Save button),
+// synchronously, from inside Show()'s own internal message loop, before
+// whatever Show() does internally afterward (recent-items bookkeeping,
+// AV/shell scanning, or whatever the real cause turns out to be) has a
+// chance to run. `promise` is fulfilled right there, before Show() itself
+// has returned -- the caller (requestPick, in main()) waits on the
+// promise's future, not on this function's return, so it gets the result
+// as soon as the user's pick is accepted rather than whenever Show()
+// eventually unwinds. This function keeps running in the background on its
+// own detached thread regardless (Show() has no way to be interrupted
+// early), but nothing downstream waits on it anymore.
+class FileDialogEventHandler : public IFileDialogEvents {
+ public:
+  explicit FileDialogEventHandler(std::shared_ptr<std::promise<std::optional<std::string>>> promise)
+      : promise_(std::move(promise)) {}
+
+  IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+    if (riid == IID_IUnknown || riid == __uuidof(IFileDialogEvents)) {
+      *ppv = static_cast<IFileDialogEvents*>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  IFACEMETHODIMP_(ULONG) AddRef() override { return ++refCount_; }
+  IFACEMETHODIMP_(ULONG) Release() override {
+    ULONG r = --refCount_;
+    if (r == 0) delete this;
+    return r;
+  }
+
+  IFACEMETHODIMP OnFileOk(IFileDialog* pfd) override {
+    std::optional<std::string> path;
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(pfd->GetResult(&item))) {
+      PWSTR pathOut = nullptr;
+      if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &pathOut))) {
+        path = wideToUtf8(pathOut);
+        CoTaskMemFree(pathOut);
+      }
+      item->Release();
+    }
+    fulfill(std::move(path));
+    return S_OK;
+  }
+  IFACEMETHODIMP OnFolderChanging(IFileDialog*, IShellItem*) override { return S_OK; }
+  IFACEMETHODIMP OnFolderChange(IFileDialog*) override { return S_OK; }
+  IFACEMETHODIMP OnSelectionChange(IFileDialog*) override { return S_OK; }
+  IFACEMETHODIMP OnShareViolation(IFileDialog*, IShellItem*, FDE_SHAREVIOLATION_RESPONSE*) override {
+    return S_OK;
+  }
+  IFACEMETHODIMP OnTypeChange(IFileDialog*) override { return S_OK; }
+  IFACEMETHODIMP OnOverwrite(IFileDialog*, IShellItem*, FDE_OVERWRITE_RESPONSE*) override {
+    return S_OK;
+  }
+
+  // Also called after Show() returns (cancel, or anything else that closes
+  // the dialog without OnFileOk ever firing) -- guarded so whichever of the
+  // two calls happens first (OnFileOk, or this fallback) is the one that
+  // actually resolves the promise; std::promise::set_value would otherwise
+  // throw on a second call.
+  void fulfill(std::optional<std::string> path) {
+    bool expected = false;
+    if (fulfilled_.compare_exchange_strong(expected, true)) {
+      promise_->set_value(std::move(path));
+    }
+  }
+
+ private:
+  std::atomic<ULONG> refCount_{1};
+  std::atomic<bool> fulfilled_{false};
+  std::shared_ptr<std::promise<std::optional<std::string>>> promise_;
+};
+
+// Runs entirely on its own detached worker thread -- see requestPick, in
+// main(), which is the only caller.
+void nativeWinPickPathEarlyEvent(bool save, std::string title, std::vector<const char*> patterns,
+                                  std::string description, std::string defaultPath,
+                                  std::shared_ptr<std::promise<std::optional<std::string>>> promise) {
+  // COINIT_APARTMENTTHREADED: IFileDialog::Show must run on an STA thread
+  // (it pumps its own nested message loop while modal). This runs on a
+  // fresh thread per pick (never reused), so there's no prior
+  // CoInitializeEx on it to collide with in practice, but RPC_E_CHANGED_MODE
+  // (some other code on this thread already initialized COM differently)
+  // is checked anyway, for the same reason it'd matter if that ever changed.
+  HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+  bool weInitialized = (hrInit == S_OK || hrInit == S_FALSE);
+
+  IFileDialog* pfd = nullptr;
+  HRESULT hr = save ? CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                        IID_PPV_ARGS(&pfd))
+                     : CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                        IID_PPV_ARGS(&pfd));
+  FileDialogEventHandler* events = new FileDialogEventHandler(promise);
+  if (SUCCEEDED(hr)) {
+    // One filter spec joining every pattern (e.g. "*.BAS;*.bas") under the
+    // caller's description, plus an "All Files" fallback -- matches what
+    // tinyfiledialogs itself always appended, so behavior doesn't change
+    // for callers.
+    std::wstring patternsJoined;
+    for (size_t i = 0; i < patterns.size(); i++) {
+      if (i) patternsJoined += L";";
+      patternsJoined += utf8ToWide(patterns[i]);
+    }
+    std::wstring descW = utf8ToWide(description);
+    COMDLG_FILTERSPEC filterSpec[2] = {
+        {descW.c_str(), patternsJoined.c_str()},
+        {L"All Files", L"*.*"},
+    };
+    pfd->SetFileTypes(2, filterSpec);
+    pfd->SetFileTypeIndex(1);
+    std::wstring titleW = utf8ToWide(title);
+    pfd->SetTitle(titleW.c_str());
+
+    if (!defaultPath.empty()) {
+      std::filesystem::path p(defaultPath);
+      if (p.has_parent_path()) {
+        IShellItem* folderItem = nullptr;
+        // Best-effort: a folder that no longer exists just leaves the
+        // dialog at its own last-used location instead of failing outright.
+        if (SUCCEEDED(SHCreateItemFromParsingName(p.parent_path().wstring().c_str(), nullptr,
+                                                    IID_PPV_ARGS(&folderItem)))) {
+          pfd->SetFolder(folderItem);
+          folderItem->Release();
+        }
+      }
+      if (p.has_filename()) pfd->SetFileName(p.filename().wstring().c_str());
+    }
+
+    DWORD cookie = 0;
+    pfd->Advise(events, &cookie);
+    // GetActiveWindow() (not a fixed handle) since this is called both from
+    // main menu shortcuts (main window active) and the Browse button inside
+    // our own separate dialog SDL window (dialog window active) -- whichever
+    // is actually focused when the picker opens becomes its owner, so it's
+    // properly modal to (and stays in front of) the right one. This blocks
+    // for however long Show() takes (the whole reason this exists) -- but
+    // OnFileOk, above, has already fulfilled `promise` well before this
+    // returns, so nothing is waiting on this call specifically anymore.
+    pfd->Show(GetActiveWindow());
+    // Covers cancel (or anything else that closes the dialog without
+    // OnFileOk ever firing) -- a no-op if OnFileOk already fulfilled it.
+    events->fulfill(std::nullopt);
+    pfd->Unadvise(cookie);
+    pfd->Release();
+  } else {
+    events->fulfill(std::nullopt);
+  }
+  events->Release();
+  if (weInitialized) CoUninitialize();
+}
+#endif  // defined(_WIN32)
 
 constexpr int kScale = 6;         // pixels per dot
 // ImGui's default main menu bar height at default font size.
@@ -96,8 +292,21 @@ constexpr const char* kIndicatorFontPath = "/usr/share/fonts/opentype/noto/NotoS
 #endif
 constexpr int kIndicatorFontFaceIndex = 0;
 
-constexpr int kWindowH =
-    pc1500::Lcd::kRows * kScale + kMarginTop + kMarginBottom + kIndicatorBarHeight + kMenuBarHeight;
+// Status panel below the LCD (ROM/module/CPU details, see its render
+// block in main()). This project doesn't enable ImGui's multi-viewport
+// mode (it manages its own separate SDL windows for dialogs instead), so
+// a MenuItem dropdown taller than the window is clipped to the window's
+// own pixel bounds rather than floating as an independent OS window --
+// ImGui falls back to its own built-in scroll arrows for the overflow in
+// that case, rather than the item simply being unreachable. Kept the
+// window at its compact, content-sized default rather than padding it out
+// to fit every dropdown: a correctly-proportioned emulator window matters
+// more here than never having to scroll a menu.
+constexpr int kStatusPanelHeight = 180;
+
+constexpr int kWindowHNoPanel = pc1500::Lcd::kRows * kScale + kMarginTop + kMarginBottom +
+                                 kIndicatorBarHeight + kMenuBarHeight;
+constexpr int kWindowHWithPanel = kWindowHNoPanel + kStatusPanelHeight;
 
 // The fixed set of strings the indicator row can ever show -- rendered
 // once into cached textures at startup rather than every frame.
@@ -645,8 +854,8 @@ bool loadBinary(pc1500::Bus& bus, uint16_t addr, const char* path, std::string* 
 }
 
 // CE-150/153/158-style plug-in ROM module at 0x8000H-0xBFFFH -- see
-// Bus::RomModule's own comment for what base/requirePv/usePuBank mean.
-bool loadRomModule(pc1500::Bus& bus, uint16_t base, bool requirePv, bool usePuBank,
+// Bus::RomModule's own comment for what slot/base/requirePv/usePuBank mean.
+bool loadRomModule(pc1500::Bus& bus, int slot, uint16_t base, bool requirePv, bool usePuBank,
                     const char* path, std::string* error) {
   std::vector<uint8_t> data = readFile(path);
   if (data.empty()) {
@@ -657,23 +866,7 @@ bool loadRomModule(pc1500::Bus& bus, uint16_t base, bool requirePv, bool usePuBa
     *error = "PU-banked module ROM must have an even size (split into two equal banks).";
     return false;
   }
-  bus.loadRomModule(data.data(), data.size(), base, requirePv, usePuBank);
-  return true;
-}
-
-// Second, independent module slot -- see Bus::loadRomModule2's own comment.
-bool loadRomModule2(pc1500::Bus& bus, uint16_t base, bool requirePv, bool usePuBank,
-                     const char* path, std::string* error) {
-  std::vector<uint8_t> data = readFile(path);
-  if (data.empty()) {
-    *error = "Could not read file (or file is empty).";
-    return false;
-  }
-  if (usePuBank && (data.size() % 2) != 0) {
-    *error = "PU-banked module ROM must have an even size (split into two equal banks).";
-    return false;
-  }
-  bus.loadRomModule2(data.data(), data.size(), base, requirePv, usePuBank);
+  bus.loadRomModule(slot, data.data(), data.size(), base, requirePv, usePuBank);
   return true;
 }
 
@@ -1096,10 +1289,23 @@ int main(int argc, char** argv) {
   pc1500host::AppConfig appConfig;
   if (!confPath.empty()) {
     std::string confErr;
+    bool confExisted = std::filesystem::exists(confPath);
     if (!pc1500host::loadAppConfig(confPath, &appConfig, &confErr)) {
       std::fprintf(stderr, "pc1500emu: could not read conf file '%s': %s\n", confPath.c_str(),
                    confErr.c_str());
       return 1;
+    }
+    // Rewrite immediately so a conf file from an older build (missing a
+    // setting added since, e.g. showStatusPanel) is upgraded to the
+    // current schema on disk right away -- loadAppConfig already defaults
+    // any missing field in memory (see its own comment), but without this
+    // the file itself would only catch up whenever some other setting
+    // next happens to change (persistActiveConf, below), which could be
+    // never. Best-effort: a write failure here isn't fatal to startup, and
+    // will surface the next time a setting actually changes.
+    if (confExisted) {
+      std::string saveErr;
+      pc1500host::saveAppConfig(appConfig, confPath, &saveErr);
     }
   }
 
@@ -1184,8 +1390,9 @@ int main(int argc, char** argv) {
                  kIndicatorFontPath, TTF_GetError());
     return 1;
   }
-  SDL_Window* window = SDL_CreateWindow("pc1500emu", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                        kWindowW, kWindowH, SDL_WINDOW_SHOWN);
+  SDL_Window* window = SDL_CreateWindow(
+      "pc1500emu v" PC1500EMU_VERSION, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, kWindowW,
+      appConfig.showStatusPanel ? kWindowHWithPanel : kWindowHNoPanel, SDL_WINDOW_SHOWN);
   SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
   Uint32 mainWindowID = SDL_GetWindowID(window);
 
@@ -1673,28 +1880,26 @@ int main(int argc, char** argv) {
       std::string error;
       bool ok = loadBinary(bus, static_cast<uint16_t>(addr), path.c_str(), &error);
       writeResponse(ok ? "OK" : ("ERROR: " + error));
-    } else if (cmd == "loadrommodule") {
-      // <base hex> <requirePv 0|1> <usePuBank 0|1> <path>
+    } else if (cmd == "loadrommodule" || cmd == "loadrommodule2" || cmd == "loadrommodule3" ||
+               cmd == "loadrommodule4") {
+      // <base hex> <requirePv 0|1> <usePuBank 0|1> <path> -- "loadrommodule"
+      // (no suffix) targets slot 1, matching the pre-four-slot command name;
+      // loadrommodule2/3/4 target slots 2-4, all four independent (see
+      // Bus::RomModule's own comment for why more than one can be live at
+      // once).
+      int slot = (cmd == "loadrommodule") ? 0 : (cmd.back() - '1');
       long base = 0, requirePv = 0, usePuBank = 0;
       std::string path;
       iss >> std::hex >> base >> std::dec >> requirePv >> usePuBank;
       iss >> path;
       std::string error;
-      bool ok = loadRomModule(bus, static_cast<uint16_t>(base), requirePv != 0, usePuBank != 0,
-                               path.c_str(), &error);
+      bool ok = loadRomModule(bus, slot, static_cast<uint16_t>(base), requirePv != 0,
+                               usePuBank != 0, path.c_str(), &error);
       writeResponse(ok ? "OK" : ("ERROR: " + error));
-    } else if (cmd == "loadrommodule2") {
-      // <base hex> <requirePv 0|1> <usePuBank 0|1> <path> -- second, independent slot
-      long base = 0, requirePv = 0, usePuBank = 0;
-      std::string path;
-      iss >> std::hex >> base >> std::dec >> requirePv >> usePuBank;
-      iss >> path;
-      std::string error;
-      bool ok = loadRomModule2(bus, static_cast<uint16_t>(base), requirePv != 0, usePuBank != 0,
-                                path.c_str(), &error);
-      writeResponse(ok ? "OK" : ("ERROR: " + error));
-    } else if (cmd == "unloadrommodule2") {
-      bus.unloadRomModule2();
+    } else if (cmd == "unloadrommodule" || cmd == "unloadrommodule2" ||
+               cmd == "unloadrommodule3" || cmd == "unloadrommodule4") {
+      int slot = (cmd == "unloadrommodule") ? 0 : (cmd.back() - '1');
+      bus.unloadRomModule(slot);
     } else if (cmd == "call") {
       long addr = 0;
       iss >> std::hex >> addr;
@@ -1936,9 +2141,18 @@ int main(int argc, char** argv) {
   bool autoCallOnLoad = false;
   // ROM module (CE-150/153/158) dialog fields -- see Bus::RomModule.
   // Defaults match CE-150 (the more common/simpler of the two presets).
+  // romTargetSlot picks which of Bus's kNumRomModules slots the dialog
+  // below actually loads into -- set right before startDialog(..
+  // LoadRomModule..) by whichever "Load Module N..." menu item was
+  // clicked.
   char romBaseBuf[8] = "A000";
   bool romRequirePv = false;
   bool romUsePuBank = false;
+  int romTargetSlot = 0;
+  // Bus never stores a loaded module's source file path (only the raw
+  // bytes/base/requirePv/usePuBank) -- tracked here purely for the status
+  // panel's display, set on a successful ActiveDialog::LoadRomModule.
+  std::array<std::string, pc1500::Bus::kNumRomModules> loadedModulePaths;
   std::string dialogError;
   // Session-wide state-file/conf-file settings. configuredStateFilePath is
   // set up earlier in main(), before the SDL/ImGui init (see the
@@ -1997,6 +2211,94 @@ int main(int argc, char** argv) {
     callAddrTouched = false;
     std::strncpy(callAddrBuf, addrBuf, sizeof(callAddrBuf));
     openDialogWindow(title, width, height);
+  };
+  // requestPick opens a native OS file picker (so the user can browse
+  // instead of typing a path from memory), filtered by patterns/description
+  // but not restricted to it -- every OS file dialog lets the user pick
+  // "All files" or type an unfiltered name regardless. onResult is called
+  // with nullopt if the user cancelled, in which case it should do nothing
+  // (matches cancelling the follow-up custom dialog).
+  //
+  // This app is single-threaded (CPU emulation, audio, and every window's
+  // rendering all happen in one while(running) loop, below), and the native
+  // picker can block for several seconds on this machine (see
+  // nativeWinPickPathEarlyEvent's own comment) -- calling it directly would
+  // freeze the whole app, not just whichever dialog asked for a path. So
+  // the actual OS call always runs on a worker thread; onResult is called
+  // once the main loop notices pendingPick's future is ready (see the poll
+  // near the top of while(running)), not from the worker thread itself.
+  // Only one pick can be in flight at a time -- a second request while
+  // one's already pending is just dropped, matching "the button doesn't do
+  // anything yet" rather than queuing or cancelling, since there's only one
+  // native dialog to show at once anyway.
+  //
+  // title/description/defaultPath are taken by value (not const char*)
+  // specifically so callers can pass a stack buffer built with snprintf
+  // (e.g. the ROM Modules menu's per-slot dialog title) -- those buffers
+  // go out of scope long before the worker thread actually runs, so a raw
+  // pointer would dangle; copying into owned strings here, before
+  // launching the thread, is what makes that safe. patterns stays
+  // `const char*` since every call site only ever passes string literals
+  // (static storage, safe to keep pointers to indefinitely).
+  struct PendingPick {
+    std::future<std::optional<std::string>> future;
+    std::function<void(std::optional<std::string>)> onResult;
+  };
+  // Only ever touched from the main thread: requestPick sets it (called
+  // from an ImGui button handler), and the poll near the top of
+  // while(running) reads/clears it. Neither worker thread below ever
+  // touches this directly.
+  std::optional<PendingPick> pendingPick;
+  auto requestPick = [&pendingPick](bool save, std::string title, std::vector<const char*> patterns,
+                                     std::string description, std::string defaultPath,
+                                     std::function<void(std::optional<std::string>)> onResult) {
+    if (pendingPick) return;
+#if defined(_WIN32)
+    // See nativeWinPickPathEarlyEvent's own comment: the future here comes
+    // from a promise fulfilled inside an IFileDialogEvents::OnFileOk
+    // callback, not from the worker thread's own return -- the worker
+    // thread keeps running (stuck inside Show()) well after this future is
+    // already ready.
+    auto promise = std::make_shared<std::promise<std::optional<std::string>>>();
+    std::future<std::optional<std::string>> future = promise->get_future();
+    std::thread(nativeWinPickPathEarlyEvent, save, std::move(title), std::move(patterns),
+                std::move(description), std::move(defaultPath), std::move(promise))
+        .detach();
+    pendingPick = PendingPick{std::move(future), std::move(onResult)};
+#else
+    pendingPick = PendingPick{
+        std::async(std::launch::async,
+                   [=]() -> std::optional<std::string> {
+                     const char* result =
+                         save ? tinyfd_saveFileDialog(title.c_str(), defaultPath.c_str(),
+                                                       static_cast<int>(patterns.size()),
+                                                       patterns.data(), description.c_str())
+                              : tinyfd_openFileDialog(title.c_str(), defaultPath.c_str(),
+                                                       static_cast<int>(patterns.size()),
+                                                       patterns.data(), description.c_str(), 0);
+                     if (result == nullptr) return std::nullopt;
+                     return std::string(result);
+                   }),
+        std::move(onResult)};
+#endif
+  };
+  // Shared by every Browse-style button (the BASIC Text dialog's, and the
+  // "Load File into Text" button further down): reads filenameBuf into
+  // basicTextBuf. Declared here (once, in the scope requestPick's async
+  // callbacks capture from) rather than inline inside the per-frame dialog
+  // render block it used to live in -- a callback that runs on a later
+  // frame (once a pick resolves) can't safely reference a lambda that was
+  // itself a per-frame local, since that local's stack storage is long
+  // gone by the time the callback fires.
+  auto loadFileIntoTextBuf = [&]() {
+    std::vector<uint8_t> fileData = readFile(filenameBuf);
+    if (fileData.empty()) {
+      dialogError = "Could not read file (or file is empty).";
+    } else {
+      size_t n = std::min(fileData.size(), kBasicTextBufSize - 1);
+      std::memcpy(basicTextBuf.get(), fileData.data(), n);
+      basicTextBuf[n] = '\0';
+    }
   };
   // Writes appConfig to activeConfPath, so any state-related setting
   // change (Load/Save State succeeding, either auto-load/auto-save toggle)
@@ -2059,6 +2361,19 @@ int main(int argc, char** argv) {
   double buzzerDcEstimate = -1.0;
 
   while (running) {
+    // Deliver a requestPick() result once its worker thread finishes --
+    // see requestPick's own comment. Checked once per frame, up front,
+    // same as the command-pipe poll right below: whatever the callback
+    // does (typically startDialog) should be visible in this frame's own
+    // render pass, not delayed another frame.
+    if (pendingPick && pendingPick->future.wait_for(std::chrono::seconds(0)) ==
+                           std::future_status::ready) {
+      std::optional<std::string> pickedPath = pendingPick->future.get();
+      std::function<void(std::optional<std::string>)> onResult = std::move(pendingPick->onResult);
+      pendingPick.reset();
+      onResult(std::move(pickedPath));
+    }
+
 #if defined(_WIN32)
     cmdPipePoll(&cmdBuf);
 #else
@@ -2244,6 +2559,15 @@ int main(int argc, char** argv) {
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
+    // Set inside the Help menu below, consumed just before BeginPopupModal
+    // further down: OpenPopup()'s id is hashed against the *current* ImGui
+    // window, which inside a MenuItem callback is the main menu bar's own
+    // implicit window, not the outer window BeginPopupModal is called from
+    // -- calling OpenPopup directly from the MenuItem hashes to a different
+    // id than BeginPopupModal looks up, so the popup would never open.
+    bool openAboutPopup = false;
+    bool openSpecialKeysPopup = false;
+
     if (ImGui::BeginMainMenuBar()) {
       // Real keyboard shortcuts for the most-used menu actions -- polled
       // every frame regardless of which (if any) menu is currently open,
@@ -2255,33 +2579,63 @@ int main(int argc, char** argv) {
       // handler above (see the `ctrlHeld && kc != SDLK_F12` guard) already
       // ensures none of these also leak through to the emulated keyboard.
       if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_O, ImGuiInputFlags_RouteGlobal)) {
-        startDialog(ActiveDialog::LoadBinary, "Load Binary");
+        requestPick(false, "Load Binary", {"*.BIN", "*.bin"}, "Binary programs", "",
+                    [&](std::optional<std::string> path) {
+                      if (path) startDialog(ActiveDialog::LoadBinary, "Load Binary", 440, 260, path->c_str());
+                    });
       }
       if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
-        startDialog(ActiveDialog::SaveBinary, "Save Binary");
+        requestPick(true, "Save Binary", {"*.BIN", "*.bin"}, "Binary programs", "",
+                    [&](std::optional<std::string> path) {
+                      if (path) startDialog(ActiveDialog::SaveBinary, "Save Binary", 440, 260, path->c_str());
+                    });
       }
       if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_O, ImGuiInputFlags_RouteGlobal)) {
-        startDialog(ActiveDialog::LoadBasic, "Load BASIC");
+        requestPick(false, "Load BASIC", {"*.BAS", "*.bas"}, "BASIC programs", "",
+                    [&](std::optional<std::string> path) {
+                      if (path) startDialog(ActiveDialog::LoadBasic, "Load BASIC", 440, 260, path->c_str());
+                    });
       }
       if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
-        startDialog(ActiveDialog::SaveBasic, "Save BASIC");
+        requestPick(true, "Save BASIC", {"*.BAS", "*.bas"}, "BASIC programs", "",
+                    [&](std::optional<std::string> path) {
+                      if (path) startDialog(ActiveDialog::SaveBasic, "Save BASIC", 440, 260, path->c_str());
+                    });
       }
       if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_L, ImGuiInputFlags_RouteGlobal)) {
-        startDialog(ActiveDialog::LoadState, "Load State", 440, 260,
-                    configuredStateFilePath.c_str());
+        requestPick(false, "Load State", {"*.state"}, "State files", configuredStateFilePath,
+                    [&](std::optional<std::string> path) {
+                      if (path) startDialog(ActiveDialog::LoadState, "Load State", 440, 260, path->c_str());
+                    });
       }
       if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_L, ImGuiInputFlags_RouteGlobal)) {
-        startDialog(ActiveDialog::SaveState, "Save State", 440, 260,
-                    configuredStateFilePath.c_str());
+        requestPick(true, "Save State", {"*.state"}, "State files", configuredStateFilePath,
+                    [&](std::optional<std::string> path) {
+                      if (path) startDialog(ActiveDialog::SaveState, "Save State", 440, 260, path->c_str());
+                    });
       }
       if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Load BASIC...", "Ctrl+Shift+O")) {
-          startDialog(ActiveDialog::LoadBasic, "Load BASIC");
+          requestPick(false, "Load BASIC", {"*.BAS", "*.bas"}, "BASIC programs", "",
+                      [&](std::optional<std::string> path) {
+                        if (path) startDialog(ActiveDialog::LoadBasic, "Load BASIC", 440, 260, path->c_str());
+                      });
         }
         if (ImGui::MenuItem("Save BASIC...", "Ctrl+Shift+S")) {
-          startDialog(ActiveDialog::SaveBasic, "Save BASIC");
+          requestPick(true, "Save BASIC", {"*.BAS", "*.bas"}, "BASIC programs", "",
+                      [&](std::optional<std::string> path) {
+                        if (path) startDialog(ActiveDialog::SaveBasic, "Save BASIC", 440, 260, path->c_str());
+                      });
         }
         ImGui::Separator();
+        // Unlike the other File-menu items, these open the editor dialog
+        // directly rather than a native picker first: the dialog's own
+        // content (the text to load/save) needs review/editing regardless
+        // of which file it goes to, so a native picker in front of it
+        // would just be an extra click that saves nothing on its own --
+        // exactly the confusion a native Save dialog's "Save" button
+        // normally resolves by itself. Browse for a path from inside the
+        // editor instead (its own "Browse..." button, next to Filename).
         if (ImGui::MenuItem("Load BASIC Text...")) {
           startDialog(ActiveDialog::LoadBasicText, "Load BASIC Text", 700, 500);
           basicTextBuf[0] = '\0';
@@ -2300,29 +2654,69 @@ int main(int argc, char** argv) {
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Load Binary...", "Ctrl+O")) {
-          startDialog(ActiveDialog::LoadBinary, "Load Binary");
+          requestPick(false, "Load Binary", {"*.BIN", "*.bin"}, "Binary programs", "",
+                      [&](std::optional<std::string> path) {
+                        if (path) startDialog(ActiveDialog::LoadBinary, "Load Binary", 440, 260, path->c_str());
+                      });
         }
         if (ImGui::MenuItem("Save Binary...", "Ctrl+S")) {
-          startDialog(ActiveDialog::SaveBinary, "Save Binary");
+          requestPick(true, "Save Binary", {"*.BIN", "*.bin"}, "Binary programs", "",
+                      [&](std::optional<std::string> path) {
+                        if (path) startDialog(ActiveDialog::SaveBinary, "Save Binary", 440, 260, path->c_str());
+                      });
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Load ROM Module...")) {
-          startDialog(ActiveDialog::LoadRomModule, "Load ROM Module");
-          std::strncpy(romBaseBuf, "A000", sizeof(romBaseBuf));
-          romRequirePv = false;
-          romUsePuBank = false;
-        }
-        if (ImGui::MenuItem("Eject ROM Module", nullptr, false, bus.romModuleLoaded())) {
-          bus.unloadRomModule();
+        if (ImGui::BeginMenu("ROM Modules")) {
+          // Four independent slots, not two -- see Bus::RomModule's own
+          // comment: a real machine can have a module plugged in at both
+          // the 0x8000 and 0xA000 bases at once, each with its own PV-low
+          // and PV-high variant, so all four (base, PV) combinations can
+          // be loaded and live simultaneously.
+          for (int slot = 0; slot < pc1500::Bus::kNumRomModules; ++slot) {
+            ImGui::PushID(slot);
+            char menuLabel[24];
+            std::snprintf(menuLabel, sizeof(menuLabel), "Load Module %d...", slot + 1);
+            if (ImGui::MenuItem(menuLabel)) {
+              char dialogTitleBuf[24];
+              std::snprintf(dialogTitleBuf, sizeof(dialogTitleBuf), "Load ROM Module %d", slot + 1);
+              // Copied to a std::string (not just passed as dialogTitleBuf) because
+              // the callback below runs on a later frame, after this stack buffer
+              // is gone -- requestPick's own title param is copied too, but that's
+              // a separate copy only used for the picker itself, not this dialog.
+              std::string dialogTitle(dialogTitleBuf);
+              requestPick(false, dialogTitle, {"*.ROM", "*.rom", "*.BIN", "*.bin"}, "ROM images", "",
+                          [&, slot, dialogTitle](std::optional<std::string> path) {
+                            if (!path) return;
+                            romTargetSlot = slot;
+                            startDialog(ActiveDialog::LoadRomModule, dialogTitle.c_str(), 440, 260,
+                                        path->c_str());
+                            std::strncpy(romBaseBuf, "A000", sizeof(romBaseBuf));
+                            romRequirePv = false;
+                            romUsePuBank = false;
+                          });
+            }
+            char ejectLabel[24];
+            std::snprintf(ejectLabel, sizeof(ejectLabel), "Eject Module %d", slot + 1);
+            if (ImGui::MenuItem(ejectLabel, nullptr, false, bus.romModuleLoaded(slot))) {
+              bus.unloadRomModule(slot);
+              loadedModulePaths[slot].clear();
+            }
+            ImGui::PopID();
+          }
+          ImGui::EndMenu();
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Load State...", "Ctrl+L")) {
-          startDialog(ActiveDialog::LoadState, "Load State", 440, 260,
-                      configuredStateFilePath.c_str());
+          requestPick(false, "Load State", {"*.state"}, "State files", configuredStateFilePath,
+                      [&](std::optional<std::string> path) {
+                        if (path) startDialog(ActiveDialog::LoadState, "Load State", 440, 260, path->c_str());
+                      });
         }
         if (ImGui::MenuItem("Save State...", "Ctrl+Shift+L")) {
-          startDialog(ActiveDialog::SaveState, "Save State", 440, 260,
-                      configuredStateFilePath.c_str());
+          requestPick(true, "Save State", {"*.state"}, "State files", configuredStateFilePath,
+                      [&](std::optional<std::string> path) {
+                        if (path) startDialog(ActiveDialog::SaveState, "Save State", 440, 260, path->c_str());
+                      });
         }
         ImGui::EndMenu();
       }
@@ -2363,6 +2757,21 @@ int main(int argc, char** argv) {
           appConfig.autoSaveOnExit = !appConfig.autoSaveOnExit;
           persistActiveConf();
         }
+        if (ImGui::MenuItem("Show Status Panel", nullptr, appConfig.showStatusPanel)) {
+          appConfig.showStatusPanel = !appConfig.showStatusPanel;
+          SDL_SetWindowSize(window, kWindowW,
+                             appConfig.showStatusPanel ? kWindowHWithPanel : kWindowHNoPanel);
+          persistActiveConf();
+        }
+        ImGui::EndMenu();
+      }
+      if (ImGui::BeginMenu("Help")) {
+        if (ImGui::MenuItem("Special Keys...")) {
+          openSpecialKeysPopup = true;
+        }
+        if (ImGui::MenuItem("About pc1500emu...")) {
+          openAboutPopup = true;
+        }
         ImGui::EndMenu();
       }
       if (automationMode) {
@@ -2376,6 +2785,136 @@ int main(int argc, char** argv) {
         ImGui::TextColored(ImVec4(0.6f, 0.9f, 0.6f, 1.0f), "  %s", stateActionStatus.c_str());
       }
       ImGui::EndMainMenuBar();
+    }
+
+    // Status panel below the LCD -- ROM/module/CPU details. ImGui text
+    // (not the indicator bar's cached-SDL_ttf-texture approach): this
+    // content changes every frame, so pre-caching doesn't help, and
+    // ImGui's own text rendering has no meaningful per-frame cost for a
+    // few lines. Positioned to start right where the no-panel window ends
+    // (kWindowHNoPanel), spanning kStatusPanelHeight down to
+    // kWindowHWithPanel. Settings > Show Status Panel toggles
+    // appConfig.showStatusPanel (persisted like every other conf-file
+    // setting) *and* resizes the actual window between kWindowHNoPanel and
+    // kWindowHWithPanel to match -- see that toggle's own
+    // SDL_SetWindowSize call, below in the Settings menu.
+    if (appConfig.showStatusPanel) {
+      float panelY = static_cast<float>(kWindowHNoPanel);
+      ImGui::SetNextWindowPos(ImVec2(0, panelY));
+      ImGui::SetNextWindowSize(ImVec2(static_cast<float>(kWindowW), static_cast<float>(kStatusPanelHeight)));
+      ImGuiWindowFlags panelFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                                     ImGuiWindowFlags_NoScrollbar;
+      if (ImGui::Begin("##statuspanel", nullptr, panelFlags)) {
+        if (ImGui::BeginTable("##statustable", 3, ImGuiTableFlags_SizingStretchSame)) {
+          ImGui::TableNextColumn();
+          ImGui::TextUnformatted("ROM / RAM");
+          ImGui::Separator();
+          ImGui::Text("ROM: %s", effectiveRomPath.empty() ? "(none)" : effectiveRomPath.c_str());
+          for (int slot = 0; slot < pc1500::Bus::kNumRomModules; ++slot) {
+            if (bus.romModuleLoaded(slot)) {
+              const auto& m = bus.romModule(slot);
+              const std::string& p = loadedModulePaths[slot];
+              ImGui::Text("M%d: %s @0x%04X PV=%s%s", slot + 1, p.empty() ? "(loaded)" : p.c_str(),
+                          m.base, m.requirePv ? "high" : "low", m.usePuBank ? " Bank" : "");
+            } else {
+              ImGui::Text("M%d: (empty)", slot + 1);
+            }
+          }
+          if (bus.extRam4800Size() > 0) {
+            ImGui::Text("Ext RAM 4800H: %uK", static_cast<unsigned>(bus.extRam4800Size() / 1024));
+          } else {
+            ImGui::TextUnformatted("Ext RAM 4800H: off");
+          }
+          if (bus.extRam0000Size() > 0) {
+            ImGui::Text("Ext RAM 0000H: %uK", static_cast<unsigned>(bus.extRam0000Size() / 1024));
+          } else {
+            ImGui::TextUnformatted("Ext RAM 0000H: off");
+          }
+
+          ImGui::TableNextColumn();
+          ImGui::TextUnformatted("CPU");
+          ImGui::Separator();
+          ImGui::Text("PC=0x%04X", cpu.p());
+          ImGui::Text("ME=%s", bus.lastAccessedSpace() == pc1500::Bus::MemorySpace::ME1 ? "ME1" : "ME0");
+          ImGui::Text("halted=%d", cpu.halted() ? 1 : 0);
+          {
+            const lh5801::Flags& flags = cpu.flags();
+            ImGui::Text("C=%d V=%d Z=%d H=%d IE=%d", flags.c ? 1 : 0, flags.v ? 1 : 0, flags.z ? 1 : 0,
+                        flags.h ? 1 : 0, flags.ie ? 1 : 0);
+          }
+
+          ImGui::TableNextColumn();
+          ImGui::TextUnformatted("pc1500emu");
+          ImGui::Separator();
+          ImGui::Text("v%s", PC1500EMU_VERSION);
+          ImGui::Text("State: %s",
+                      configuredStateFilePath.empty() ? "(none)" : configuredStateFilePath.c_str());
+
+          ImGui::EndTable();
+        }
+      }
+      ImGui::End();
+    }
+
+    // Special Keys popup -- same plain-ImGui-modal approach as About,
+    // below. Reference is `kKeyMap[]`/`charToTapActions()`'s own comments
+    // (and README.md's "Keyboard mapping" section, which this mirrors):
+    // PC-1500 keys without an obvious host equivalent live on F7-F12.
+    if (openSpecialKeysPopup) {
+      ImGui::OpenPopup("Special Keys");
+    }
+    if (ImGui::BeginPopupModal("Special Keys", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      if (ImGui::BeginTable("##specialkeys", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        auto row = [](const char* key, const char* fn) {
+          ImGui::TableNextColumn();
+          ImGui::TextUnformatted(key);
+          ImGui::TableNextColumn();
+          ImGui::TextUnformatted(fn);
+        };
+        row("F7", "CL");
+        row("F8", "MODE");
+        row("F9", "DEF");
+        row("F10", "SML");
+        row("Shift+F10", "Up/down rocker key");
+        row("F11", "RCL");
+        row("F12", "ON (also BREAK while a program is running)");
+        row("Shift+F12", "OFF");
+        row("Ctrl+F12", "RESET (host-only; mimics the ALL RESET pinhole)");
+        row("Shift", "Tap to toggle (not a hold -- matches real hardware)");
+        row("Tab", "Standalone Shift keypress");
+        ImGui::EndTable();
+      }
+      ImGui::Separator();
+      ImGui::TextUnformatted("Letters, numpad digits, arrows, F1-F6, Enter, and Space map");
+      ImGui::TextUnformatted("directly. Typing a digit or punctuation reproduces the exact");
+      ImGui::TextUnformatted("PC-1500 keypress that types it on real hardware.");
+      ImGui::Separator();
+      if (ImGui::Button("OK", ImVec2(120, 0))) {
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
+
+    // About popup -- a plain ImGui modal in the main context, unlike the
+    // Load/Save dialogs' separate-SDL-window machinery, since there's no
+    // file path input involved, just a few read-only lines. OpenPopup is
+    // called here (not from the MenuItem above) so it shares this scope's
+    // window context with BeginPopupModal -- see openAboutPopup's comment.
+    if (openAboutPopup) {
+      ImGui::OpenPopup("About pc1500emu");
+    }
+    if (ImGui::BeginPopupModal("About pc1500emu", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      ImGui::Text("pc1500emu v%s", PC1500EMU_VERSION);
+      ImGui::TextUnformatted("A from-scratch Sharp PC-1500 / LH5801 emulator.");
+      ImGui::Separator();
+      ImGui::TextUnformatted("Copyright (c) 2026 Paul Chambre.");
+      ImGui::TextUnformatted("Licensed under the Apache License, Version 2.0.");
+      ImGui::Separator();
+      if (ImGui::Button("OK", ImVec2(120, 0))) {
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
     }
 
     ImGui::Render();
@@ -2443,6 +2982,19 @@ int main(int argc, char** argv) {
                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse)) {
         ImGui::InputText("Filename", filenameBuf, sizeof(filenameBuf));
+        if (isBasicText) {
+          ImGui::SameLine();
+          if (ImGui::Button("Browse...")) {
+            const char* title = isLoad ? "Load BASIC Text" : "Save BASIC Text";
+            requestPick(!isLoad, title, {"*.BAS", "*.bas"}, "BASIC programs", "",
+                        [&, isLoad](std::optional<std::string> path) {
+                          if (!path) return;
+                          std::strncpy(filenameBuf, path->c_str(), sizeof(filenameBuf) - 1);
+                          filenameBuf[sizeof(filenameBuf) - 1] = '\0';
+                          if (isLoad) loadFileIntoTextBuf();
+                        });
+          }
+        }
         if (isBinary) {
           bool addrChanged = ImGui::InputText("Address (hex)", addrBuf, sizeof(addrBuf),
                                                ImGuiInputTextFlags_CharsHexadecimal);
@@ -2495,14 +3047,7 @@ int main(int argc, char** argv) {
           if (isLoad) {
             ImGui::SameLine();
             if (ImGui::Button("Load File into Text")) {
-              std::vector<uint8_t> fileData = readFile(filenameBuf);
-              if (fileData.empty()) {
-                dialogError = "Could not read file (or file is empty).";
-              } else {
-                size_t n = std::min(fileData.size(), kBasicTextBufSize - 1);
-                std::memcpy(basicTextBuf.get(), fileData.data(), n);
-                basicTextBuf[n] = '\0';
-              }
+              loadFileIntoTextBuf();
             }
             ImGui::SameLine();
             if (ImGui::Button("Paste from Clipboard")) {
@@ -2552,7 +3097,9 @@ int main(int argc, char** argv) {
               break;
             case ActiveDialog::LoadRomModule: {
               uint16_t base = static_cast<uint16_t>(strtol(romBaseBuf, nullptr, 16));
-              ok = loadRomModule(bus, base, romRequirePv, romUsePuBank, filenameBuf, &dialogError);
+              ok = loadRomModule(bus, romTargetSlot, base, romRequirePv, romUsePuBank, filenameBuf,
+                                  &dialogError);
+              if (ok) loadedModulePaths[romTargetSlot] = filenameBuf;
               break;
             }
             case ActiveDialog::LoadBasicText:

@@ -58,11 +58,11 @@ void testRoundTrip() {
   bus.writeME0(0x7FFF, 0x99);  // system RAM, mirrors to 0x7BFF, never gated
 
   uint8_t module1Data[4] = {0x11, 0x22, 0x33, 0x44};
-  bus.loadRomModule(module1Data, sizeof(module1Data), 0xA000, /*requirePv=*/false,
+  bus.loadRomModule(0, module1Data, sizeof(module1Data), 0xA000, /*requirePv=*/false,
                      /*usePuBank=*/false);
   uint8_t module2Data[4] = {0x55, 0x66, 0x77, 0x88};
-  bus.loadRomModule2(module2Data, sizeof(module2Data), 0x8000, /*requirePv=*/true,
-                      /*usePuBank=*/true);
+  bus.loadRomModule(1, module2Data, sizeof(module2Data), 0x8000, /*requirePv=*/true,
+                     /*usePuBank=*/true);
 
   // Distinguishing CPU state -- this is the whole point of the redesign
   // that dropped cpu.reset() from the restore path: a resumed session
@@ -96,8 +96,10 @@ void testRoundTrip() {
   CHECK(bus2.extRam4800Size() == 0x2000);
   CHECK(bus2.extRam0000Size() == 0x4000);
 
-  CHECK(bus2.romModuleLoaded());
-  CHECK(bus2.romModule2Loaded());
+  CHECK(bus2.romModuleLoaded(0));
+  CHECK(bus2.romModuleLoaded(1));
+  CHECK(!bus2.romModuleLoaded(2));
+  CHECK(!bus2.romModuleLoaded(3));
 
   CHECK(cpu2.p() == 0x1234);
   CHECK(cpu2.s() == 0x7A00);

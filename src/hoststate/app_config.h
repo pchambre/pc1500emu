@@ -21,6 +21,7 @@ struct AppConfig {
   std::optional<std::string> stateFilePath;
   bool autoLoadOnStart = true;
   bool autoSaveOnExit = false;
+  bool showStatusPanel = false;
 };
 
 // A missing file at `path` is not an error -- returns true with *out left
