@@ -283,12 +283,33 @@ constexpr int kIndicatorFontPtSize = 11;
 // don't differ meaningfully between the CJK variants for our purposes.
 // Windows has shipped a CJK-capable font collection by default since
 // Windows 8 regardless of display language, so msgothic.ttc needs no
-// separate install; Linux distros vary in where they put Noto, so this is
-// still just the one path this project's dev machine has it at.
+// separate install. macOS and Linux vary more (different macOS releases
+// ship different default font sets -- confirmed on real hardware that
+// there's no /usr/share/fonts at all on macOS, that's Linux-only FHS
+// convention; Linux distros vary in whether/where Noto CJK is installed),
+// so those platforms try a short list of known candidate paths in order at
+// startup (see the loop around TTF_OpenFontIndex, below) and use the first
+// one that actually opens, rather than trusting a single hardcoded guess.
 #if defined(_WIN32)
-constexpr const char* kIndicatorFontPath = "C:\\Windows\\Fonts\\msgothic.ttc";
+constexpr const char* kIndicatorFontPathCandidates[] = {"C:\\Windows\\Fonts\\msgothic.ttc"};
+#elif defined(__APPLE__)
+// Verified against a real `ls /System/Library/Fonts` on Paul's Mac
+// (2026-08-09) -- Hiragino Sans GB.ttc and the native-named Hiragino Kaku
+// Gothic W4.ttc both exist there; PingFang.ttc does NOT exist as a
+// top-level file (dropped, was a guess); Apple's Korean font is named
+// AppleSDGothicNeo.ttc with no spaces (not "Apple SD Gothic Neo.ttc," the
+// initial guess); Arial Unicode.ttf lives under Fonts/Supplemental/, not
+// /Library/Fonts.
+constexpr const char* kIndicatorFontPathCandidates[] = {
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/\xE3\x83\x92\xE3\x83\xA9\xE3\x82\xAE\xE3\x83\x8E\xE8\xA7\x92\xE3\x82\xB4\xE3\x82\xB7\xE3\x83\x83\xE3\x82\xAF W4.ttc",  // Hiragino Kaku Gothic (native Japanese font name)
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+};
 #else
-constexpr const char* kIndicatorFontPath = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+constexpr const char* kIndicatorFontPathCandidates[] = {
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+};
 #endif
 constexpr int kIndicatorFontFaceIndex = 0;
 
@@ -1383,11 +1404,19 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "pc1500emu: TTF_Init failed: %s\n", TTF_GetError());
     return 1;
   }
-  TTF_Font* indicatorFont = TTF_OpenFontIndex(kIndicatorFontPath, kIndicatorFontPtSize,
-                                               kIndicatorFontFaceIndex);
+  TTF_Font* indicatorFont = nullptr;
+  std::string indicatorFontLastError;
+  for (const char* candidate : kIndicatorFontPathCandidates) {
+    indicatorFont = TTF_OpenFontIndex(candidate, kIndicatorFontPtSize, kIndicatorFontFaceIndex);
+    if (indicatorFont) break;
+    indicatorFontLastError = TTF_GetError();
+  }
   if (!indicatorFont) {
-    std::fprintf(stderr, "pc1500emu: could not load indicator font '%s': %s\n",
-                 kIndicatorFontPath, TTF_GetError());
+    std::fprintf(stderr, "pc1500emu: could not load an indicator font -- tried:\n");
+    for (const char* candidate : kIndicatorFontPathCandidates) {
+      std::fprintf(stderr, "  %s\n", candidate);
+    }
+    std::fprintf(stderr, "last error: %s\n", indicatorFontLastError.c_str());
     return 1;
   }
   SDL_Window* window = SDL_CreateWindow(
