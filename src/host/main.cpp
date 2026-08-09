@@ -47,6 +47,7 @@
 #include "keyboard.h"
 #include "lcd.h"
 #include "lh5801.h"
+#include "mac_activate.h"
 #include "state_file.h"
 #include "text_loader.h"
 #include "tinyfiledialogs.h"
@@ -1424,6 +1425,8 @@ int main(int argc, char** argv) {
       appConfig.showStatusPanel ? kWindowHWithPanel : kWindowHNoPanel, SDL_WINDOW_SHOWN);
   SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
   Uint32 mainWindowID = SDL_GetWindowID(window);
+  // No-op outside macOS -- see mac_activate.h/.mm.
+  macActivateApp();
 
   IMGUI_CHECKVERSION();
   ImGuiContext* mainImguiCtx = ImGui::CreateContext();
@@ -2784,6 +2787,23 @@ int main(int argc, char** argv) {
         }
         if (ImGui::MenuItem("Auto-Save State on Exit", nullptr, appConfig.autoSaveOnExit)) {
           appConfig.autoSaveOnExit = !appConfig.autoSaveOnExit;
+          // Enabling this with no state file configured yet (never done an
+          // explicit Load/Save State, and none carried over from an
+          // existing conf) would otherwise silently do nothing at exit --
+          // the exit-time save is gated on configuredStateFilePath being
+          // non-empty (see its own block, near the end of main()), with no
+          // error either way since there's nothing to report as failed.
+          // Default it here the same way persistActiveConf lazily defaults
+          // the conf path itself, so the checkbox actually does something
+          // out of the box.
+          if (appConfig.autoSaveOnExit && configuredStateFilePath.empty()) {
+            constexpr const char* kDefaultStateFileName = "pc1500emu.state";
+            configuredStateFilePath =
+                (std::filesystem::current_path() / kDefaultStateFileName).string();
+            appConfig.stateFilePath = configuredStateFilePath;
+            stateActionStatus = "Auto-save will use " + configuredStateFilePath;
+            stateActionStatusFramesRemaining = kStateActionStatusFrames;
+          }
           persistActiveConf();
         }
         if (ImGui::MenuItem("Show Status Panel", nullptr, appConfig.showStatusPanel)) {

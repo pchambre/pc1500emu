@@ -60,3 +60,11 @@ if(WIN32)
   # auto-linked by MSVC the way some system libs are, so all are explicit.
   target_link_libraries(pc1500emu PRIVATE comdlg32 shell32 ole32 uuid)
 endif()
+if(APPLE)
+  # mac_activate.mm forces this process to the foreground on launch -- see
+  # its own comment for why (running as a bare executable, not a proper
+  # .app bundle, means macOS doesn't do this automatically). CMake compiles
+  # .mm as Objective-C++ automatically; needs the Cocoa framework linked in.
+  target_sources(pc1500emu PRIVATE mac_activate.mm)
+  target_link_libraries(pc1500emu PRIVATE "-framework Cocoa")
+endif()
