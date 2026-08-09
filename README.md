@@ -269,6 +269,9 @@ build\src\disasm\RelWithDebInfo\pc1500disasm.exe --mode base ROM1.BIN -o rom1.as
 
 # expansion module, either platform (adjust the binary path as above):
 pc1500disasm --mode module --base 0xA000 CE-150.ROM -o ce150.asm
+
+# standalone ML program, e.g. one loaded via BASIC and CALLed at 0x4268:
+pc1500disasm --mode program --base 0x4268 MyProgram.bin -o myprogram.asm
 ```
 
 - `--mode base` (default load address `0xC000`) seeds the reset/interrupt
@@ -276,6 +279,11 @@ pc1500disasm --mode module --base 0xA000 CE-150.ROM -o ce150.asm
 - `--mode module` (default load address `0x8000`) scans for the `0x55`
   sentinel byte expansion modules use at each 2KB-aligned page and
   auto-detects that page's own keyword table.
+- `--mode program` disassembles a standalone BASIC-`POKE`d/`CALL`ed ML
+  routine: no vectors or keyword table to auto-seed from, so it just
+  traverses from `--seed` (repeatable; defaults to `--base` itself if none
+  given, the common case of a routine entered at its own load address).
+  `--base` is required (no universal load address for a standalone routine).
 - `--base 0xNNNN` overrides the default load address.
 - `-o out.asm` writes to a file instead of stdout; `--annotate` adds a
   trailing `; 0xNNNN: XX XX` comment per line for human review.
@@ -285,18 +293,43 @@ whenever the address is one of the confirmed PC-1500 memory-map/ROM
 addresses in `src/disasm/known_symbols.cpp` (e.g. `E2AAH` → `IDLE`,
 `764EH` → `STATUS1`, `7B0EH` → `KEYGATE`) — always on, not gated behind
 `--annotate`, since it's real documentation rather than a raw byte dump.
+This applies to a call/jump target (e.g. `SJP E243H`) just as much as a
+direct memory reference (e.g. `LDA (764EH)`).
+
+`--symbols-file <path>` adds your own annotations on top of that built-in
+table, without a code change or rebuild -- useful for ROM routines you've
+identified yourself (e.g. from the PC-2 Assembly Language manual) that
+aren't in `known_symbols.cpp` yet. One entry per line:
+```
+# lines starting with # (and blank lines) are ignored
+0xE243 KEYSCAN_WAIT scan keyboard, wait for a key
+0x1234 MYROUTINE    whatever this one does
+```
+`<addr>` takes an optional `0x` prefix (always hex); everything after
+`<name>` is the comment verbatim, so it may contain spaces. A malformed
+line is skipped with a warning to stderr rather than aborting the whole
+file. An entry here at the same address as a built-in one overrides it.
 
 ### Editing disassembly output
 
 No dedicated LH5801 IDE exists anywhere (checked). `tools/vscode-lh5801-asm/`
 is a small local VS Code extension providing syntax highlighting for the
-`sdas` dialect this disassembler emits and `sdaslh5801` accepts. Install it
-by copying the folder into `%USERPROFILE%\.vscode\extensions\` (Windows) or
-`~/.vscode/extensions/` (Linux/Mac), then reload the window.
+`sdas` dialect this disassembler emits and `sdaslh5801` accepts, plus a
+**"LH5801: Disassemble to ASM"** command that runs `pc1500disasm` for you:
+right-click a `.ROM`/`.BIN` file in the Explorer (or run the command from
+the Command Palette, which then prompts you to pick one), choose a mode
+(base/module/program), confirm the load address, and it writes and opens
+the resulting `.asm`. Set `lh5801.disasmCommand` in `settings.json` first
+(defaults to this repo's own Windows build output,
+`build/src/disasm/RelWithDebInfo/pc1500disasm.exe` — adjust for Linux/Mac).
+Install the extension by copying `tools/vscode-lh5801-asm/` into
+`%USERPROFILE%\.vscode\extensions\` (Windows) or `~/.vscode/extensions/`
+(Linux/Mac), then reload the window.
 
 Opening this repo in VS Code also picks up:
 - `.vscode/settings.json` — associates `*.asm`/`*.s` with the extension's
-  grammar, scoped to this project only.
+  grammar (scoped to this project only), and holds `lh5801.disasmCommand`
+  (above) and `lh5801.sdasCommand` (below).
 - `.vscode/tasks.json` — a build task (`Ctrl+Shift+B`) that runs
   `sdaslh5801` on the active file and reports errors in the Problems panel.
   Fill in `lh5801.sdasCommand` in `settings.json` with your own built

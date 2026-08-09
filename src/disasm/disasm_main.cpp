@@ -13,12 +13,13 @@
 
 #include "analyzer.h"
 #include "formatter.h"
+#include "known_symbols.h"
 
 namespace {
 
 void printUsage(const char* argv0) {
   std::fprintf(stderr,
-               "Usage: %s [--mode base|module] [--base 0xNNNN] [-o out.asm] [--annotate] <romfile>\n"
+               "Usage: %s [--mode base|module|program] [--base 0xNNNN] [-o out.asm] [--annotate] <romfile>\n"
                "\n"
                "  --mode base    Base PC-1500 ROM (ROM1.BIN): seeds the reset/interrupt\n"
                "                 vectors and the built-in keyword table. Default load\n"
@@ -26,6 +27,11 @@ void printUsage(const char* argv0) {
                "  --mode module  Expansion-module ROM: scans for the 0x55 sentinel at\n"
                "                 every 2KB-aligned page and auto-detects its keyword\n"
                "                 table(s). Default load address 0x8000.\n"
+               "  --mode program Standalone BASIC-POKEd/CALLed ML routine: no vectors, no\n"
+               "                 keyword table -- just traverses from --seed (repeatable),\n"
+               "                 defaulting to --base itself if no --seed is given (the\n"
+               "                 common case: a routine CALLed at its own load address).\n"
+               "                 --base is required (no universal convention to default to).\n"
                "  --base 0xNNNN  Override the default load address for the chosen mode.\n"
                "  --seed 0xNNNN  Traverse from this address too, in addition to whatever\n"
                "                 vectors/keyword tables are found automatically (repeatable).\n"
@@ -33,9 +39,21 @@ void printUsage(const char* argv0) {
                "                 keyword-table entries to pass the auto-detector's\n"
                "                 false-positive-avoidance confidence check -- pc1500disasm\n"
                "                 reports these to stderr as 'low-confidence' candidates,\n"
-               "                 each entry's address is exactly what --seed wants.\n"
+               "                 each entry's address is exactly what --seed wants. In\n"
+               "                 program mode, --seed is the entry point list itself (see\n"
+               "                 above) rather than an addition to auto-detected seeds.\n"
                "  -o out.asm     Write the listing here instead of stdout.\n"
-               "  --annotate     Add a trailing '; 0xNNNN: XX XX ...' comment per line.\n",
+               "  --annotate     Add a trailing '; 0xNNNN: XX XX ...' comment per line.\n"
+               "  --symbols-file <path>\n"
+               "                 Extra address annotations (\"; NAME -- comment\", same as the\n"
+               "                 built-in table), on top of known_symbols.cpp's own -- lets you\n"
+               "                 add your own without a code change/rebuild. One entry per line:\n"
+               "                 '<addr> <name> <comment...>' (addr takes an optional 0x prefix,\n"
+               "                 always hex; comment is the rest of the line, may contain spaces).\n"
+               "                 Blank lines and lines starting with '#' are ignored. A malformed\n"
+               "                 line is skipped with a warning; a same-address entry here\n"
+               "                 overrides the built-in table. Example line:\n"
+               "                   0xE243 KEYSCAN_WAIT scan keyboard, wait for a key\n",
                argv0);
 }
 
@@ -55,6 +73,7 @@ int main(int argc, char** argv) {
   bool annotate = false;
   std::string romPath;
   std::vector<uint16_t> seeds;
+  std::string symbolsFilePath;
 
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
@@ -69,6 +88,8 @@ int main(int argc, char** argv) {
       outPath = argv[++i];
     } else if (arg == "--annotate") {
       annotate = true;
+    } else if (arg == "--symbols-file" && i + 1 < argc) {
+      symbolsFilePath = argv[++i];
     } else if (arg == "-h" || arg == "--help") {
       printUsage(argv[0]);
       return 0;
@@ -85,8 +106,14 @@ int main(int argc, char** argv) {
     printUsage(argv[0]);
     return 1;
   }
-  if (mode != "base" && mode != "module") {
-    std::fprintf(stderr, "pc1500disasm: --mode must be 'base' or 'module'\n");
+  if (mode != "base" && mode != "module" && mode != "program") {
+    std::fprintf(stderr, "pc1500disasm: --mode must be 'base', 'module', or 'program'\n");
+    return 1;
+  }
+  if (mode == "program" && !baseGiven) {
+    std::fprintf(stderr,
+                  "pc1500disasm: --mode program requires --base (no universal load address "
+                  "for a standalone ML routine)\n");
     return 1;
   }
   if (!baseGiven) base = (mode == "base") ? 0xC000 : 0x8000;
@@ -106,9 +133,14 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  pc1500::disasm::AnalysisResult result =
-      (mode == "base") ? pc1500::disasm::analyzeBaseRom(image, static_cast<uint16_t>(base), seeds)
-                        : pc1500::disasm::analyzeModuleRom(image, static_cast<uint16_t>(base), seeds);
+  pc1500::disasm::AnalysisResult result;
+  if (mode == "base") {
+    result = pc1500::disasm::analyzeBaseRom(image, static_cast<uint16_t>(base), seeds);
+  } else if (mode == "module") {
+    result = pc1500::disasm::analyzeModuleRom(image, static_cast<uint16_t>(base), seeds);
+  } else {
+    result = pc1500::disasm::analyzeProgram(image, static_cast<uint16_t>(base), seeds);
+  }
 
   for (const auto& kt : result.lowConfidenceTables) {
     std::fprintf(stderr,
@@ -123,6 +155,14 @@ int main(int argc, char** argv) {
 
   pc1500::disasm::FormatOptions options;
   options.annotate = annotate;
+  if (!symbolsFilePath.empty()) {
+    std::string loadError;
+    if (!pc1500::disasm::loadUserSymbolsFile(symbolsFilePath, &options.userSymbols, &loadError)) {
+      std::fprintf(stderr, "pc1500disasm: --symbols-file '%s': %s\n", symbolsFilePath.c_str(),
+                    loadError.c_str());
+      return 1;
+    }
+  }
   std::string listing = pc1500::disasm::formatListing(image, result, options);
 
   if (outPath.empty()) {

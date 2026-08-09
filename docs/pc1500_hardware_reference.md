@@ -47,6 +47,18 @@ forms access ME1 (see `lh5801_opcode_reference.md`). On the PC-1500:
 | `8000H`-`BFFFH` | CE-150/CE-153/CE-158 system program + I/O PC (only present if that peripheral is connected) |
 | `C000H`-`FFFFH` | PC-1500 system ROM (16KB, chip SC61328F) |
 
+**System-subroutine entry points**: `src/disasm/known_symbols.cpp` catalogs
+confirmed ROM routine addresses in both ranges above (keyboard scan, LCD
+output, BASIC string/numeric-function entry points, cassette I/O, printer
+I/O), sourced from the PC-2 Assembly Language manual (Bruce Elliott,
+*TRS-80 Microcomputer News*, 1983-84) -- the disassembler
+(`pc1500disasm`) renders these as inline annotations automatically. Every
+routine in `8000H`-`BFFFH` requires the CE-150 module attached with PV
+low (see `Bus::RomModule` in `src/bus/bus.h`) -- the manual itself doesn't
+state this (it only documents PU, not PV, as the printer-ROM enable
+signal), so it's cited from this project's own already-confirmed hardware
+behavior instead.
+
 **Gotcha, learned the hard way**: `4000H`-`47FFH` being "standard user RAM"
 at the chip-select level does *not* mean all of it is free scratch space.
 On a bare PC-1500 (no CE-151/CE-155/CE-159 module), the BASIC ROM firmware

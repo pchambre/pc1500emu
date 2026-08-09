@@ -320,4 +320,24 @@ AnalysisResult analyzeModuleRom(const std::vector<uint8_t>& image, uint16_t base
   return r;
 }
 
+AnalysisResult analyzeProgram(const std::vector<uint8_t>& image, uint16_t base,
+                               const std::vector<uint16_t>& entryPoints) {
+  AnalysisResult r;
+  r.base = base;
+  r.kind.assign(image.size(), ByteKind::Unknown);
+  std::deque<uint16_t> worklist;
+  if (entryPoints.empty()) {
+    r.labels.insert(base);
+    worklist.push_back(base);
+  } else {
+    for (uint16_t entry : entryPoints) {
+      r.labels.insert(entry);
+      worklist.push_back(entry);
+    }
+  }
+
+  traverse(image, base, r.kind, r.labels, r.vectorEntries, worklist);
+  return r;
+}
+
 }  // namespace pc1500::disasm

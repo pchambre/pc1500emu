@@ -9,7 +9,35 @@
     "vscode": "^1.75.0"
   },
   "categories": ["Programming Languages", "Debuggers"],
+  "main": "./extension.js",
+  "activationEvents": ["onCommand:lh5801-asm.disassemble"],
   "contributes": {
+    "commands": [
+      {
+        "command": "lh5801-asm.disassemble",
+        "title": "Disassemble to ASM (pc1500disasm)",
+        "category": "LH5801"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "lh5801-asm.disassemble",
+          "when": "resourceExtname =~ /\\.(rom|bin)$/i",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "LH5801/PC-1500",
+      "properties": {
+        "lh5801.disasmCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Path to your built pc1500disasm executable, used by 'LH5801: Disassemble to ASM'. Supports ${workspaceFolder}. E.g. ${workspaceFolder}/build/src/disasm/RelWithDebInfo/pc1500disasm.exe on Windows, or ${workspaceFolder}/build/src/disasm/pc1500disasm on Linux/Mac."
+        }
+      }
+    },
     "languages": [
       {
         "id": "lh5801-asm",

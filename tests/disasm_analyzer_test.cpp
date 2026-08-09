@@ -10,6 +10,7 @@ namespace {
 
 using pc1500::disasm::analyzeBaseRom;
 using pc1500::disasm::analyzeModuleRom;
+using pc1500::disasm::analyzeProgram;
 using pc1500::disasm::ByteKind;
 
 int g_failures = 0;
@@ -269,6 +270,60 @@ void testCe150RomKnownTable() {
   }
 }
 
+// Standalone-program mode has no vectors/keyword table to auto-seed from --
+// just PSH A / RTN (0xFD 0xC8 / 0x9A), enough to confirm both traversal
+// itself and the two entry-point-seeding paths (implicit: none given,
+// falls back to `base`; explicit: an --seed-equivalent list) work without
+// any of base/module mode's extra structure appearing in the result.
+void testProgramModeTraversal() {
+  constexpr uint16_t kBase = 0x4268;
+  std::vector<uint8_t> image = {0xFD, 0xC8, 0x9A};  // psh a; rtn
+
+  auto rDefault = analyzeProgram(image, kBase);
+  CHECK(rDefault.labels.count(kBase) == 1);
+  CHECK(rDefault.kind[0] == ByteKind::CodeStart);       // psh a
+  CHECK(rDefault.kind[1] == ByteKind::CodeContinuation);  // psh a's 2nd byte
+  CHECK(rDefault.kind[2] == ByteKind::CodeStart);       // rtn
+  CHECK(rDefault.vectorEntries.empty());
+  CHECK(rDefault.baseKeywordTable.entries.empty());
+  CHECK(rDefault.moduleKeywordTables.empty());
+
+  // Explicit entry point (e.g. the --seed-driven CLI path) instead of the
+  // base-address default -- same traversal result either way here since
+  // there's only the one entry point in this tiny image, but confirms the
+  // explicit-list branch is actually taken (not silently ignored in favor
+  // of the base-address fallback).
+  auto rExplicit = analyzeProgram(image, kBase, {kBase});
+  CHECK(rExplicit.labels.count(kBase) == 1);
+  CHECK(rExplicit.kind[0] == ByteKind::CodeStart);
+  CHECK(rExplicit.kind[2] == ByteKind::CodeStart);
+}
+
+// Real ML routine (BASIC-POKEd at, and CALLed from, 0x4268 -- confirmed on
+// hardware): PSH A/X/Y/U, point X at 7875H and STA (clear it), SJP two ROM
+// routines, POP U/Y/X/A, RTN. Confirms a real program-mode file traverses
+// end to end with no gaps (every byte reached, no undefined-opcode wander)
+// and no base/module-mode structure leaks into the result.
+void testRealProgramFile() {
+  const std::string path = "C:/Users/paulc/Documents/PC1500/MLGetKeystrokesAndDisplay.bin";
+  std::vector<uint8_t> image = readFile(path);
+  if (image.empty()) {
+    std::printf("SKIP: testRealProgramFile -- file not found at its known location.\n");
+    return;
+  }
+  constexpr uint16_t kBase = 0x4268;
+  auto r = analyzeProgram(image, kBase);
+
+  CHECK(r.labels.count(kBase) == 1);
+  CHECK(r.vectorEntries.empty());
+  CHECK(r.baseKeywordTable.entries.empty());
+  CHECK(r.moduleKeywordTables.empty());
+  for (size_t i = 0; i < r.kind.size(); i++) {
+    CHECK(r.kind[i] != ByteKind::Unknown);
+  }
+  CHECK(r.kind.back() == ByteKind::CodeStart);  // the trailing RTN (0x9A)
+}
+
 }  // namespace
 
 int main() {
@@ -276,6 +331,8 @@ int main() {
   testSingleEntryTableAcceptedWithValidIndex();
   testSingleEntryTableRejectedWithoutValidIndex();
   testCe150RomKnownTable();
+  testProgramModeTraversal();
+  testRealProgramFile();
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

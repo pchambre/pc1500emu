@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "analyzer.h"
+#include "known_symbols.h"
 
 // Renders an AnalysisResult (classified bytes + recognized keyword/vector
 // tables) to sdas-syntax text, directly reassemblable by sdcc-pc1500's
@@ -18,6 +19,13 @@ struct FormatOptions {
   // showing the source address and raw bytes -- for human review, not
   // needed for reassembly.
   bool annotate = false;
+
+  // A --symbols-file's parsed contents (empty if none was given) --
+  // annotated the same way as known_symbols.cpp's built-in table (always
+  // on, "; NAME -- comment"), and checked ahead of it so a user entry can
+  // override a built-in one at the same address. See
+  // known_symbols.h's loadUserSymbolsFile/lookupSymbol.
+  std::vector<UserSymbol> userSymbols;
 };
 
 std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResult& result,

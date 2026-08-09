@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <optional>
 #include <sstream>
 
 #include "known_symbols.h"
@@ -81,15 +82,28 @@ std::string renderInstruction(const DecodedInstruction& d) {
 // Known-address documentation, always on (unlike --annotate's raw byte
 // dump) -- see known_symbols.h. Only op1 is checked: every two-operand
 // form in the opcode table (adi/ani/ori/bii/cpi/eai/ldi/lop) has an
-// immediate, never an address, in op2.
-std::string symbolComment(const DecodedInstruction& d) {
-  const KnownSymbol* sym = nullptr;
+// immediate, never an address, in op2. `userSymbols` (a --symbols-file's
+// contents, empty if none was given) is checked ahead of the built-in
+// table -- see lookupSymbol's own comment.
+//
+// Besides a direct Me0Abs/Me1Abs memory reference (e.g. LDA (addr)), a
+// branch/call target (Branch8, or JMP/SJP's Imm16 -- see isTargetSlot,
+// above) is checked too, via d.branchTarget rather than d.value1 -- same
+// distinction renderInstruction already makes when deciding whether to
+// render an operand as a label. Without this, an SJP to a known ROM
+// routine (e.g. E243H) would never get annotated at all, since the
+// routine's own address never appears as a labeled line in a small
+// program-mode image that doesn't include E243H's bytes.
+std::string symbolComment(const DecodedInstruction& d, const std::vector<UserSymbol>& userSymbols) {
+  std::optional<ResolvedSymbol> sym;
   if (d.op1 == Operand::Me0Abs) {
-    sym = findKnownSymbol(static_cast<uint16_t>(d.value1), /*me1=*/false);
+    sym = lookupSymbol(static_cast<uint16_t>(d.value1), /*me1=*/false, userSymbols);
   } else if (d.op1 == Operand::Me1Abs) {
-    sym = findKnownSymbol(static_cast<uint16_t>(d.value1), /*me1=*/true);
+    sym = lookupSymbol(static_cast<uint16_t>(d.value1), /*me1=*/true, userSymbols);
+  } else if (isTargetSlot(d, d.op1)) {
+    sym = lookupSymbol(d.branchTarget, /*me1=*/false, userSymbols);
   }
-  if (sym == nullptr) return "";
+  if (!sym) return "";
   return std::string("  ; ") + sym->name + " -- " + sym->comment;
 }
 
@@ -97,10 +111,10 @@ std::string symbolComment(const DecodedInstruction& d) {
 // (documentation only -- the label text itself is always L<hex>, never
 // renamed, so it stays a guaranteed-valid, guaranteed-unique sdas
 // identifier for reassembly).
-std::string labelLine(uint16_t addr) {
+std::string labelLine(uint16_t addr, const std::vector<UserSymbol>& userSymbols) {
   std::string line = label(addr) + ":";
-  const KnownSymbol* sym = findKnownSymbol(addr, /*me1=*/false);
-  if (sym != nullptr) {
+  std::optional<ResolvedSymbol> sym = lookupSymbol(addr, /*me1=*/false, userSymbols);
+  if (sym) {
     line += "  ; ";
     line += sym->name;
     line += " -- ";
@@ -142,13 +156,13 @@ void appendAnnotation(std::ostringstream& out, const FormatOptions& opts,
 }
 
 std::string renderKeywordTable(const std::vector<uint8_t>& image, uint16_t base,
-                                const KeywordTable& kt) {
+                                const KeywordTable& kt, const std::vector<UserSymbol>& userSymbols) {
   std::ostringstream out;
   bool haveIndex = kt.indexAddr >= base &&
                     (static_cast<size_t>(kt.indexAddr) + 52) <= base + image.size();
   if (haveIndex) {
     out << "; first-letter index\n";
-    out << labelLine(kt.indexAddr);
+    out << labelLine(kt.indexAddr, userSymbols);
     for (int letter = 0; letter < 26; letter++) {
       uint16_t addr = static_cast<uint16_t>(kt.indexAddr + letter * 2);
       uint16_t v = static_cast<uint16_t>((image[addr - base] << 8) | image[addr + 1 - base]);
@@ -157,7 +171,7 @@ std::string renderKeywordTable(const std::vector<uint8_t>& image, uint16_t base,
   }
   out << "; keyword table (marker/name/code/address per entry)\n";
   for (const auto& e : kt.entries) {
-    out << labelLine(e.markerAddr);
+    out << labelLine(e.markerAddr, userSymbols);
     out << "\t.db " << hex2((e.markerAddr < base ? 0 : image[e.markerAddr - base])) << "  ; marker (len="
         << e.name.size() << ")\n";
     out << "\t.ascii \"" << escapeAscii(e.name) << "\"\n";
@@ -186,7 +200,8 @@ std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResul
                        (static_cast<size_t>(kt.indexAddr) + 52) <= result.base + image.size())
                           ? kt.indexAddr
                           : kt.tableAddr;
-    specials.push_back({start, kt.endAddr, renderKeywordTable(image, result.base, kt)});
+    specials.push_back(
+        {start, kt.endAddr, renderKeywordTable(image, result.base, kt, options.userSymbols)});
   };
   addKeywordTableRegion(result.baseKeywordTable);
   for (const auto& kt : result.moduleKeywordTables) addKeywordTableRegion(kt);
@@ -254,10 +269,11 @@ std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResul
       // prompt, is normally reached only by falling through from the
       // preceding HLT-wake code, never jumped to directly) -- otherwise a
       // real, meaningful address could go entirely unlabeled.
-      if (result.labels.count(addr) || findKnownSymbol(addr, /*me1=*/false) != nullptr) {
-        out << labelLine(addr);
+      if (result.labels.count(addr) ||
+          lookupSymbol(addr, /*me1=*/false, options.userSymbols).has_value()) {
+        out << labelLine(addr, options.userSymbols);
       }
-      out << "\t" << renderInstruction(d) << symbolComment(d);
+      out << "\t" << renderInstruction(d) << symbolComment(d, options.userSymbols);
       appendAnnotation(out, options, image, result.base, addr, d.length);
       out << "\n";
       offset += static_cast<size_t>(d.length);
@@ -284,8 +300,9 @@ std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResul
     for (size_t i = 0; allPrintable && i < runLen; i++) {
       if (!isPrintable(image[runStart + i])) allPrintable = false;
     }
-    if (result.labels.count(runStartAddr) || findKnownSymbol(runStartAddr, /*me1=*/false) != nullptr) {
-      out << labelLine(runStartAddr);
+    if (result.labels.count(runStartAddr) ||
+        lookupSymbol(runStartAddr, /*me1=*/false, options.userSymbols).has_value()) {
+      out << labelLine(runStartAddr, options.userSymbols);
     }
     if (allPrintable) {
       std::string text(reinterpret_cast<const char*>(&image[runStart]), runLen);

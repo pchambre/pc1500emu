@@ -93,4 +93,14 @@ AnalysisResult analyzeBaseRom(const std::vector<uint8_t>& image, uint16_t base,
 AnalysisResult analyzeModuleRom(const std::vector<uint8_t>& image, uint16_t base,
                                  const std::vector<uint16_t>& extraSeeds = {});
 
+// Standalone-program mode: a BASIC-`POKE`d/`CALL`ed ML routine, with none
+// of base/module ROM's own structure (no reset/interrupt vectors, no
+// keyword table) to auto-seed from -- the only entry points are whatever
+// the caller already knows (typically just the `CALL` address, often the
+// same as `base` for a routine entered at its own load address). Pure
+// traversal from `entryPoints`, nothing else; if `entryPoints` is empty,
+// seeds from `base` alone, since that's the common case.
+AnalysisResult analyzeProgram(const std::vector<uint8_t>& image, uint16_t base,
+                               const std::vector<uint16_t>& entryPoints = {});
+
 }  // namespace pc1500::disasm

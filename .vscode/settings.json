@@ -14,5 +14,13 @@
   // fill in one of:
   //   WSL build:   wsl /home/<you>/sdcc-pc1500/sdcc/sdas/aslh5801/sdaslh5801
   //   MSYS2 build: C:/msys64/home/<you>/sdcc-pc1500/sdcc/sdas/aslh5801/sdaslh5801.exe
-  "lh5801.sdasCommand": ""
+  "lh5801.sdasCommand": "",
+
+  // Path to pc1500disasm(.exe), used by the lh5801-asm extension's
+  // "LH5801: Disassemble to ASM" command (right-click a .ROM/.BIN file in
+  // the Explorer, or run from the Command Palette). Unlike sdasCommand
+  // above, this one is built by this repo's own CMake build, so it has a
+  // real default here rather than being left blank -- adjust for Linux/Mac
+  // (drop the RelWithDebInfo path segment and the .exe: build/src/disasm/pc1500disasm).
+  "lh5801.disasmCommand": "${workspaceFolder}/build/src/disasm/RelWithDebInfo/pc1500disasm.exe"
 }
