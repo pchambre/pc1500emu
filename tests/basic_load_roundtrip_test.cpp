@@ -18,6 +18,7 @@
 // any other one.
 #include <cstdio>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -157,10 +158,198 @@ void testHexload1500RoundTrip() {
   }
 }
 
+// Loads `rom` and boots+settles a fresh Bus/CPU pair, ready for
+// typeBasicProgramText -- shared setup for every test below that needs a
+// live ROM (not just the file-round-trip test above, which inlines its
+// own copy since it predates this helper).
+struct BootedMachine {
+  pc1500::Keyboard keyboard;
+  pc1500::Bus bus{keyboard};
+  lh5801::CPU cpu{bus};
+  int cyclesSinceTimerTick = 0;
+};
+
+// extRam4800Bytes: emulated module RAM to install at the 4800H window
+// before boot (e.g. 0x2000 for an 8K module -- a real 1982-era hardware
+// option, see README's "Extension RAM (4800H)" section) -- the ROM only
+// detects installed extension RAM at reset/cold-start, not on the fly, so
+// this has to be set before the boot loop below runs, not after.
+std::unique_ptr<BootedMachine> bootAndSettle(const std::vector<uint8_t>& rom,
+                                              size_t extRam4800Bytes = 0) {
+  auto m = std::make_unique<BootedMachine>();
+  m->bus.loadME0(0xC000, rom.data(), rom.size());
+  if (extRam4800Bytes > 0) m->bus.setExtRam4800Size(extRam4800Bytes);
+  m->cpu.reset();
+  long bootCycles = 0;
+  auto stepOne = [&]() {
+    int c = m->cpu.step();
+    int used = (c > 0) ? c : 1;
+    bootCycles += used;
+    m->cyclesSinceTimerTick += used;
+    m->bus.advanceCycles(used);
+    while (m->cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+      m->cpu.tickTimer();
+      m->cyclesSinceTimerTick -= kCyclesPerTimerTick;
+    }
+  };
+  while (!m->cpu.halted() && bootCycles < 20'000'000) stepOne();
+  for (long i = 0; i < 4'000'000; i++) stepOne();
+  return m;
+}
+
+// A ~100-char single BASIC line with several colon-separated statements
+// (the real line 90 from the user's own Blackjack.bas, before it got
+// word-wrapped in transcription) -- needs 3 passes: the ordinary 79-char
+// fresh-line limit only fits the first few statements, and each
+// subsequent LIST-and-append pass has progressively less room as the
+// line's own stored (tokenized, compact) size grows. Exercises the
+// specific real-world case this feature exists for.
+void testLongLineMultiPass() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  if (rom.empty()) {
+    std::printf("SKIP: testLongLineMultiPass -- ROM1.BIN not found.\n");
+    return;
+  }
+  auto m = bootAndSettle(rom);
+  std::string longLine =
+      "90 \"1\":C=C+D:E=INT (C/256):POKE B,E:POKE B+1,C-(E*256):PRINT C:CURSOR 5:"
+      "B=B+(PEEK (B+2))+3";
+  CHECK(longLine.size() > 79);
+
+  std::string loadError;
+  bool loaded = pc1500::basic::typeBasicProgramText(m->bus, m->cpu, longLine, kCyclesPerFrame,
+                                                     kCyclesPerTimerTick, &loadError);
+  CHECK(loaded);
+  if (!loaded) {
+    std::printf("  loadError: %s\n", loadError.c_str());
+    return;
+  }
+
+  std::string saveError;
+  std::vector<uint8_t> tokenized = pc1500::basic::readBasicProgramBytes(m->bus, &saveError);
+  std::string detok;
+  CHECK(pc1500::basic::detokenizeBasicProgram(tokenized, &detok, &saveError));
+  CHECK(stripSpaces(detok).find(stripSpaces(longLine)) != std::string::npos);
+  if (stripSpaces(detok).find(stripSpaces(longLine)) == std::string::npos) {
+    std::printf("  detok: %s\n", detok.c_str());
+  }
+}
+
+// A colon *inside* a quoted string, in a line otherwise long enough to
+// need a second pass -- the segment splitter must not treat that colon
+// as a statement boundary (which would produce an unterminated string in
+// one pass and a syntactically-nonsensical fragment in the next).
+void testLongLineColonInsideQuotes() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  if (rom.empty()) {
+    std::printf("SKIP: testLongLineColonInsideQuotes -- ROM1.BIN not found.\n");
+    return;
+  }
+  auto m = bootAndSettle(rom);
+  // "A:B" (colon inside quotes) followed by enough padding statements to
+  // force a second pass. Uses PRINT (tokenizes well) rather than bare
+  // assignments for the padding -- bare "Y0=1"-style statements barely
+  // compress at all, so enough of them to push the *raw* length over 79
+  // pushes the final *tokenized* size over the (also empirically
+  // confirmed, see kContinuationPassBudget) ~78-byte ceiling on a single
+  // line's total stored content, which is a real hardware limit no
+  // amount of extra passes can work around -- not a bug, but also not
+  // what this test is trying to exercise, so avoid it here.
+  std::string longLine = "10 INPUT \"A:B\";X";
+  for (int i = 0; i < 8; i++) longLine += ":PRINT \"Y" + std::to_string(i) + "\"";
+  CHECK(longLine.size() > 79);
+
+  std::string loadError;
+  bool loaded = pc1500::basic::typeBasicProgramText(m->bus, m->cpu, longLine, kCyclesPerFrame,
+                                                     kCyclesPerTimerTick, &loadError);
+  CHECK(loaded);
+  if (!loaded) {
+    std::printf("  loadError: %s\n", loadError.c_str());
+    return;
+  }
+  std::string saveError;
+  std::vector<uint8_t> tokenized = pc1500::basic::readBasicProgramBytes(m->bus, &saveError);
+  std::string detok;
+  CHECK(pc1500::basic::detokenizeBasicProgram(tokenized, &detok, &saveError));
+  CHECK(detok.find("A:B") != std::string::npos);
+}
+
+// A single statement (no colon anywhere) longer than any one pass could
+// ever fit -- there's no valid split point, so this must fail cleanly
+// with a clear error rather than silently truncating or corrupting the
+// program area.
+void testLongLineUnsplittableFails() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  if (rom.empty()) {
+    std::printf("SKIP: testLongLineUnsplittableFails -- ROM1.BIN not found.\n");
+    return;
+  }
+  auto m = bootAndSettle(rom);
+  std::string longLine = "10 PRINT \"" + std::string(100, 'X') + "\"";
+  CHECK(longLine.size() > 79);
+
+  std::string loadError;
+  bool loaded = pc1500::basic::typeBasicProgramText(m->bus, m->cpu, longLine, kCyclesPerFrame,
+                                                     kCyclesPerTimerTick, &loadError);
+  CHECK(!loaded);
+  CHECK(!loadError.empty());
+}
+
+// The user's own real-world file (following this project's established
+// "skip if not present at its known local path" convention, same as
+// ROM1.BIN/hexload1500.bas/CE-150.ROM): 24 genuine long lines (80-108
+// chars) from a real 1984 listing, none of them synthetic test data. The
+// full program's tokenized size doesn't fit in the stock 2K of built-in
+// RAM (confirmed: the ROM's own memory-full rejection fires partway
+// through line 670) -- a real capacity limit, not a bug in the long-line
+// typing feature -- so this boots with an emulated 8K expansion module at
+// the 4800H window (a real 1982-era hardware option), matching what a
+// real owner running a program this size would have needed.
+void testBlackjackRoundTrip() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kBasPath = "C:/Users/paulc/Documents/PC1500/Blackjack.bas";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> originalBytes = readFile(kBasPath);
+  if (rom.empty() || originalBytes.empty()) {
+    std::printf("SKIP: testBlackjackRoundTrip -- ROM1.BIN and/or Blackjack.bas not found.\n");
+    return;
+  }
+  std::string original(originalBytes.begin(), originalBytes.end());
+  auto m = bootAndSettle(rom, 0x2000);
+
+  std::string loadError;
+  bool loaded = pc1500::basic::typeBasicProgramText(m->bus, m->cpu, original, kCyclesPerFrame,
+                                                     kCyclesPerTimerTick, &loadError);
+  CHECK(loaded);
+  if (!loaded) {
+    std::printf("  loadError: %s\n", loadError.c_str());
+    return;
+  }
+
+  std::string saveError;
+  std::vector<uint8_t> tokenized = pc1500::basic::readBasicProgramBytes(m->bus, &saveError);
+  CHECK(!tokenized.empty());
+  std::string roundTripped;
+  CHECK(pc1500::basic::detokenizeBasicProgram(tokenized, &roundTripped, &saveError));
+  CHECK(stripSpaces(roundTripped) == stripSpaces(original));
+  if (stripSpaces(roundTripped) != stripSpaces(original)) {
+    std::printf("---- original (spaces stripped) ----\n%s\n", stripSpaces(original).c_str());
+    std::printf("---- round-tripped (spaces stripped) ----\n%s\n",
+                stripSpaces(roundTripped).c_str());
+  }
+}
+
 }  // namespace
 
 int main() {
   testHexload1500RoundTrip();
+  testLongLineMultiPass();
+  testLongLineColonInsideQuotes();
+  testLongLineUnsplittableFails();
+  testBlackjackRoundTrip();
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

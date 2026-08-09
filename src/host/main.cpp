@@ -3120,6 +3120,21 @@ int main(int argc, char** argv) {
         bool doAction = ImGui::Button(actionLabel);
         ImGui::SameLine();
         bool doCancel = ImGui::Button("Cancel");
+        // Enter submits, Escape cancels -- every dialog except
+        // LoadBasicText, where Enter has to stay a plain newline while
+        // typing/editing the BASIC program text (the multiline InputText,
+        // above) rather than immediately submitting mid-edit. Raw
+        // IsKeyPressed (not the Shortcut()/routing API the menu-bar
+        // shortcuts use) is deliberate: it fires regardless of which field
+        // currently has focus, matching a standard OK/Cancel dialog.
+        if (activeDialog != ActiveDialog::LoadBasicText &&
+            (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+             ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))) {
+          doAction = true;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+          doCancel = true;
+        }
         if (doAction) {
           bool ok = false;
           switch (activeDialog) {

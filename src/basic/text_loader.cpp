@@ -2,12 +2,149 @@
 // Version 2.0 -- see LICENSE.
 #include "text_loader.h"
 
+#include <cctype>
 #include <fstream>
 #include <sstream>
 
 #include "basic_text.h"
 
 namespace pc1500::basic {
+
+namespace {
+
+// Splits a source line's content (i.e. with the leading line number and
+// its separating space already removed -- see splitLineNumber) into
+// atoms -- minimal chunks that are never safe to split in the middle of,
+// so any run of adjacent atoms can be typed together and ENTERed as one
+// pass. Confirmed on real hardware (Paul, 2026-08-09): a line does NOT
+// need to be a complete/valid statement to be typed and tokenized in one
+// pass -- e.g. `IF O=72` can be entered on its own, then resumed and
+// extended with `OR O=13`, etc. -- so the old colon-only splitting was
+// unnecessarily conservative (it made a single long colon-free statement,
+// e.g. a chain of `X=NOR Y=N...THEN`, look unsplittable when it isn't).
+// The only real constraint is not to cut a single lexeme in half:
+//   - a quoted string literal (through its closing quote, or to end of
+//     content if unterminated) is one atom
+//   - a maximal run of letters/digits (keyword, identifier, or number --
+//     these aren't distinguished from each other, since it's never safe
+//     to split any of them internally either way) is one atom
+//   - a two-character relational operator (<=, >=, <>) is one atom
+//   - every other character (spaces, other operators/punctuation,
+//     including ':') is its own one-character atom
+// Concatenating all returned atoms reproduces `content` exactly.
+std::vector<std::string> splitIntoAtoms(const std::string& content) {
+  std::vector<std::string> atoms;
+  size_t i = 0;
+  while (i < content.size()) {
+    char c = content[i];
+    if (c == '"') {
+      size_t start = i++;
+      while (i < content.size() && content[i] != '"') i++;
+      if (i < content.size()) i++;  // include closing quote
+      atoms.push_back(content.substr(start, i - start));
+      continue;
+    }
+    if (std::isalnum(static_cast<unsigned char>(c))) {
+      size_t start = i;
+      while (i < content.size() && std::isalnum(static_cast<unsigned char>(content[i]))) i++;
+      atoms.push_back(content.substr(start, i - start));
+      continue;
+    }
+    if ((c == '<' || c == '>') && i + 1 < content.size() &&
+        (content[i + 1] == '=' || (c == '<' && content[i + 1] == '>'))) {
+      atoms.push_back(content.substr(i, 2));
+      i += 2;
+      continue;
+    }
+    atoms.push_back(std::string(1, c));
+    i++;
+  }
+  return atoms;
+}
+
+// Splits a source line into its leading numeric line number and
+// everything after it, skipping at most one separating space (matching
+// this project's own typing convention, "10 PRINT ..." -- not required
+// if the source line has none). False if `line` doesn't start with a
+// digit at all.
+bool splitLineNumber(const std::string& line, std::string* numberStr, std::string* content) {
+  size_t i = 0;
+  while (i < line.size() && line[i] >= '0' && line[i] <= '9') i++;
+  if (i == 0) return false;
+  *numberStr = line.substr(0, i);
+  size_t contentStart = i;
+  if (contentStart < line.size() && line[contentStart] == ' ') contentStart++;
+  *content = line.substr(contentStart);
+  return true;
+}
+
+// Walks the line-record chain (same layout findBasicProgramEnd/
+// readBasicProgramBytes use: repeated [2-byte line#][1-byte size]
+// [content...]) looking for the record whose line# field equals
+// `lineNumber`. Returns the record's own start address (the line#'s
+// address, not the content's) via *outAddr; false if not found (the
+// program's own 0xFFH end marker was reached first).
+bool findLineRecord(pc1500::Bus& bus, uint16_t lineNumber, uint32_t* outAddr) {
+  uint32_t addr = kBasicProgramStart;
+  while (addr <= 0xFFFF) {
+    uint8_t hi = bus.readME0(static_cast<uint16_t>(addr));
+    if (hi == 0xFF) return false;
+    if (addr + 2 > 0xFFFF) return false;
+    uint8_t lo = bus.readME0(static_cast<uint16_t>(addr + 1));
+    uint16_t thisLineNumber = static_cast<uint16_t>((hi << 8) | lo);
+    uint8_t lineSize = bus.readME0(static_cast<uint16_t>(addr + 2));
+    if (thisLineNumber == lineNumber) {
+      *outAddr = addr;
+      return true;
+    }
+    addr += 3 + lineSize;
+  }
+  return false;
+}
+
+// Reads one line's current stored bytes in isolation (not the whole
+// program) and detokenizes them, for verifying a long line's multi-pass
+// append actually landed -- see typeBasicProgramText's typeLongLine.
+// Wraps the single record in a synthetic one-line "program" (the record
+// itself plus a trailing 0xFFH) since detokenizeBasicProgram expects a
+// full program blob, not a bare record.
+std::string detokenizeStoredLine(pc1500::Bus& bus, uint16_t lineNumber, std::string* error) {
+  uint32_t addr = 0;
+  if (!findLineRecord(bus, lineNumber, &addr)) {
+    *error = "line " + std::to_string(lineNumber) + " not found";
+    return "";
+  }
+  uint8_t lineSize = bus.readME0(static_cast<uint16_t>(addr + 2));
+  std::vector<uint8_t> blob;
+  blob.reserve(static_cast<size_t>(lineSize) + 4);
+  blob.push_back(bus.readME0(static_cast<uint16_t>(addr)));
+  blob.push_back(bus.readME0(static_cast<uint16_t>(addr + 1)));
+  blob.push_back(lineSize);
+  for (int i = 0; i < lineSize; i++) {
+    blob.push_back(bus.readME0(static_cast<uint16_t>(addr + 3 + i)));
+  }
+  blob.push_back(0xFF);
+  std::string text;
+  if (!detokenizeBasicProgram(blob, &text, error)) return "";
+  return text;
+}
+
+// Collapses whitespace for a content-only comparison -- the ROM's
+// tokenize/detokenize pass doesn't preserve spacing exactly (confirmed,
+// see typeBasicProgramText's own header comment and
+// tests/basic_load_roundtrip_test.cpp's identically-purposed stripSpaces),
+// so a byte-exact substring check would false-fail on cosmetic-only
+// differences.
+std::string stripSpacesForCompare(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    if (c != ' ' && c != '\t' && c != '\n' && c != '\r') out.push_back(c);
+  }
+  return out;
+}
+
+}  // namespace
 
 bool charToTapActions(char c, std::deque<QueuedKeyAction>* out) {
   pc1500::Key direct{};
@@ -227,6 +364,208 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
     runKeyAction({pc1500::Key::Cl, true, kTapFrames});
     runKeyAction({pc1500::Key::Cl, false, kIdleFrames});
   };
+  auto pressRight = [&]() {
+    runKeyAction({pc1500::Key::Right, true, kTapFrames});
+    runKeyAction({pc1500::Key::Right, false, kIdleFrames});
+  };
+  // 90 is well past any line length this project supports (max ~a few
+  // hundred bytes of stored content) -- confirmed on real hardware that
+  // Right Arrow simply stops advancing once at the true end of a line's
+  // content, regardless of how many more times it's pressed, so
+  // over-pressing here is safe rather than needing to compute/detect the
+  // exact redisplayed length.
+  auto navigateToLineEnd = [&]() {
+    for (int i = 0; i < 90; i++) pressRight();
+  };
+
+  // The PC-1500's continuation-pass budget: a resumed edit pass's own
+  // newly-typed raw characters, added to the line's *current stored* size
+  // (read directly from bus memory -- this project's automation has that
+  // ground truth available, unlike a human typing on real hardware, so
+  // there's no need to estimate the redisplayed/detokenized length at
+  // all), roughly must not exceed this -- used only to decide how many
+  // atoms to *try* packing into a pass. It's a starting estimate, not an
+  // exact boundary: empirically (2026-08-09, headless tests against a
+  // real ROM dump) the true cutoff turned out to vary by a character or
+  // two between otherwise-similar cases (e.g. Blackjack.bas line 670
+  // accepted a storedSize 71 + 6-char append at total 77, but line 1270
+  // silently dropped the last character of a storedSize 65 + 12-char
+  // append, also at total 77) -- so rather than chase an exact constant,
+  // typeLongLine detects a short append below and resumes typing exactly
+  // where it left off instead of trusting this number to be precise.
+  constexpr int kContinuationPassBudget = 77;
+
+  // Finds the longest prefix of `attempted` that actually made it into
+  // `detok` (space-tolerant, matching the check the caller already does
+  // to decide pass/fail) -- used to recover from a pass that got
+  // partially, silently truncated by the ROM's own input buffer instead
+  // of failing outright.
+  auto longestAcceptedPrefixLen = [&](const std::string& detok,
+                                       const std::string& attempted) -> size_t {
+    std::string detokStripped = stripSpacesForCompare(detok);
+    for (size_t len = attempted.size(); len > 0; len--) {
+      if (detokStripped.find(stripSpacesForCompare(attempted.substr(0, len))) !=
+          std::string::npos) {
+        return len;
+      }
+    }
+    return 0;
+  };
+
+  // Types one source-text line whose raw length exceeds the ROM's
+  // single-pass 79-character input limit, across multiple LIST-and-append
+  // editing passes -- the real technique PC-1500 users used to enter
+  // lines whose *tokenized* stored size exceeds what any single raw
+  // input burst could produce (tokenization compresses keywords, so a
+  // line's stored size can keep growing well past 79 across passes even
+  // though each individual pass's raw typing stays under the cap). A
+  // line does not need to be a complete/valid statement at the end of any
+  // given pass -- confirmed on real hardware -- so passes split at atom
+  // boundaries (see splitIntoAtoms), not just at colons.
+  //
+  // Pass 1 packs as many whole atoms as fit in the ordinary 79-char
+  // fresh-line limit. Each subsequent pass reads the line's real current
+  // stored size, computes exactly how much raw-char room is left under
+  // kContinuationPassBudget, and packs as many more whole atoms as fit --
+  // then LISTs the line back up, navigates to its end, types the packed
+  // atoms, and presses Enter again. After every pass (including pass 1,
+  // via the same beforeEnd/afterEnd check the short-line path below
+  // uses), and additionally after every continuation pass specifically,
+  // the freshly-stored line is detokenized and checked to actually
+  // contain what was just typed -- a safety net independent of the
+  // budget arithmetic above being exactly right, since a
+  // silently-truncated append is otherwise indistinguishable from a
+  // normally-compact tokenization (both make stored size grow by less
+  // than what was typed).
+  auto typeLongLine = [&](const std::string& fullLine) -> bool {
+    std::string numberStr, content;
+    if (!splitLineNumber(fullLine, &numberStr, &content)) {
+      *error = "long line has no leading line number, can't resume-edit it: " + fullLine;
+      return false;
+    }
+    uint16_t lineNumber = static_cast<uint16_t>(std::stoul(numberStr));
+    std::vector<std::string> segments = splitIntoAtoms(content);
+
+    size_t segIdx = 0;
+    std::string pass1Text = numberStr + " ";
+    while (segIdx < segments.size() && pass1Text.size() + segments[segIdx].size() <= 79) {
+      pass1Text += segments[segIdx];
+      segIdx++;
+    }
+    if (segIdx == 0) {
+      *error = "line " + numberStr +
+               " has a single unsplittable token too long to enter even as the first pass: " +
+               segments[0];
+      return false;
+    }
+    for (char c : pass1Text) {
+      if (!typeChar(c)) {
+        *error = "no keystroke mapping for character '" + std::string(1, c) + "' in line: " + fullLine;
+        return false;
+      }
+    }
+    pressEnter();
+    stepCycles(4L * kIdleFrames * cyclesPerFrame);
+    {
+      std::string verifyError;
+      std::string detok = detokenizeStoredLine(bus, lineNumber, &verifyError);
+      if (stripSpacesForCompare(detok).find(stripSpacesForCompare(pass1Text)) == std::string::npos) {
+        *error = "line " + numberStr + ": first pass wasn't accepted (rejected by the ROM?): " +
+                 pass1Text;
+        return false;
+      }
+    }
+
+    // `carry`: leftover text from a pass that got partially, silently
+    // truncated by the ROM -- must be retyped (from exactly where it left
+    // off) before any further atoms are packed. Non-empty only while
+    // recovering from a short append; `carryTargetIdx` is the segIdx a
+    // fully-accepted carry represents (i.e. what segIdx becomes once
+    // carry is completely flushed).
+    std::string carry;
+    size_t carryTargetIdx = segIdx;
+    int carryStalls = 0;
+    while (segIdx < segments.size() || !carry.empty()) {
+      std::string passText;
+      size_t startIdx = segIdx;
+      if (!carry.empty()) {
+        passText = carry;
+      } else {
+        uint32_t addr = 0;
+        if (!findLineRecord(bus, lineNumber, &addr)) {
+          *error = "line " + numberStr + " not found after a previous pass";
+          return false;
+        }
+        int storedSize = bus.readME0(static_cast<uint16_t>(addr + 2));
+        int room = kContinuationPassBudget - storedSize;
+        if (room <= 0) {
+          *error = "line " + numberStr + " has no room left (stored size " +
+                   std::to_string(storedSize) + ") to append: " + segments[segIdx];
+          return false;
+        }
+        while (segIdx < segments.size() &&
+               static_cast<int>(passText.size() + segments[segIdx].size()) <= room) {
+          passText += segments[segIdx];
+          segIdx++;
+        }
+        if (segIdx == startIdx) {
+          *error = "line " + numberStr + "'s next token doesn't fit in the " +
+                   std::to_string(room) + " characters left this pass: " + segments[segIdx];
+          return false;
+        }
+        carryTargetIdx = segIdx;
+        segIdx = startIdx;  // only committed once this pass is confirmed below
+      }
+
+      for (char c : std::string("LIST ") + numberStr) {
+        if (!typeChar(c)) {
+          *error = "no keystroke mapping for character '" + std::string(1, c) + "'";
+          return false;
+        }
+      }
+      pressEnter();
+      stepCycles(4L * kIdleFrames * cyclesPerFrame);
+      navigateToLineEnd();
+      for (char c : passText) {
+        if (!typeChar(c)) {
+          *error = "no keystroke mapping for character '" + std::string(1, c) + "' in line: " + fullLine;
+          return false;
+        }
+      }
+      pressEnter();
+      stepCycles(4L * kIdleFrames * cyclesPerFrame);
+
+      std::string verifyError;
+      std::string detok = detokenizeStoredLine(bus, lineNumber, &verifyError);
+      size_t acceptedLen = detok.empty() ? 0 : longestAcceptedPrefixLen(detok, passText);
+      if (acceptedLen >= passText.size()) {
+        // Fully accepted: commit the atoms this pass represented.
+        carry.clear();
+        segIdx = carryTargetIdx;
+        continue;
+      }
+      // Partially (or not at all) accepted -- the ROM's own input buffer
+      // silently dropped the tail rather than rejecting the pass outright
+      // (confirmed: this can cut mid-keyword, e.g. "GOSUB" -> "GOSU").
+      // Resume from exactly where it left off, without needing to know
+      // the precise cutoff in advance.
+      std::string remainder = passText.substr(acceptedLen);
+      if (remainder.size() == carry.size() && remainder == carry) {
+        carryStalls++;
+      } else {
+        carryStalls = 0;
+      }
+      carry = remainder;
+      segIdx = startIdx;
+      if (carryStalls > 5) {
+        *error = "line " + numberStr + ": append of '" + passText +
+                 "' made no progress after repeated retries (likely silently truncated) -- "
+                 "stored line now reads: " + detok;
+        return false;
+      }
+    }
+    return true;
+  };
 
   // The ROM boots (and returns after certain operations) to a state that
   // doesn't respond to typed characters until CL is pressed once --
@@ -259,12 +598,16 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
 
     // The ROM's own line editor has a hard 79-character input limit
     // (confirmed empirically: an 80-character line has its 80th character
-    // and everything after it silently dropped, with no error shown).
+    // and everything after it silently dropped, with no error shown) --
+    // but a line's *tokenized* stored size can still exceed that, via the
+    // real multi-pass LIST-and-append technique typeLongLine implements
+    // (see its own comment). Only a truly unsplittable line (a single
+    // atom -- e.g. one identifier or a quoted string -- longer than any
+    // single pass could ever fit) still fails outright, from inside
+    // typeLongLine itself.
     if (line.size() > 79) {
-      *error = "line exceeds the PC-1500's 79-character input limit (" +
-               std::to_string(line.size()) + " chars) and would be silently truncated by the "
-               "ROM -- split it into multiple lines: " + line;
-      return false;
+      if (!typeLongLine(line)) return false;
+      continue;
     }
 
     uint32_t beforeEnd = findBasicProgramEnd(bus);

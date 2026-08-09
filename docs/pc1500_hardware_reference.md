@@ -374,6 +374,83 @@ this list, with two loose ends:
 IN0-IN2 (PA2: `1,4,7`; PA0: `2,5,8`; PA7: `3,6,9`) — the classic
 calculator-style digit pad.
 
+## BASIC line editor
+
+Confirmed facts about the ROM's own line editor, gathered while building
+`typeBasicProgramText`'s support for source lines longer than the raw
+79-character input limit (`src/basic/text_loader.cpp`) -- this project
+had zero documentation of BASIC line-editor UI behavior before this.
+
+- **Hard 79-character raw-input limit on a fresh line.** Typing (or
+  pasting, via this project's automation) more than 79 characters before
+  Enter silently drops the 80th character onward, with no error shown.
+  This is on the *raw, not-yet-tokenized* input buffer -- confirmed
+  distinct from the line's final *stored* (tokenized) size, which can end
+  up much larger via the multi-pass technique below.
+- **Resuming edit on an already-stored line**: `LIST <line#>` + Enter
+  redisplays that line's *detokenized* text as editable. Typing a bare
+  line number + Enter instead **deletes** that line -- not a re-edit
+  trick.
+- **Cursor position on redisplay**: lands at the very start of the line's
+  content (right after the line number), invisible until moved.
+- **Reaching the end of a redisplayed line**: press Right Arrow
+  repeatedly. Once genuinely at the end, further presses are a safe
+  no-op -- confirmed on real hardware that the cursor simply stops
+  advancing, "regardless of line length," so over-pressing (e.g. 90 times,
+  comfortably past any line this project produces) is a safe way to reach
+  the end without needing to compute or detect the exact redisplayed
+  length. Holding the key down (auto-repeat) changes the cursor glyph from
+  a block to an underscore; if already at true end-of-line, the underscore
+  replaces the last character instead of appearing after it -- a real,
+  human-visible tell, not modeled by this project's automation since it
+  doesn't need to *see* the cursor, only reach the end reliably.
+- **A line does not need to be a syntactically complete statement to be
+  typed and tokenized.** E.g. `10 IF O=72` can be entered and Enter'd on
+  its own (mid-condition, no `THEN`), then resumed via `LIST 10` and
+  extended with `OR O=13`, and so on -- syntax is only checked at `RUN`
+  time, not at Enter time. This means a pass can split *anywhere* a
+  lexeme boundary allows (not just at colons between statements) --
+  `typeLongLine`'s atom splitter (`splitIntoAtoms`) treats a quoted string,
+  a run of letters/digits (keyword/identifier/number -- these aren't
+  distinguished, since none are safe to split internally), or a `<=`/`>=`/
+  `<>` operator as the smallest unbreakable unit, and packs whole atoms
+  per pass; every other character (including `:`) is its own atom.
+- **Continuation-pass budget is measured against stored size, not
+  redisplayed length.** A resumed pass's own newly-typed raw characters,
+  added to the line's *current stored* size (the `lineSize` byte in its
+  on-disk record -- see the reserve-area note above for the record
+  layout), is what's capped -- not the redisplayed/detokenized text length,
+  which can already exceed 79 characters on screen once earlier keywords
+  have been tokenized down to their compact 1-2-byte codes. Empirically
+  (2026-08-09, headless tests against a real ROM dump) this cap sits
+  around 77-78, but doesn't land on an exact, reproducible constant: two
+  real cases from a 1984 listing (`Blackjack.bas`) with the same total
+  (stored size + new characters = 77) landed on opposite sides -- one
+  accepted in full, the other silently dropped its last character,
+  mid-keyword (`GOSUB` -> `GOSU`). Since a fixed constant can't capture
+  this precisely, `typeLongLine` treats its budget as an estimate only:
+  after each pass it detokenizes the line and finds the longest prefix of
+  what it just typed that actually landed; if short, it retypes exactly
+  the missing remainder as the next pass (via the same `LIST`+navigate
+  sequence) rather than trusting the estimate to be exact.
+- **A single BASIC line's total stored size is capped independent of how
+  many passes are used** (an emergent consequence of the budget above
+  applying fresh on every pass) -- content that doesn't tokenize well
+  (e.g. bare variable assignments, which stay almost 1:1 with raw
+  characters) hits this ceiling in far fewer raw characters than
+  keyword-dense content.
+- **A program's total tokenized size is still capped by installed RAM,
+  same as real hardware.** The stock PC-1500 has 2K of built-in RAM
+  (`4000H`-`47FFH`, see the memory map above); a large real-world listing
+  can exceed that once fully tokenized (confirmed: `Blackjack.bas` hits
+  the ROM's own memory-full rejection partway through re-entering a line
+  once the program has grown to just past `47D3H`). This is expected,
+  correct ROM behavior, not a loader bug -- a real owner running a
+  program this size needed an expansion module (Settings > Extension RAM
+  (4800H) in this emulator; 4K/8K were real 1982-era options), which the
+  ROM only detects at reset/cold-start, not on the fly, so it has to be
+  configured *before* booting/typing, not after.
+
 ## LCD
 
 - Physical display: **LF8082GE**, a 7×156 dot multi-display module (7 rows

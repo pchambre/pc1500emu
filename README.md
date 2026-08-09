@@ -131,11 +131,16 @@ native OS menu) sits above the display:
   simulated keystrokes (so it's the real ROM tokenizing, not a
   reimplementation) — type or paste a listing into the text box, or load
   it from a file first, then click Load; any line the ROM doesn't accept
-  is reported by number/content rather than silently dropped. *Save*
-  detokenizes the current program into the text box using this project's
-  own keyword table (`src/basic/`); its spacing is our own readable
-  convention, not necessarily byte-for-byte identical to a real device's
-  `LIST` output. Either box can be copied to/from the clipboard.
+  is reported by number/content rather than silently dropped. A source
+  line longer than the ROM's 79-character raw-input limit is entered
+  across multiple LIST-and-append editing passes, the same technique real
+  PC-1500 owners used to enter lines whose *tokenized* size exceeds what
+  any single typed burst could produce — see the `loadbasictext` FIFO
+  command entry below for how this works. *Save* detokenizes the current
+  program into the text box using this project's own keyword table
+  (`src/basic/`); its spacing is our own readable convention, not
+  necessarily byte-for-byte identical to a real device's `LIST` output.
+  Either box can be copied to/from the clipboard.
 - **File > Load/Save Binary...** — a raw `[address, address+length)` ME0
   byte range plus a filename, matching real `CLOAD M`/`CSAVE M` semantics.
   Load has an optional "call after load" checkbox (sets the CPU's `P`
@@ -220,12 +225,26 @@ Commands:
   File menu section above) by stepping CPU/bus cycles directly rather than
   the real-time `type`/`key` queue, so it completes in well under a second
   regardless of program size; a returned `ERROR: N line(s) rejected...`
-  lists which lines the ROM didn't accept. Any line longer than 79
-  characters is rejected up front with a clear error instead of being
-  typed — the ROM's own line editor has a hard 79-character input limit
-  and silently drops everything past it with no error shown, so without
-  this check a too-long line would appear to load successfully while
-  actually being truncated.
+  lists which lines the ROM didn't accept. The ROM's own line editor has a
+  hard 79-character raw-input limit and silently drops everything past it
+  with no error shown, so a source line over 79 characters is entered
+  across multiple passes instead: type up to the ROM's own limit and
+  press Enter (tokenizing what's typed so far, which doesn't need to be a
+  complete/valid statement), then `LIST <line#>`, jump to the end of the
+  redisplayed line, and type more — repeating until the whole line is in.
+  Each pass's raw typing is capped not against the line's on-screen
+  length (which can already exceed 79 characters once earlier keywords
+  are tokenized) but against the line's actual current *stored* size,
+  read directly from bus memory; if the ROM's input buffer still silently
+  drops a character or two near that estimate, the same pass is retried
+  with whatever was actually accepted, picking up exactly where it left
+  off, rather than trusting the estimate to be exact. Only a single
+  unsplittable token (e.g. one identifier or a quoted string longer than
+  79 characters on its own) still fails outright, with a clear error. A
+  program whose total tokenized size exceeds the PC-1500's built-in 2K of
+  RAM needs an emulated expansion module (Settings > Extension RAM) to
+  load in full, same as on real hardware — see
+  `docs/pc1500_hardware_reference.md`'s "BASIC line editor" section.
 - `break [cycles]` — scriptable equivalent of pressing the physical ON key
   (F12) while a program is running: sets the ON-key line (which latches IF
   register bit `0x02`, confirmed shared with the RTC's TP edge -- see
