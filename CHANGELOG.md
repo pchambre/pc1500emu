@@ -4,7 +4,7 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
-## [0.6.0] - Unreleased
+## [0.6.0] - 2026-08-09
 
 ### Added
 - "Load BASIC Text" now supports source lines longer than the ROM's
@@ -13,9 +13,17 @@ per this project's own convention (not just milestones).
   Enter, then resume editing the same line to append more, repeating as
   needed. See `docs/pc1500_hardware_reference.md`'s "BASIC line editor"
   section for the confirmed mechanics this is built on.
+- "Load BASIC Text" shows a "Loading..." indicator (and a wait cursor)
+  while a long listing is being typed in, instead of appearing to hang.
 - Enter/Escape keyboard shortcuts for dialogs: Enter triggers the primary
   action (Load, Save, etc.) on every dialog except "Load BASIC Text";
-  Escape triggers Cancel on all dialogs.
+  Escape triggers Cancel on all dialogs. Escape also closes an open menu.
+- Keyboard shortcuts for actions that previously required the mouse:
+  Ctrl+Alt+O/S for Load/Save BASIC Text, Ctrl+Alt+A for Automation Mode,
+  Ctrl+Alt+P for the status panel.
+- Extension RAM size (both the 4800H and 0000H windows) is now remembered
+  across restarts, via the same conf file as the other Settings-menu
+  options.
 
 ### Fixed
 - macOS: indicator font path no longer hardcodes a Linux-only location;
@@ -25,6 +33,11 @@ per this project's own convention (not just milestones).
 - Checking "Auto-Save State on Exit" with no state file ever explicitly
   loaded/saved now defaults to `pc1500emu.state` in the current directory,
   instead of silently doing nothing at exit.
+- "Load BASIC Text": the button that reads the Filename field's path into
+  the text box is now labeled "Read File" (previously "Load File into
+  Text") and stays disabled until a filename is entered. Clicking Load
+  after typing or pasting a filename, without pressing Read File first,
+  now reads that file automatically.
 
 ## [0.5.1] - 2026-08-09
 

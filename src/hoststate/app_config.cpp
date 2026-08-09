@@ -52,6 +52,8 @@ bool loadAppConfig(const std::string& path, AppConfig* out, std::string* error) 
   out->autoLoadOnStart = j.value("autoLoadOnStart", true);
   out->autoSaveOnExit = j.value("autoSaveOnExit", false);
   out->showStatusPanel = j.value("showStatusPanel", false);
+  out->extRam4800Bytes = j.value("extRam4800Bytes", static_cast<size_t>(0));
+  out->extRam0000Bytes = j.value("extRam0000Bytes", static_cast<size_t>(0));
   return true;
 }
 
@@ -62,6 +64,8 @@ bool saveAppConfig(const AppConfig& config, const std::string& path, std::string
   j["autoLoadOnStart"] = config.autoLoadOnStart;
   j["autoSaveOnExit"] = config.autoSaveOnExit;
   j["showStatusPanel"] = config.showStatusPanel;
+  j["extRam4800Bytes"] = config.extRam4800Bytes;
+  j["extRam0000Bytes"] = config.extRam0000Bytes;
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) {

@@ -44,6 +44,8 @@ void testRoundTrip() {
   config.autoLoadOnStart = false;
   config.autoSaveOnExit = true;
   config.showStatusPanel = true;
+  config.extRam4800Bytes = 0x2000;
+  config.extRam0000Bytes = 0x4000;
 
   std::string path = tempPath("pc1500emu_app_config_test.json");
   std::string err;
@@ -62,6 +64,8 @@ void testRoundTrip() {
   CHECK(loaded.autoLoadOnStart == false);
   CHECK(loaded.autoSaveOnExit == true);
   CHECK(loaded.showStatusPanel == true);
+  CHECK(loaded.extRam4800Bytes == 0x2000);
+  CHECK(loaded.extRam0000Bytes == 0x4000);
 
   std::remove(path.c_str());
 }
@@ -81,6 +85,8 @@ void testEmptyConfigRoundTrip() {
   CHECK(loaded.autoLoadOnStart == true);   // AppConfig{}'s own default
   CHECK(loaded.autoSaveOnExit == false);
   CHECK(loaded.showStatusPanel == false);
+  CHECK(loaded.extRam4800Bytes == 0);
+  CHECK(loaded.extRam0000Bytes == 0);
 
   std::remove(path.c_str());
 }
@@ -115,6 +121,8 @@ void testOldConfigMissingNewFieldUsesDefault() {
   CHECK(loaded.autoLoadOnStart == false);        // present in the old file
   CHECK(loaded.autoSaveOnExit == false);         // absent -- AppConfig{}'s default
   CHECK(loaded.showStatusPanel == false);        // absent -- AppConfig{}'s default
+  CHECK(loaded.extRam4800Bytes == 0);            // absent -- AppConfig{}'s default
+  CHECK(loaded.extRam0000Bytes == 0);            // absent -- AppConfig{}'s default
   std::remove(path.c_str());
 }
 

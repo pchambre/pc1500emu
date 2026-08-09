@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -95,9 +96,18 @@ bool loadBasicProgram(pc1500::Bus& bus, const char* path, std::string* error);
 // `cyclesPerFrame`/`cyclesPerTimerTick` let the caller supply its own
 // timing constants (main.cpp's kCyclesPerFrame/kCyclesPerTimerTick) without
 // this file needing to depend on them -- not tied to real GUI frames,
-// advances cpu/bus cycles directly so a whole listing loads in well under a
-// second of host time regardless of how many characters it "types".
+// advances cpu/bus cycles directly so a whole listing loads well under a
+// second of host time for a short program. A real-world listing with many
+// long lines needing the multi-pass technique (see typeLongLine's own
+// comment in text_loader.cpp) can take several seconds, though, since each
+// pass involves its own LIST/navigate/type/Enter sequence -- `onProgress`,
+// if given, is called once per source line processed (and once per
+// continuation pass within a single long line) purely so a caller driving
+// a GUI can repaint/pump its own event loop periodically during a long
+// call, without this function needing to know anything about GUIs,
+// threading, or how much work is left.
 bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& text,
-                           int cyclesPerFrame, int cyclesPerTimerTick, std::string* error);
+                           int cyclesPerFrame, int cyclesPerTimerTick, std::string* error,
+                           std::function<void()> onProgress = nullptr);
 
 }  // namespace pc1500::basic

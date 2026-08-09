@@ -8,6 +8,7 @@
 // out on the command line every time.
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <string>
 
@@ -22,6 +23,15 @@ struct AppConfig {
   bool autoLoadOnStart = true;
   bool autoSaveOnExit = false;
   bool showStatusPanel = false;
+  // Emulated expansion-module RAM sizes (bytes), applied to Bus before
+  // cpu.reset() on a fresh boot (not a state restore, which already
+  // carries its own extRam sizes -- see Bus::saveState/loadState) --
+  // the ROM only detects installed extension RAM at reset/cold-start, so
+  // this has to be set before that first reset, not applied lazily later.
+  // See main.cpp's Settings > Extension RAM menu and Bus::setExtRam4800Size/
+  // setExtRam0000Size.
+  size_t extRam4800Bytes = 0;
+  size_t extRam0000Bytes = 0;
 };
 
 // A missing file at `path` is not an error -- returns true with *out left

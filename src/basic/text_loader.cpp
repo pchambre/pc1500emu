@@ -315,7 +315,8 @@ bool loadBasicProgram(pc1500::Bus& bus, const char* path, std::string* error) {
 }
 
 bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& text,
-                           int cyclesPerFrame, int cyclesPerTimerTick, std::string* error) {
+                           int cyclesPerFrame, int cyclesPerTimerTick, std::string* error,
+                           std::function<void()> onProgress) {
   int cyclesSinceTimerTick = 0;
   auto stepCycles = [&](long cycles) {
     for (long i = 0; i < cycles;) {
@@ -486,6 +487,7 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
     size_t carryTargetIdx = segIdx;
     int carryStalls = 0;
     while (segIdx < segments.size() || !carry.empty()) {
+      if (onProgress) onProgress();
       std::string passText;
       size_t startIdx = segIdx;
       if (!carry.empty()) {
@@ -593,6 +595,7 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
   std::istringstream lineStream(text);
   std::string line;
   while (std::getline(lineStream, line)) {
+    if (onProgress) onProgress();
     if (!line.empty() && line.back() == '\r') line.pop_back();
     if (line.find_first_not_of(" \t") == std::string::npos) continue;  // blank line
 

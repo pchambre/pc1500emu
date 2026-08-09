@@ -8,6 +8,7 @@
 #endif
 
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_syswm.h>
 #include <SDL2/SDL_ttf.h>
 
 #include "imgui.h"
@@ -696,6 +697,30 @@ std::string platformTempFilePath(const char* filename) {
 #endif
 }
 
+// Forces `window`'s already-Present()'d frame to actually be composited to
+// screen immediately, rather than waiting for whatever normally triggers a
+// repaint (focus change, resize, alt-tab...). Needed for the dialog
+// window's periodic "Loading..." repaints during a long blocking call --
+// see typeBasicProgramText's onProgress callback, below -- since
+// SDL_RenderPresent alone submits the frame to the swap chain, and even
+// SDL_PumpEvents pumping the message queue isn't enough on Windows to make
+// DWM actually paint it: confirmed, without this, the dialog visibly only
+// updated once the window happened to lose and regain focus. RedrawWindow
+// with RDW_UPDATENOW forces a synchronous WM_PAINT dispatch right here
+// rather than leaving it queued.
+void forceWindowRepaint(SDL_Window* window) {
+#if defined(_WIN32)
+  SDL_SysWMinfo wmInfo;
+  SDL_VERSION(&wmInfo.version);
+  if (SDL_GetWindowWMInfo(window, &wmInfo)) {
+    RedrawWindow(wmInfo.info.win.window, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE);
+  }
+#else
+  (void)window;
+#endif
+}
+
 const std::string kResponsePath = platformTempFilePath("pc1500emu.response");
 
 #if defined(_WIN32)
@@ -1375,7 +1400,14 @@ int main(int argc, char** argv) {
       }
     }
   }
-  if (!stateRestored) cpu.reset();
+  if (!stateRestored) {
+    // Must happen before this cpu.reset() -- see AppConfig::extRam4800Bytes'
+    // own comment. A restored state file already carries its own extRam
+    // sizes (Bus::loadState), so this is skipped in that branch.
+    bus.setExtRam4800Size(appConfig.extRam4800Bytes);
+    bus.setExtRam0000Size(appConfig.extRam0000Bytes);
+    cpu.reset();
+  }
 
   // Known limitation: HLT sets a one-way halted flag. Real hardware wakes
   // from HLT via interrupt, but this core doesn't implement interrupt
@@ -1385,6 +1417,13 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "pc1500emu: SDL_Init failed: %s\n", SDL_GetError());
     return 1;
   }
+
+  // Shown while a blocking operation (currently just Load BASIC Text's
+  // multi-pass typing of a long real-world listing, which can take
+  // several seconds of wall-clock time) is in progress -- see
+  // basicTextLoadPending's own comment below.
+  SDL_Cursor* waitCursor = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_WAIT);
+  SDL_Cursor* defaultCursor = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_ARROW);
 
   // Buzzer output. Not fatal if unavailable -- run silently rather than
   // refusing to start over something as inessential as sound.
@@ -2315,8 +2354,10 @@ int main(int argc, char** argv) {
 #endif
   };
   // Shared by every Browse-style button (the BASIC Text dialog's, and the
-  // "Load File into Text" button further down): reads filenameBuf into
-  // basicTextBuf. Declared here (once, in the scope requestPick's async
+  // "Read File" button further down) and by the Load action itself when a
+  // filename was typed/pasted in without either of those being clicked:
+  // reads filenameBuf into basicTextBuf. Declared here (once, in the scope
+  // requestPick's async
   // callbacks capture from) rather than inline inside the per-frame dialog
   // render block it used to live in -- a callback that runs on a later
   // frame (once a pick resolves) can't safely reference a lambda that was
@@ -2646,7 +2687,33 @@ int main(int argc, char** argv) {
                       if (path) startDialog(ActiveDialog::SaveState, "Save State", 440, 260, path->c_str());
                     });
       }
+      if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_O, ImGuiInputFlags_RouteGlobal)) {
+        startDialog(ActiveDialog::LoadBasicText, "Load BASIC Text", 700, 500);
+        basicTextBuf[0] = '\0';
+      }
+      if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
+        startDialog(ActiveDialog::SaveBasicText, "Save BASIC Text", 700, 500);
+        std::string text, saveErr;
+        if (pc1500::basic::detokenizeBasicProgram(readBasicProgramBytes(bus, &saveErr), &text,
+                                                    &saveErr)) {
+          std::strncpy(basicTextBuf.get(), text.c_str(), kBasicTextBufSize - 1);
+          basicTextBuf[kBasicTextBufSize - 1] = '\0';
+        } else {
+          basicTextBuf[0] = '\0';
+          dialogError = saveErr;
+        }
+      }
+      if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_A, ImGuiInputFlags_RouteGlobal)) {
+        automationMode = !automationMode;
+      }
+      if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_P, ImGuiInputFlags_RouteGlobal)) {
+        appConfig.showStatusPanel = !appConfig.showStatusPanel;
+        SDL_SetWindowSize(window, kWindowW,
+                           appConfig.showStatusPanel ? kWindowHWithPanel : kWindowHNoPanel);
+        persistActiveConf();
+      }
       if (ImGui::BeginMenu("File")) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
         if (ImGui::MenuItem("Load BASIC...", "Ctrl+Shift+O")) {
           requestPick(false, "Load BASIC", {"*.BAS", "*.bas"}, "BASIC programs", "",
                       [&](std::optional<std::string> path) {
@@ -2668,11 +2735,11 @@ int main(int argc, char** argv) {
         // exactly the confusion a native Save dialog's "Save" button
         // normally resolves by itself. Browse for a path from inside the
         // editor instead (its own "Browse..." button, next to Filename).
-        if (ImGui::MenuItem("Load BASIC Text...")) {
+        if (ImGui::MenuItem("Load BASIC Text...", "Ctrl+Alt+O")) {
           startDialog(ActiveDialog::LoadBasicText, "Load BASIC Text", 700, 500);
           basicTextBuf[0] = '\0';
         }
-        if (ImGui::MenuItem("Save BASIC Text...")) {
+        if (ImGui::MenuItem("Save BASIC Text...", "Ctrl+Alt+S")) {
           startDialog(ActiveDialog::SaveBasicText, "Save BASIC Text", 700, 500);
           std::string text, saveErr;
           if (pc1500::basic::detokenizeBasicProgram(readBasicProgramBytes(bus, &saveErr), &text,
@@ -2699,6 +2766,7 @@ int main(int argc, char** argv) {
         }
         ImGui::Separator();
         if (ImGui::BeginMenu("ROM Modules")) {
+          if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
           // Four independent slots, not two -- see Bus::RomModule's own
           // comment: a real machine can have a module plugged in at both
           // the 0x8000 and 0xA000 bases at once, each with its own PV-low
@@ -2753,32 +2821,50 @@ int main(int argc, char** argv) {
         ImGui::EndMenu();
       }
       if (ImGui::BeginMenu("Settings")) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
         if (ImGui::BeginMenu("Extension RAM (4800H)")) {
+          if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
           size_t cur = bus.extRam4800Size();
+          // Persisted to the conf file (AppConfig::extRam4800Bytes) so it
+          // survives a restart -- it only takes effect on the *next*
+          // reset/cold-start either way (see that field's own comment), so
+          // there's no live-apply subtlety to worry about here, just
+          // remembering the choice.
+          auto setExtRam4800 = [&](size_t bytes) {
+            bus.setExtRam4800Size(bytes);
+            appConfig.extRam4800Bytes = bytes;
+            persistActiveConf();
+          };
           // Real 1982 hardware options were 4K/8K; 10K (the window's full
           // physical span) wasn't a real period-correct module, but is
           // easy to emulate and physically possible with modern RAM.
-          if (ImGui::MenuItem("None", nullptr, cur == 0)) bus.setExtRam4800Size(0);
-          if (ImGui::MenuItem("4K", nullptr, cur == 0x1000)) bus.setExtRam4800Size(0x1000);
-          if (ImGui::MenuItem("8K", nullptr, cur == 0x2000)) bus.setExtRam4800Size(0x2000);
+          if (ImGui::MenuItem("None", nullptr, cur == 0)) setExtRam4800(0);
+          if (ImGui::MenuItem("4K", nullptr, cur == 0x1000)) setExtRam4800(0x1000);
+          if (ImGui::MenuItem("8K", nullptr, cur == 0x2000)) setExtRam4800(0x2000);
           if (ImGui::MenuItem("10K (full window)", nullptr,
                                cur == pc1500::Bus::kExtRam4800WindowSize)) {
-            bus.setExtRam4800Size(pc1500::Bus::kExtRam4800WindowSize);
+            setExtRam4800(pc1500::Bus::kExtRam4800WindowSize);
           }
           ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Extension RAM (0000H)")) {
+          if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
           size_t cur = bus.extRam0000Size();
+          auto setExtRam0000 = [&](size_t bytes) {
+            bus.setExtRam0000Size(bytes);
+            appConfig.extRam0000Bytes = bytes;
+            persistActiveConf();
+          };
           // Not a real 1982-era option at all (nothing plugged in there
           // back then), but physically possible now.
-          if (ImGui::MenuItem("None", nullptr, cur == 0)) bus.setExtRam0000Size(0);
+          if (ImGui::MenuItem("None", nullptr, cur == 0)) setExtRam0000(0);
           if (ImGui::MenuItem("16K (full window)", nullptr,
                                cur == pc1500::Bus::kExtRam0000WindowSize)) {
-            bus.setExtRam0000Size(pc1500::Bus::kExtRam0000WindowSize);
+            setExtRam0000(pc1500::Bus::kExtRam0000WindowSize);
           }
           ImGui::EndMenu();
         }
-        if (ImGui::MenuItem("Automation Mode (ignore host keyboard)", nullptr, automationMode)) {
+        if (ImGui::MenuItem("Automation Mode (ignore host keyboard)", "Ctrl+Alt+A", automationMode)) {
           automationMode = !automationMode;
         }
         if (ImGui::MenuItem("Auto-Load State on Start", nullptr, appConfig.autoLoadOnStart)) {
@@ -2806,7 +2892,7 @@ int main(int argc, char** argv) {
           }
           persistActiveConf();
         }
-        if (ImGui::MenuItem("Show Status Panel", nullptr, appConfig.showStatusPanel)) {
+        if (ImGui::MenuItem("Show Status Panel", "Ctrl+Alt+P", appConfig.showStatusPanel)) {
           appConfig.showStatusPanel = !appConfig.showStatusPanel;
           SDL_SetWindowSize(window, kWindowW,
                              appConfig.showStatusPanel ? kWindowHWithPanel : kWindowHNoPanel);
@@ -2815,6 +2901,7 @@ int main(int argc, char** argv) {
         ImGui::EndMenu();
       }
       if (ImGui::BeginMenu("Help")) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
         if (ImGui::MenuItem("Special Keys...")) {
           openSpecialKeysPopup = true;
         }
@@ -3027,6 +3114,7 @@ int main(int argc, char** argv) {
       ImGui::SetNextWindowPos(ImVec2(0, 0));
       ImGui::SetNextWindowSize(dialogIo.DisplaySize);
       bool closeRequested = false;
+      bool wantsBasicTextLoad = false;
       if (ImGui::Begin("##dialog", nullptr,
                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse)) {
@@ -3095,9 +3183,11 @@ int main(int argc, char** argv) {
         if (isBasicText) {
           if (isLoad) {
             ImGui::SameLine();
-            if (ImGui::Button("Load File into Text")) {
+            ImGui::BeginDisabled(filenameBuf[0] == '\0');
+            if (ImGui::Button("Read File")) {
               loadFileIntoTextBuf();
             }
+            ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Paste from Clipboard")) {
               const char* clip = ImGui::GetClipboardText();
@@ -3167,8 +3257,24 @@ int main(int argc, char** argv) {
               break;
             }
             case ActiveDialog::LoadBasicText:
-              ok = typeBasicProgramText(bus, cpu, basicTextBuf.get(), kCyclesPerFrame,
-                                        kCyclesPerTimerTick, &dialogError);
+              // If the text box is still empty, the user typed/pasted a
+              // path into Filename and went straight for Load without
+              // clicking Read File first -- read it now so Load works the
+              // way it looks like it should. Once the box has *something*
+              // in it (from Read File, Browse, Paste, or hand-typing),
+              // leave it alone: Load must submit whatever's on screen, not
+              // silently clobber edits by re-reading the file.
+              if (basicTextBuf[0] == '\0' && filenameBuf[0] != '\0') {
+                loadFileIntoTextBuf();
+              }
+              // Deferred, not called here directly -- typeBasicProgramText's
+              // onProgress callback (below, after this frame's own
+              // End()/Render()/Present()) needs to run its own complete
+              // NewFrame/Begin/End/Render/Present cycles to repaint
+              // "Loading..." periodically during a long call, which can't
+              // happen while *this* frame's own Begin("##dialog") is still
+              // open (ImGui doesn't support nesting frame cycles).
+              wantsBasicTextLoad = true;
               break;
             case ActiveDialog::SaveBasicText: {
               std::ofstream f(filenameBuf, std::ios::binary);
@@ -3226,6 +3332,72 @@ int main(int argc, char** argv) {
       ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), dialogRenderer);
       SDL_RenderPresent(dialogRenderer);
       ImGui::SetCurrentContext(mainImguiCtx);
+      SDL_PumpEvents();
+
+      // Only reached once this frame's own dialog render is fully closed
+      // out (End/Render/Present above) -- typeBasicProgramText's
+      // onProgress callback below runs its own complete NewFrame/Begin/
+      // End/Render/Present cycles to repaint "Loading..." (next to the
+      // now-disabled Load/Cancel buttons) periodically during what can be
+      // a multi-second call for a real-world listing with many long
+      // lines, which would otherwise leave the window looking frozen with
+      // no feedback (and, on Windows, eventually trigger the OS's own
+      // "not responding" ghost cursor).
+      if (wantsBasicTextLoad) {
+        auto onProgress = [&]() {
+          ImGui::SetCurrentContext(dialogImguiCtx);
+          ImGui_ImplSDLRenderer2_NewFrame();
+          ImGui_ImplSDL2_NewFrame();
+          ImGui::NewFrame();
+          ImGuiIO& progressIo = ImGui::GetIO();
+          ImGui::SetNextWindowPos(ImVec2(0, 0));
+          ImGui::SetNextWindowSize(progressIo.DisplaySize);
+          // Mirrors the normal LoadBasicText layout exactly (Filename+Browse
+          // row, Read File/Paste row, the big text box, *then*
+          // the action row) -- everything disabled/read-only, since it's
+          // non-interactive while loading -- so nothing visibly jumps
+          // position compared to the dialog's usual look. An earlier
+          // version put the Load/Cancel/"Loading..." row first, which
+          // pushed the text box down; confirmed wrong, fixed here.
+          if (ImGui::Begin("##dialog", nullptr,
+                            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse)) {
+            ImGui::BeginDisabled();
+            ImGui::InputText("Filename", filenameBuf, sizeof(filenameBuf));
+            ImGui::SameLine();
+            ImGui::Button("Browse...");
+            ImGui::SameLine();
+            ImGui::Button("Read File");
+            ImGui::SameLine();
+            ImGui::Button("Paste from Clipboard");
+            ImGui::InputTextMultiline("##basicText", basicTextBuf.get(), kBasicTextBufSize,
+                                       ImVec2(-1, -60));
+            ImGui::Button("Load");
+            ImGui::SameLine();
+            ImGui::Button("Cancel");
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextUnformatted("Loading...");
+          }
+          ImGui::End();
+          ImGui::Render();
+          SDL_SetRenderDrawColor(dialogRenderer, 0x30, 0x30, 0x30, 255);
+          SDL_RenderClear(dialogRenderer);
+          ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), dialogRenderer);
+          SDL_RenderPresent(dialogRenderer);
+          ImGui::SetCurrentContext(mainImguiCtx);
+          SDL_PumpEvents();
+          forceWindowRepaint(dialogWindow);
+        };
+        SDL_SetCursor(waitCursor);
+        onProgress();  // paint "Loading..." immediately, before the first line is even typed
+        std::string loadError;
+        bool ok = typeBasicProgramText(bus, cpu, basicTextBuf.get(), kCyclesPerFrame,
+                                        kCyclesPerTimerTick, &loadError, onProgress);
+        dialogError = loadError;
+        SDL_SetCursor(defaultCursor);
+        if (ok) closeRequested = true;
+      }
 
       if (closeRequested) {
         activeDialog = ActiveDialog::None;
@@ -3464,6 +3636,8 @@ int main(int argc, char** argv) {
   SDL_DestroyWindow(window);
   TTF_Quit();
   if (audioDevice != 0) SDL_CloseAudioDevice(audioDevice);
+  SDL_FreeCursor(waitCursor);
+  SDL_FreeCursor(defaultCursor);
   SDL_Quit();
   return 0;
 }
