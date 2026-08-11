@@ -42,6 +42,10 @@ add_executable(known_symbols_test known_symbols_test.cpp)
 target_link_libraries(known_symbols_test PRIVATE pc1500disasm)
 add_test(NAME known_symbols_test COMMAND known_symbols_test)
 
+add_executable(formatter_test formatter_test.cpp)
+target_link_libraries(formatter_test PRIVATE pc1500disasm)
+add_test(NAME formatter_test COMMAND formatter_test)
+
 add_executable(dap_protocol_test dap_protocol_test.cpp)
 target_link_libraries(dap_protocol_test PRIVATE pc1500debugadapterlib)
 add_test(NAME dap_protocol_test COMMAND dap_protocol_test)

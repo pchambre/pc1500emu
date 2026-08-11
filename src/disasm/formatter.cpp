@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <optional>
 #include <sstream>
+#include <unordered_map>
 
 #include "known_symbols.h"
 #include "opcode_table.h"
@@ -13,6 +14,42 @@
 namespace pc1500::disasm {
 
 namespace {
+
+// Maps a keyword routine's entry-point address back to the keyword
+// name(s) whose table entry points there, e.g. E86AH -> {"WAIT"} -- so a
+// label at that address can be annotated as the known implementation of
+// that keyword, the same way known_symbols.cpp documents hardware
+// addresses. Built once per formatListing call from every keyword table
+// in the AnalysisResult (base ROM's built-in table, plus any module
+// tables); a vector rather than a single name since nothing rules out two
+// keywords sharing one entry point (e.g. a module keyword table entry
+// that happens to alias a base ROM routine).
+using KeywordAddrMap = std::unordered_map<uint16_t, std::vector<std::string>>;
+
+KeywordAddrMap buildKeywordAddrMap(const AnalysisResult& result) {
+  KeywordAddrMap map;
+  auto addTable = [&](const KeywordTable& kt) {
+    for (const auto& e : kt.entries) map[e.address].push_back(e.name);
+  };
+  addTable(result.baseKeywordTable);
+  for (const auto& kt : result.moduleKeywordTables) addTable(kt);
+  return map;
+}
+
+// Renders "WAIT" as "; WAIT keyword", or "WAIT, ATN" (comma-joined) in the
+// rare case multiple keywords share one entry point -- empty string if
+// `addr` isn't a keyword's own entry point.
+std::string keywordComment(uint16_t addr, const KeywordAddrMap& keywordAddrs) {
+  auto it = keywordAddrs.find(addr);
+  if (it == keywordAddrs.end()) return "";
+  std::string out = "  ; ";
+  for (size_t i = 0; i < it->second.size(); i++) {
+    if (i) out += ", ";
+    out += it->second[i];
+  }
+  out += (it->second.size() == 1) ? " keyword" : " keywords";
+  return out;
+}
 
 std::string hex2(uint32_t v) {
   char buf[8];
@@ -107,12 +144,16 @@ std::string symbolComment(const DecodedInstruction& d, const std::vector<UserSym
   return std::string("  ; ") + sym->name + " -- " + sym->comment;
 }
 
-// A label line, with a known-address comment appended when applicable
-// (documentation only -- the label text itself is always L<hex>, never
-// renamed, so it stays a guaranteed-valid, guaranteed-unique sdas
-// identifier for reassembly).
-std::string labelLine(uint16_t addr, const std::vector<UserSymbol>& userSymbols) {
+// A label line, with a known-address comment and/or keyword back-link
+// appended when applicable (documentation only -- the label text itself
+// is always L<hex>, never renamed, so it stays a guaranteed-valid,
+// guaranteed-unique sdas identifier for reassembly). Both can appear
+// together (e.g. a keyword entry point that's also a documented hardware
+// touch-point) -- they're independent annotations, not alternatives.
+std::string labelLine(uint16_t addr, const std::vector<UserSymbol>& userSymbols,
+                       const KeywordAddrMap& keywordAddrs) {
   std::string line = label(addr) + ":";
+  line += keywordComment(addr, keywordAddrs);
   std::optional<ResolvedSymbol> sym = lookupSymbol(addr, /*me1=*/false, userSymbols);
   if (sym) {
     line += "  ; ";
@@ -156,13 +197,14 @@ void appendAnnotation(std::ostringstream& out, const FormatOptions& opts,
 }
 
 std::string renderKeywordTable(const std::vector<uint8_t>& image, uint16_t base,
-                                const KeywordTable& kt, const std::vector<UserSymbol>& userSymbols) {
+                                const KeywordTable& kt, const std::vector<UserSymbol>& userSymbols,
+                                const KeywordAddrMap& keywordAddrs) {
   std::ostringstream out;
   bool haveIndex = kt.indexAddr >= base &&
                     (static_cast<size_t>(kt.indexAddr) + 52) <= base + image.size();
   if (haveIndex) {
     out << "; first-letter index\n";
-    out << labelLine(kt.indexAddr, userSymbols);
+    out << labelLine(kt.indexAddr, userSymbols, keywordAddrs);
     for (int letter = 0; letter < 26; letter++) {
       uint16_t addr = static_cast<uint16_t>(kt.indexAddr + letter * 2);
       uint16_t v = static_cast<uint16_t>((image[addr - base] << 8) | image[addr + 1 - base]);
@@ -171,7 +213,7 @@ std::string renderKeywordTable(const std::vector<uint8_t>& image, uint16_t base,
   }
   out << "; keyword table (marker/name/code/address per entry)\n";
   for (const auto& e : kt.entries) {
-    out << labelLine(e.markerAddr, userSymbols);
+    out << labelLine(e.markerAddr, userSymbols, keywordAddrs);
     out << "\t.db " << hex2((e.markerAddr < base ? 0 : image[e.markerAddr - base])) << "  ; marker (len="
         << e.name.size() << ")\n";
     out << "\t.ascii \"" << escapeAscii(e.name) << "\"\n";
@@ -193,6 +235,8 @@ std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResul
   out << "\t.area CODE (ABS)\n";
   out << "\t.org " << hex4(result.base) << "\n\n";
 
+  const KeywordAddrMap keywordAddrs = buildKeywordAddrMap(result);
+
   std::vector<SpecialRegion> specials;
   auto addKeywordTableRegion = [&](const KeywordTable& kt) {
     if (kt.entries.empty()) return;
@@ -200,8 +244,8 @@ std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResul
                        (static_cast<size_t>(kt.indexAddr) + 52) <= result.base + image.size())
                           ? kt.indexAddr
                           : kt.tableAddr;
-    specials.push_back(
-        {start, kt.endAddr, renderKeywordTable(image, result.base, kt, options.userSymbols)});
+    specials.push_back({start, kt.endAddr,
+                         renderKeywordTable(image, result.base, kt, options.userSymbols, keywordAddrs)});
   };
   addKeywordTableRegion(result.baseKeywordTable);
   for (const auto& kt : result.moduleKeywordTables) addKeywordTableRegion(kt);
@@ -269,9 +313,9 @@ std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResul
       // prompt, is normally reached only by falling through from the
       // preceding HLT-wake code, never jumped to directly) -- otherwise a
       // real, meaningful address could go entirely unlabeled.
-      if (result.labels.count(addr) ||
+      if (result.labels.count(addr) || keywordAddrs.count(addr) ||
           lookupSymbol(addr, /*me1=*/false, options.userSymbols).has_value()) {
-        out << labelLine(addr, options.userSymbols);
+        out << labelLine(addr, options.userSymbols, keywordAddrs);
       }
       out << "\t" << renderInstruction(d) << symbolComment(d, options.userSymbols);
       appendAnnotation(out, options, image, result.base, addr, d.length);
@@ -300,9 +344,9 @@ std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResul
     for (size_t i = 0; allPrintable && i < runLen; i++) {
       if (!isPrintable(image[runStart + i])) allPrintable = false;
     }
-    if (result.labels.count(runStartAddr) ||
+    if (result.labels.count(runStartAddr) || keywordAddrs.count(runStartAddr) ||
         lookupSymbol(runStartAddr, /*me1=*/false, options.userSymbols).has_value()) {
-      out << labelLine(runStartAddr, options.userSymbols);
+      out << labelLine(runStartAddr, options.userSymbols, keywordAddrs);
     }
     if (allPrintable) {
       std::string text(reinterpret_cast<const char*>(&image[runStart]), runLen);
