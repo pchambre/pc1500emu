@@ -10,12 +10,14 @@
 // A curated table of confirmed PC-1500 memory-map addresses and ROM entry
 // points, for the disassembler's formatter to annotate output with --
 // documentation only, not a rename (labels stay L<hex>: for guaranteed
-// valid/unique sdas identifiers; see formatter.cpp). Every entry here was
+// valid/unique sdas identifiers; see formatter.cpp). Most entries here were
 // established elsewhere in this project (bus.cpp/bus.h comments,
-// docs/pc1500_hardware_reference.md, src/basic/text_loader.h, and this
-// session's own SML-regression and keyword-table investigations) --
-// nothing new is asserted here, this is just those facts made available
-// to the disassembler.
+// docs/pc1500_hardware_reference.md, src/basic/text_loader.h, and various
+// sessions' own regression/keyword-table investigations) and just made
+// available to the disassembler here; some (the BASIC interpreter's own RAM
+// variable table, PC-1500 Technical Reference Manual pp.100-101) are
+// transcribed directly from a manual instead, not independently confirmed
+// against a real disassembly -- each such block says so in its own comment.
 namespace pc1500::disasm {
 
 struct KnownSymbol {

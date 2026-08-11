@@ -45,6 +45,29 @@ void testFindKnownSymbol() {
   const KnownSymbol* dispchar = findKnownSymbol(0xED4D, /*me1=*/false);
   CHECK(dispchar != nullptr);
   if (dispchar != nullptr) CHECK(std::string(dispchar->name) == "DISP_CHAR_ADV");
+
+  // PC-1500 Technical Reference Manual pp.100-101 -- BASIC interpreter's
+  // own RAM variable table. 78B8H is the motivating example: found live in
+  // ROM1.BIN as "ori (0x78B8),0x80" around CFF7H (LC42A's own ON ERROR
+  // GOTO dispatch neighborhood).
+  const KnownSymbol* onErr = findKnownSymbol(0x78B8, /*me1=*/false);
+  CHECK(onErr != nullptr);
+  if (onErr != nullptr) CHECK(std::string(onErr->name) == "ON_ERROR_ADDRESS_H");
+  // The corrected address (79E7H, not the manual's printed 78E7H -- see
+  // this table's own comment in known_symbols.cpp) is what's actually
+  // registered; the erroneous one must not resolve to anything.
+  CHECK(findKnownSymbol(0x79E7, /*me1=*/false) != nullptr);
+  CHECK(findKnownSymbol(0x78E7, /*me1=*/false) == nullptr);
+  // 7874H already had a hardware-confirmed entry (CURSOR_RESET_FLAG) --
+  // confirms the manual's overlapping CURSOR ENABLE was merged into it
+  // rather than silently shadowed by a second, conflicting entry at the
+  // same address.
+  const KnownSymbol* cursor = findKnownSymbol(0x7874, /*me1=*/false);
+  CHECK(cursor != nullptr);
+  if (cursor != nullptr) {
+    CHECK(std::string(cursor->name) == "CURSOR_RESET_FLAG");
+    CHECK(std::string(cursor->comment).find("CURSOR ENABLE") != std::string::npos);
+  }
 }
 
 // Integration check: a synthetic module-mode image whose only instruction

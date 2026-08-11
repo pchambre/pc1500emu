@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.6.4] - 2026-08-11
+
+### Added
+- `pc1500disasm` now annotates the BASIC interpreter's own named RAM
+  variables (WAIT counter, FOR/GOSUB pointers, current/previous/search/
+  break/error line+address+top fields, ON ERROR GOTO target, USING format
+  state, pen-plotter/printer variables) in `7800H`-`7BFFH`, transcribed
+  from the PC-1500 Technical Reference Manual's own table (pp.100-101) --
+  e.g. `ori (0x78B8),0x80` now shows `; ON_ERROR_ADDRESS_H -- ...`.
+
 ## [0.6.3] - 2026-08-11
 
 ### Fixed

@@ -59,6 +59,17 @@ state this (it only documents PU, not PV, as the printer-ROM enable
 signal), so it's cited from this project's own already-confirmed hardware
 behavior instead.
 
+**BASIC interpreter RAM variables** (`7800H`-`7BFFH`, the fixed variable
+area above): `src/disasm/known_symbols.cpp` also catalogs the BASIC
+interpreter's own named RAM variables in this range (WAIT counter, FOR/GOSUB
+pointers, current/previous/search/break/error line+address+top fields, ON
+ERROR GOTO target, USING format state, and the pen-plotter/printer variables
+at `79D1H`+/`7B00H`+), transcribed from the PC-1500 Technical Reference
+Manual's own table (pp.100-101) -- unlike the ROM-routine entries above,
+these are transcribed directly from that table, not independently confirmed
+against a real disassembly, so treat a name here as "what the manual calls
+it" rather than something separately traced live.
+
 **Gotcha, learned the hard way**: `4000H`-`47FFH` being "standard user RAM"
 at the chip-select level does *not* mean all of it is free scratch space.
 On a bare PC-1500 (no CE-151/CE-155/CE-159 module), the BASIC ROM firmware
