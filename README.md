@@ -32,10 +32,15 @@ cmake --build build
 ```
 
 **Windows**: install SDL2 and SDL2-ttf via [vcpkg](https://github.com/microsoft/vcpkg)
-(`vcpkg install sdl2 sdl2-ttf`), then point CMake at its toolchain file:
+(`vcpkg install sdl2 sdl2-ttf`), then point CMake at its toolchain file. In
+PowerShell, quote the whole `-DCMAKE_TOOLCHAIN_FILE=...` argument — passed
+unquoted, PowerShell mangles a value containing `../` before it reaches
+`cmake.exe` (it silently drops the `-DCMAKE_TOOLCHAIN_FILE=` prefix, so
+CMake sees the path alone and misreads it as the source directory instead,
+failing with "is a file, not a directory"):
 
-```sh
-cmake -B build -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake
+```powershell
+cmake -B build "-DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake"
 cmake --build build --config RelWithDebInfo
 ```
 
