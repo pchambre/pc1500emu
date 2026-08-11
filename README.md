@@ -20,7 +20,10 @@ compiler backend work begins.
 
 ## Building
 
-Requires SDL2 and SDL2_ttf development packages.
+Requires SDL2 and SDL2_ttf development packages. The Linux and Windows
+blocks below are alternatives for the two platforms, not sequential steps —
+running both against the same `build` directory leaves it stuck on
+whichever configuration ran first (see the Windows section's own note).
 
 **Linux**: `libsdl2-dev`, `libsdl2-ttf-dev` on Debian/Ubuntu.
 [Dear ImGui](https://github.com/ocornut/imgui) (the menu bar UI) is vendored
@@ -43,6 +46,17 @@ failing with "is a file, not a directory"):
 cmake -B build "-DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake"
 cmake --build build --config RelWithDebInfo
 ```
+
+`CMAKE_TOOLCHAIN_FILE` only takes effect on a build directory's *first*
+configure — CMake processes it before any of this project's own
+`CMakeLists.txt` runs, so setting it against a `build` directory that's
+already been configured (e.g. the plain `cmake -B build` from the Linux
+block above, run against the same folder by habit) has no effect: CMake
+either silently ignores it (`CMake Warning (unused-cli): ... variables
+were not used by the project: CMAKE_TOOLCHAIN_FILE`) or, if that earlier
+configure didn't already find SDL2 some other way, fails to find it at
+all. If you hit either of these, delete the `build` directory and
+reconfigure from scratch with the toolchain flag present from the start.
 
 The indicator row (see the Keyboard mapping section below) needs a
 CJK-capable font for its katakana glyphs; Windows ships one
