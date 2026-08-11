@@ -389,10 +389,24 @@ void Adapter::onLaunch(const Json& req) {
 
   if (args.contains("emulatorPath")) {
     std::string emulatorPath = args.value("emulatorPath", "");
-    std::string romPath = args.value("romPath", "");
+
+    // emulatorArgs (a JSON array of strings) is what the lh5801-asm
+    // extension's own "LH5801: Debug in pc1500emu" command populates --
+    // e.g. ["--conf", "<generated conf path>", "--no-state"] when
+    // extension-RAM settings are in play, or just [romPath] otherwise.
+    // A hand-written launch.json config (see .vscode/launch.json's own
+    // templates) won't have it, so this falls back to the plain
+    // [romPath] positional arg used before emulatorArgs existed.
+    std::vector<std::string> emulatorArgs;
+    if (args.contains("emulatorArgs") && args["emulatorArgs"].is_array()) {
+      for (const auto& a : args["emulatorArgs"]) emulatorArgs.push_back(a.get<std::string>());
+    } else {
+      emulatorArgs.push_back(args.value("romPath", ""));
+    }
 
 #if defined(_WIN32)
-    std::string cmdLine = "\"" + emulatorPath + "\" \"" + romPath + "\"";
+    std::string cmdLine = "\"" + emulatorPath + "\"";
+    for (const auto& a : emulatorArgs) cmdLine += " \"" + a + "\"";
     std::vector<char> cmdLineBuf(cmdLine.begin(), cmdLine.end());
     cmdLineBuf.push_back('\0');
 
@@ -409,12 +423,19 @@ void Adapter::onLaunch(const Json& req) {
 #else
     std::vector<char> exeBuf(emulatorPath.begin(), emulatorPath.end());
     exeBuf.push_back('\0');
-    std::vector<char> romBuf(romPath.begin(), romPath.end());
-    romBuf.push_back('\0');
-    char* argv[] = {exeBuf.data(), romBuf.data(), nullptr};
+    std::vector<std::vector<char>> argBufs;
+    for (const auto& a : emulatorArgs) {
+      std::vector<char> buf(a.begin(), a.end());
+      buf.push_back('\0');
+      argBufs.push_back(std::move(buf));
+    }
+    std::vector<char*> argv;
+    argv.push_back(exeBuf.data());
+    for (auto& b : argBufs) argv.push_back(b.data());
+    argv.push_back(nullptr);
 
     pid_t pid = kInvalidProcess;
-    int rc = posix_spawn(&pid, exeBuf.data(), nullptr, nullptr, argv, environ);
+    int rc = posix_spawn(&pid, exeBuf.data(), nullptr, nullptr, argv.data(), environ);
     if (rc != 0) {
       sendResponse(req, false, nullptr, "failed to launch emulator: " + emulatorPath);
       return;
@@ -437,6 +458,69 @@ void Adapter::onLaunch(const Json& req) {
     if (!ready) {
       sendResponse(req, false, nullptr, "emulator started but its command pipe never came up");
       return;
+    }
+
+    // The command pipe comes up (SDL/window init) well before a
+    // cold-booting ROM's own init sequence actually completes --
+    // confirmed live: loading/calling into the machine before it
+    // settles corrupts whatever boot code was still mid-execution (P
+    // visibly wanders, RAM variables stay at their 0xFF power-up
+    // default). Wait for two consecutive debugstatus polls to report
+    // the same P before proceeding -- a ROM-address-agnostic stability
+    // check, not a fixed delay, since a state-restored boot has no such
+    // window (P is already stable the instant the pipe answers) and
+    // costs just one extra poll here.
+    auto extractP = [](const std::string& resp) -> std::optional<std::string> {
+      auto pos = resp.find("P=");
+      if (pos == std::string::npos) return std::nullopt;
+      pos += 2;
+      auto end = resp.find(' ', pos);
+      if (end == std::string::npos) end = resp.size();
+      return resp.substr(pos, end - pos);
+    };
+    auto stableDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    std::optional<std::string> lastP;
+    bool stable = false;
+    while (std::chrono::steady_clock::now() < stableDeadline) {
+      auto resp = sendCmd("debugstatus");
+      if (!resp) break;
+      auto p = extractP(*resp);
+      if (p && lastP && *p == *lastP) {
+        stable = true;
+        break;
+      }
+      lastP = p;
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    if (!stable) {
+      sendResponse(req, false, nullptr, "emulator's command pipe came up but its boot never settled");
+      return;
+    }
+
+    // Preload any auxiliary ROM modules (e.g. CE-150/158) before the
+    // main program itself loads -- only meaningful right after a fresh
+    // spawn like this one, never when attaching to an already-running
+    // instance (args.contains("emulatorPath") is exactly that
+    // distinction). See lh5801.preloadRomModules in the extension's own
+    // package.json for the field shapes this expects.
+    if (args.contains("preloadRomModules") && args["preloadRomModules"].is_array()) {
+      for (const auto& mod : args["preloadRomModules"]) {
+        int slot = mod.value("slot", 0);
+        std::string base = mod.value("base", "");
+        bool requirePv = mod.value("requirePv", false);
+        bool usePuBank = mod.value("usePuBank", false);
+        std::string modPath = mod.value("path", "");
+        std::string cmdName = slot <= 0 ? "loadrommodule" : "loadrommodule" + std::to_string(slot + 1);
+        std::ostringstream cmd;
+        cmd << cmdName << " " << base << " " << (requirePv ? 1 : 0) << " " << (usePuBank ? 1 : 0) << " " << modPath;
+        auto resp = sendCmd(cmd.str());
+        if (!resp || resp->rfind("OK", 0) != 0) {
+          sendResponse(req, false, nullptr,
+                       "failed to preload ROM module (slot " + std::to_string(slot + 1) +
+                           "): " + (resp ? *resp : std::string("no response")));
+          return;
+        }
+      }
     }
   }
 

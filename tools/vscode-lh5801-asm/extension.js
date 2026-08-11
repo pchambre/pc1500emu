@@ -393,28 +393,143 @@ async function pickLoadMode() {
   };
 }
 
-// Ensures a pc1500emu instance is reachable over the command pipe,
-// launching lh5801.emulatorPath (with lh5801.romPath) if a quick probe
-// finds nothing already listening. Returns true if an instance is
-// reachable by the time this returns.
-async function ensureEmulatorRunning(anchorUri) {
-  if (await sendCommand('status', 700) !== null) return true;
-
+// Resolves lh5801.emulatorPath/romPath plus the extension-RAM settings
+// (lh5801.extRam4800Bytes/extRam0000Bytes) into { emulatorPath, args }
+// for spawn() (Run) or the debug launch config's emulatorArgs (Debug).
+// When both extRAM settings are 0 (the default), this is just
+// [romPath] -- unchanged from before these settings existed. When
+// either is non-zero, a temp conf JSON is written (AppConfig's own
+// extRam4800Bytes/extRam0000Bytes fields, see
+// src/hoststate/app_config.h) and spawned via --conf/--no-state
+// instead: --no-state is required because that conf is only applied
+// "before cpu.reset() on a fresh boot", not a state restore (confirmed
+// via app_config.h's own comment), so without it a resumed saved state
+// could silently keep the old RAM size. Returns null (after reporting
+// the error) if emulatorPath is missing/doesn't exist, or if romPath is
+// blank while extRAM settings need it to build the conf's own romPath
+// field (Run alone tolerates a blank romPath in the unchanged case,
+// relying on the emulator's own default-conf-file discovery -- but that
+// discovery is bypassed entirely once --conf is given explicitly, so
+// this specific path has no fallback).
+async function resolveEmulatorLaunch(anchorUri) {
   const emulatorPath = resolveCommandSetting('lh5801.emulatorPath', anchorUri);
-  const romPath = resolveCommandSetting('lh5801.romPath', anchorUri);
   if (!emulatorPath) {
-    await complainMissingSetting('lh5801.emulatorPath', 'point it at your built pc1500emu.exe, or launch it yourself first.');
-    return false;
+    await complainMissingSetting('lh5801.emulatorPath', 'point it at your built pc1500emu.exe first.');
+    return null;
   }
   if (!fs.existsSync(emulatorPath)) {
     vscode.window.showErrorMessage(`lh5801.emulatorPath doesn't exist: ${emulatorPath}`);
-    return false;
+    return null;
   }
 
-  const child = spawn(emulatorPath, romPath ? [romPath] : [], { detached: true, stdio: 'ignore' });
+  const romPath = resolveCommandSetting('lh5801.romPath', anchorUri);
+  const config = vscode.workspace.getConfiguration('lh5801');
+  const extRam4800Bytes = config.get('extRam4800Bytes', 0) || 0;
+  const extRam0000Bytes = config.get('extRam0000Bytes', 0) || 0;
+
+  if (!extRam4800Bytes && !extRam0000Bytes) {
+    return { emulatorPath, args: romPath ? [romPath] : [] };
+  }
+
+  if (!romPath) {
+    await complainMissingSetting('lh5801.romPath', 'required to generate a --conf for lh5801.extRam4800Bytes/extRam0000Bytes.');
+    return null;
+  }
+
+  const confPath = path.join(os.tmpdir(), `pc1500emu-lh5801-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(
+    confPath,
+    JSON.stringify({ romPath, extRam4800Bytes, extRam0000Bytes, autoLoadOnStart: false, autoSaveOnExit: false }, null, 2)
+  );
+  return { emulatorPath, args: ['--conf', confPath, '--no-state'] };
+}
+
+// Resolves lh5801.preloadRomModules -- an array of
+// { slot?, base, requirePv?, usePuBank?, path } entries to load into a
+// *freshly spawned* emulator via loadrommodule[2-4], before the main
+// program itself loads. `slot` is 0-3 (default 0), matching
+// pickLoadMode()'s own slot numbering.
+function resolvePreloadRomModules(anchorUri) {
+  const raw = vscode.workspace.getConfiguration('lh5801').get('preloadRomModules', []);
+  if (!Array.isArray(raw)) return [];
+  return raw.map((m) => ({
+    slot: Number.isInteger(m.slot) ? m.slot : 0,
+    base: String(m.base || '').trim(),
+    requirePv: !!m.requirePv,
+    usePuBank: !!m.usePuBank,
+    path: expandWorkspaceFolder(String(m.path || '').trim(), anchorUri),
+  }));
+}
+
+// Polls `status` until two consecutive reads report the same P register
+// (a ROM-address-agnostic stability check -- boot time isn't perfectly
+// deterministic, so a fixed delay would either be too short on a slow
+// run or wastefully long on a fast one). Returns false on timeout or if
+// the pipe stops responding.
+async function waitForStableBoot(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastP = null;
+  while (Date.now() < deadline) {
+    const s = await sendCommand('status', Math.max(500, deadline - Date.now()));
+    if (s === null) return false;
+    const m = /P=([0-9A-Fa-f]+)/.exec(s);
+    const p = m ? m[1] : null;
+    if (p !== null && p === lastP) return true;
+    lastP = p;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return false;
+}
+
+// Ensures a pc1500emu instance is reachable over the command pipe,
+// launching one via resolveEmulatorLaunch if a quick probe finds
+// nothing already listening. On a fresh spawn only (never when
+// attaching to one already running -- that implies the user already
+// has it set up the way they want), also preloads
+// lh5801.preloadRomModules before returning, skipping (with a warning)
+// any entry whose slot collides with `reservedSlot` (the main program's
+// own chosen slot, if it's being loaded as a ROM module itself).
+// Returns { running: bool, freshlySpawned: bool }.
+async function ensureEmulatorRunning(anchorUri, reservedSlot) {
+  if ((await sendCommand('status', 700)) !== null) return { running: true, freshlySpawned: false };
+
+  const launch = await resolveEmulatorLaunch(anchorUri);
+  if (!launch) return { running: false, freshlySpawned: false };
+
+  const child = spawn(launch.emulatorPath, launch.args, { detached: true, stdio: 'ignore' });
   child.unref();
 
-  return (await sendCommand('status', 10000)) !== null;
+  if ((await sendCommand('status', 10000)) === null) return { running: false, freshlySpawned: false };
+
+  // The command pipe comes up (SDL/window init) well before a cold-booting
+  // ROM's own init sequence actually completes -- confirmed live: loading/
+  // calling into the machine before it settles corrupts whatever boot code
+  // was still mid-execution (P visibly wanders, RAM variables stay at
+  // their 0xFF power-up default). A state-restored boot has no such
+  // window (P is already stable the instant the pipe answers), so this
+  // only costs a couple of cheap polls in the common case.
+  if (!(await waitForStableBoot(5000))) {
+    vscode.window.showErrorMessage('pc1500emu: command pipe came up but its boot never settled.');
+    return { running: false, freshlySpawned: false };
+  }
+
+  for (const mod of resolvePreloadRomModules(anchorUri)) {
+    if (reservedSlot !== undefined && mod.slot === reservedSlot) {
+      vscode.window.showWarningMessage(
+        `pc1500emu: skipping preload ROM module for slot ${mod.slot + 1} -- the main program itself is loading into that slot.`
+      );
+      continue;
+    }
+    const cmd = `${mod.slot === 0 ? 'loadrommodule' : 'loadrommodule' + (mod.slot + 1)} ${mod.base} ${mod.requirePv ? 1 : 0} ${mod.usePuBank ? 1 : 0} ${mod.path}`;
+    const response = await sendCommand(cmd, 5000);
+    if (response === null || !response.trim().startsWith('OK')) {
+      vscode.window.showErrorMessage(
+        `pc1500emu: failed to preload ROM module (slot ${mod.slot + 1}): ${response === null ? 'no response' : response.trim()}`
+      );
+    }
+  }
+
+  return { running: true, freshlySpawned: true };
 }
 
 async function runCommand(clickedUri) {
@@ -424,7 +539,9 @@ async function runCommand(clickedUri) {
     const loadMode = await pickLoadMode();
     if (!loadMode) return;
 
-    if (!(await ensureEmulatorRunning(program.sourceUri || vscode.Uri.file(program.binPath)))) return;
+    const anchorUri = program.sourceUri || vscode.Uri.file(program.binPath);
+    const emu = await ensureEmulatorRunning(anchorUri, loadMode.mode === 'rommodule' ? loadMode.slot : undefined);
+    if (!emu.running) return;
 
     const loadCmd =
       loadMode.mode === 'binary'
@@ -488,12 +605,25 @@ async function debugCommand(clickedUri) {
       }
     }
     if (!launchChoice.attach) {
-      const emulatorPath = resolveCommandSetting('lh5801.emulatorPath', anchorUri);
-      const romPath = resolveCommandSetting('lh5801.romPath', anchorUri);
-      if (!emulatorPath) { await complainMissingSetting('lh5801.emulatorPath', 'point it at your built pc1500emu.exe first.'); return; }
-      if (!romPath) { await complainMissingSetting('lh5801.romPath', 'point it at your ROM1.BIN first.'); return; }
-      config.emulatorPath = emulatorPath;
-      config.romPath = romPath;
+      const launch = await resolveEmulatorLaunch(anchorUri);
+      if (!launch) return;
+      config.emulatorPath = launch.emulatorPath;
+      config.emulatorArgs = launch.args;
+
+      // Debug always loads a rommodule program into slot 1 (see the
+      // warning above), so that's the only slot a preload entry can
+      // collide with here.
+      const reservedSlot = loadMode.mode === 'rommodule' ? 0 : undefined;
+      const preload = resolvePreloadRomModules(anchorUri).filter((mod) => {
+        if (reservedSlot !== undefined && mod.slot === reservedSlot) {
+          vscode.window.showWarningMessage(
+            `pc1500emu: skipping preload ROM module for slot ${mod.slot + 1} -- the main program itself is loading into that slot.`
+          );
+          return false;
+        }
+        return true;
+      });
+      if (preload.length) config.preloadRomModules = preload;
     }
 
     const folder = vscode.workspace.getWorkspaceFolder(anchorUri) || vscode.workspace.workspaceFolders?.[0];
@@ -673,6 +803,19 @@ async function resolveInputUri(clickedUri, extRe, filters) {
   return picked && picked[0];
 }
 
+// The workspace folder that owns `uri`, falling back to the first
+// workspace folder -- shared by resolveCommandSetting and
+// resolvePreloadRomModules's own ${workspaceFolder} expansion below.
+function workspaceFolderFor(uri) {
+  return (uri && vscode.workspace.getWorkspaceFolder(uri)) || vscode.workspace.workspaceFolders?.[0];
+}
+
+function expandWorkspaceFolder(raw, uri) {
+  if (!raw) return raw;
+  const folder = workspaceFolderFor(uri);
+  return folder ? raw.replace(/\$\{workspaceFolder\}/g, folder.uri.fsPath) : raw;
+}
+
 // lh5801.* command/path settings aren't task/launch config, so VS Code
 // doesn't expand ${workspaceFolder} in them automatically the way it
 // does for those -- done manually here instead, against whichever
@@ -680,9 +823,7 @@ async function resolveInputUri(clickedUri, extRe, filters) {
 // the first one).
 function resolveCommandSetting(key, uri) {
   const raw = vscode.workspace.getConfiguration('lh5801').get(key.replace(/^lh5801\./, ''), '');
-  if (!raw) return '';
-  const folder = (uri && vscode.workspace.getWorkspaceFolder(uri)) || vscode.workspace.workspaceFolders?.[0];
-  return folder ? raw.replace(/\$\{workspaceFolder\}/g, folder.uri.fsPath) : raw;
+  return expandWorkspaceFolder(raw, uri);
 }
 
 function workspaceCwdFor(uri) {

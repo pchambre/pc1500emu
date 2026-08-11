@@ -398,13 +398,21 @@ running (or debugged) program without leaving the editor:
   command pipe and `call`s the entry point, or starts an `lh5801` debug
   session the same way F5 would (see Debugger below) — you're asked
   whether to attach to a running instance or launch a fresh one.
+  A *freshly-launched* instance (never one you're attaching to) also
+  picks up `lh5801.extRam4800Bytes`/`lh5801.extRam0000Bytes` (extension
+  RAM — many real programs, e.g. anything using `printf()`, need more
+  than the base 2KB) and `lh5801.preloadRomModules` (auxiliary ROM
+  modules, e.g. a CE-150/158, loaded before the main program). Non-zero
+  extension RAM forces that launch to boot cold (`--no-state`) — the
+  size is only detected by the ROM on a fresh boot, not a state restore.
 
 Opening this repo in VS Code also picks up:
 - `.vscode/settings.json` — associates `*.asm`/`*.s` with the extension's
   grammar (scoped to this project only), and holds `lh5801.disasmCommand`,
   `lh5801.sdasCommand` (below), and the `lh5801.linkCommand`/
   `lh5801.makebinCommand`/`lh5801.buildCCommand`/`lh5801.emulatorPath`/
-  `lh5801.romPath` settings the commands above use.
+  `lh5801.romPath`/`lh5801.extRam4800Bytes`/`lh5801.extRam0000Bytes`/
+  `lh5801.preloadRomModules` settings the commands above use.
 - `.vscode/tasks.json` — a build task (`Ctrl+Shift+B`) that runs
   `sdaslh5801` on the active file and reports errors in the Problems panel.
   Fill in `lh5801.sdasCommand` in `settings.json` with your own built
@@ -448,6 +456,14 @@ given, resolve source-line breakpoints and stack-frame source locations
 against it. Without a `listing`, debugging still works at the instruction
 level (breakpoints by address, stepping, registers, memory) — VS Code just
 won't be able to show a source line for the current position.
+
+When `emulatorPath` is given (a fresh launch, not an attach), two more
+launch properties apply: `emulatorArgs` (extra CLI args, overriding the
+bare `romPath` positional arg — this is how "LH5801: Debug in pc1500emu"
+passes a generated `--conf`/`--no-state` for extension RAM, see above)
+and `preloadRomModules` (auxiliary ROM modules loaded before `program`
+itself). Both are usually auto-populated by the extension command, not
+meant to be hand-written into `launch.json`.
 
 Known limitations:
 

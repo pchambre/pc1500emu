@@ -2,7 +2,7 @@
   "name": "lh5801-asm",
   "displayName": "LH5801 Assembly (sdaslh5801)",
   "description": "Syntax highlighting for the sdaslh5801 (PC-1500 LH5801) assembler dialect, matching pc1500emu's disassembler output and https://github.com/pchambre/sdcc-pc1500",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "pchambre",
   "private": true,
   "engines": {
@@ -134,6 +134,39 @@
           "type": "string",
           "default": "",
           "description": "Path to ROM1.BIN, passed to a freshly-launched pc1500emu by 'LH5801: Run in pc1500emu' / 'LH5801: Debug in pc1500emu'. Not needed if you always attach to an already-running instance."
+        },
+        "lh5801.extRam4800Bytes": {
+          "type": "number",
+          "enum": [0, 4096, 8192, 10240],
+          "default": 0,
+          "description": "Extension RAM (bytes) at 4800H-6FFFH -- the CE-158-style expansion module -- for a *freshly-launched* pc1500emu started by 'LH5801: Run in pc1500emu' / 'LH5801: Debug in pc1500emu' (never applied when attaching to one already running). 0 = none (base 2KB only, matches every default before this setting existed). Non-zero forces that launch to boot cold (--no-state), since the size is only detected by the ROM on a fresh, non-restored boot -- see AppConfig::extRam4800Bytes in src/hoststate/app_config.h."
+        },
+        "lh5801.extRam0000Bytes": {
+          "type": "number",
+          "enum": [0, 16384],
+          "default": 0,
+          "description": "Extension RAM (bytes) at 0000H-3FFFH -- an emulator-only option with no real 1982 hardware equivalent -- for a freshly-launched pc1500emu. Same cold-boot caveat as lh5801.extRam4800Bytes."
+        },
+        "lh5801.preloadRomModules": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "required": ["base", "path"],
+            "properties": {
+              "slot": {
+                "type": "integer",
+                "enum": [0, 1, 2, 3],
+                "default": 0,
+                "description": "Which of the 4 independent ROM module slots (0-3, matching 'LH5801: Run in pc1500emu''s own Extension ROM Slot 1-4 picker)."
+              },
+              "base": { "type": "string", "description": "Hex load address (no 0x prefix), e.g. \"A000\"." },
+              "requirePv": { "type": "boolean", "default": false, "description": "Module requires the PV flag (CE-158-family modules)." },
+              "usePuBank": { "type": "boolean", "default": false, "description": "Module is PU-banked (file must be even-sized)." },
+              "path": { "type": "string", "description": "Path to the ROM module file. Supports ${workspaceFolder}." }
+            }
+          },
+          "description": "Auxiliary ROM modules (e.g. a CE-150/158) to load into a *freshly-launched* pc1500emu, before the main program itself, for 'LH5801: Run in pc1500emu' / 'LH5801: Debug in pc1500emu' (never applied when attaching to one already running). An entry whose slot collides with the main program's own chosen slot (when it's loaded as a ROM module itself) is skipped with a warning."
         }
       }
     },
@@ -212,7 +245,26 @@
               },
               "romPath": {
                 "type": "string",
-                "description": "Path to ROM1.BIN. Required if emulatorPath is given."
+                "description": "Path to ROM1.BIN. Required if emulatorPath is given, unless emulatorArgs is given instead."
+              },
+              "emulatorArgs": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Extra CLI args for a freshly-launched emulatorPath, overriding the bare romPath positional arg when given -- usually auto-populated by 'LH5801: Debug in pc1500emu' itself (e.g. [\"--conf\", \"<generated path>\", \"--no-state\"] when lh5801.extRam4800Bytes/extRam0000Bytes are non-default), not meant to be hand-written."
+              },
+              "preloadRomModules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "slot": { "type": "integer", "enum": [0, 1, 2, 3], "default": 0 },
+                    "base": { "type": "string" },
+                    "requirePv": { "type": "boolean", "default": false },
+                    "usePuBank": { "type": "boolean", "default": false },
+                    "path": { "type": "string" }
+                  }
+                },
+                "description": "Auxiliary ROM modules to load (via loadrommodule) right after a freshly-launched emulatorPath comes up, before `program` itself -- same shape as, and usually auto-populated from, lh5801.preloadRomModules. Only takes effect when emulatorPath is given (a fresh launch); ignored when attaching to an already-running instance."
               }
             }
           }
