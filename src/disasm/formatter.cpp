@@ -131,17 +131,36 @@ std::string renderInstruction(const DecodedInstruction& d) {
 // routine (e.g. E243H) would never get annotated at all, since the
 // routine's own address never appears as a labeled line in a small
 // program-mode image that doesn't include E243H's bytes.
+//
+// Also checks describeBits (known_symbols.h) when op2 is an immediate
+// (the mask a bii/ani/ori-style instruction tests/sets/clears) against a
+// Me0Abs/Me1Abs op1 -- so e.g. `bii (0x764E),0x02` shows "[bit: SHIFT]"
+// alongside (or instead of, if the address itself has no KnownSymbol
+// entry) the byte-level STATUS1 annotation, rather than every instruction
+// touching that byte looking identical regardless of which flag it
+// actually cares about.
 std::string symbolComment(const DecodedInstruction& d, const std::vector<UserSymbol>& userSymbols) {
   std::optional<ResolvedSymbol> sym;
+  std::string bits;
   if (d.op1 == Operand::Me0Abs) {
-    sym = lookupSymbol(static_cast<uint16_t>(d.value1), /*me1=*/false, userSymbols);
+    uint16_t addr = static_cast<uint16_t>(d.value1);
+    sym = lookupSymbol(addr, /*me1=*/false, userSymbols);
+    if (d.op2 == Operand::Imm8) bits = describeBits(addr, /*me1=*/false, static_cast<uint8_t>(d.value2));
   } else if (d.op1 == Operand::Me1Abs) {
-    sym = lookupSymbol(static_cast<uint16_t>(d.value1), /*me1=*/true, userSymbols);
+    uint16_t addr = static_cast<uint16_t>(d.value1);
+    sym = lookupSymbol(addr, /*me1=*/true, userSymbols);
+    if (d.op2 == Operand::Imm8) bits = describeBits(addr, /*me1=*/true, static_cast<uint8_t>(d.value2));
   } else if (isTargetSlot(d, d.op1)) {
     sym = lookupSymbol(d.branchTarget, /*me1=*/false, userSymbols);
   }
-  if (!sym) return "";
-  return std::string("  ; ") + sym->name + " -- " + sym->comment;
+  if (!sym && bits.empty()) return "";
+  std::string out = "  ; ";
+  if (sym) out += sym->name + " -- " + sym->comment;
+  if (!bits.empty()) {
+    if (sym) out += " ";
+    out += "[bit: " + bits + "]";
+  }
+  return out;
 }
 
 // A label line, with a known-address comment and/or keyword back-link

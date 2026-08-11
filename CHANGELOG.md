@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.6.6] - 2026-08-11
+
+### Added
+- `pc1500disasm` now annotates individual bits of `STATUS1`/`STATUS2`
+  (`764EH`/`764FH`) when a `bii`/`ani`/`ori` instruction's immediate mask
+  touches one, e.g. `bii (0x764E),0x02` now shows `[bit: SHIFT]` alongside
+  the byte-level name, instead of every instruction touching that byte
+  showing an identical generic annotation. Bit names are from the PC-1500
+  Technical Reference Manual's own bit-layout table (p.98).
+
 ## [0.6.5] - 2026-08-11
 
 ### Fixed

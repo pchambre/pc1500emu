@@ -70,6 +70,22 @@ void testFindKnownSymbol() {
   }
 }
 
+// STATUS1/STATUS2's (764EH/764FH) individual bits, per the PC-1500
+// Technical Reference Manual's own bit-layout table (p.98).
+void testDescribeBits() {
+  CHECK(describeBits(0x764F, /*me1=*/false, 0x40) == "RUN");
+  CHECK(describeBits(0x764E, /*me1=*/false, 0x01) == "BUSY");
+  // A mask can touch more than one named bit at once.
+  CHECK(describeBits(0x764E, /*me1=*/false, 0xFE) == "DEF,I,II,III,SMALL,SML,SHIFT");
+  // Bit 7 and bit 3 of 764FH are "NOT USED" per the manual -- no entry,
+  // so a mask that only touches those bits describes nothing.
+  CHECK(describeBits(0x764F, /*me1=*/false, 0x88) == "");
+  // An address with no known bit fields at all.
+  CHECK(describeBits(0x1234, /*me1=*/false, 0xFF) == "");
+  // ME0/ME1 are separate spaces, same as findKnownSymbol.
+  CHECK(describeBits(0x764E, /*me1=*/true, 0x01) == "");
+}
+
 // Integration check: a synthetic module-mode image whose only instruction
 // is the real SML-dispatch fragment from E36AH (ORI (7B0EH),0x01,
 // hand-disassembled this session and confirmed against ROM1.BIN) --
@@ -95,6 +111,31 @@ void testFormatListingAnnotatesKnownAddress() {
   std::string listing = formatListing(image, r);
   CHECK(listing.find("KEYGATE") != std::string::npos);
   CHECK(listing.find("ori (0x7B0E),0x01") != std::string::npos);
+}
+
+// Same shape as testFormatListingAnnotatesKnownAddress, but for a
+// bii/ani/ori instruction whose immediate mask matches a KnownBitField --
+// confirms the "[bit: NAME]" annotation reaches formatListing's actual
+// output text (alongside the byte-level STATUS1 name), not just
+// describeBits in isolation.
+void testFormatListingAnnotatesKnownBit() {
+  constexpr uint16_t kBase = 0x9000;
+  std::vector<uint8_t> image(0x800, 0xFF);
+  auto put = [&](uint16_t addr, std::initializer_list<uint8_t> bytes) {
+    uint16_t a = addr;
+    for (uint8_t b : bytes) image[a++ - kBase] = b;
+  };
+  image[0x9000 - kBase] = 0x55;
+  put(0x9001, {0x91, 'A', 0xE1, 0x00, 0x90, 0x20});  // "A" -> addr 9020
+  put(0x9007, {0x91, 'B', 0xE1, 0x01, 0x90, 0x30});  // "B" -> addr 9030
+  put(0x9020, {0xED, 0x76, 0x4E, 0x02});             // bii (0x764E),0x02 (SHIFT)
+  put(0x9024, {0x9A});                               // rtn
+  put(0x9030, {0x9A});                               // rtn
+
+  AnalysisResult r = analyzeModuleRom(image, kBase);
+  std::string listing = formatListing(image, r);
+  CHECK(listing.find("bii (0x764E),0x02  ; STATUS1 -- status byte 1: "
+                      "busy/shift/small/def flags [bit: SHIFT]") != std::string::npos);
 }
 
 // A call target (SJP's Imm16 operand, resolved via d.branchTarget) is a
@@ -212,7 +253,9 @@ void testLookupSymbolPrecedence() {
 
 int main() {
   testFindKnownSymbol();
+  testDescribeBits();
   testFormatListingAnnotatesKnownAddress();
+  testFormatListingAnnotatesKnownBit();
   testSjpTargetAnnotated();
   testRealProgramFileAnnotated();
   testLoadUserSymbolsFileValid();

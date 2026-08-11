@@ -256,6 +256,30 @@ constexpr KnownSymbol kSymbols[] = {
     {0xABEF, false, "PRT_GRAPHIC_MODE", "switch printer from text to graphic mode (CE-150 module required, PV low)"},
     {0xACBB, false, "PRT_TEXT_MODE", "get printer TEXT mode ready (the counterpart to PRT_GRAPHIC_MODE); confirmed calling PRT_GRAPHIC_MODE and touching GRAPH_TEXT/SCISSORING_COUNTER_YH in this project's own CE-150.ROM disassembly (CE-150 module required, PV low, ROM version 1 -- AC8FH on version 0)"},
 };
+
+// STATUS1/STATUS2's (764EH/764FH) individual bits, per the PC-1500
+// Technical Reference Manual's own bit-layout table (p.98, Memory Map VI)
+// -- lets a bii/ani/ori instruction touching one of these get annotated
+// with exactly which flag it's checking/setting/clearing, not just the
+// byte-level "STATUS1"/"STATUS2" name every such instruction would
+// otherwise show identically. Bit 7 and bit 3 of 764FH are "NOT USED" per
+// the manual -- no entries for those.
+constexpr KnownBitField kBitFields[] = {
+    {0x764E, false, 0x80, "DEF"},
+    {0x764E, false, 0x40, "I"},
+    {0x764E, false, 0x20, "II"},
+    {0x764E, false, 0x10, "III"},
+    {0x764E, false, 0x08, "SMALL"},
+    {0x764E, false, 0x04, "SML"},
+    {0x764E, false, 0x02, "SHIFT"},
+    {0x764E, false, 0x01, "BUSY"},
+    {0x764F, false, 0x40, "RUN"},
+    {0x764F, false, 0x20, "PRO"},
+    {0x764F, false, 0x10, "RESERVE"},
+    {0x764F, false, 0x04, "RAD"},
+    {0x764F, false, 0x02, "G"},
+    {0x764F, false, 0x01, "DE"},
+};
 // clang-format on
 
 }  // namespace
@@ -265,6 +289,17 @@ const KnownSymbol* findKnownSymbol(uint16_t addr, bool me1) {
     if (s.addr == addr && s.me1 == me1) return &s;
   }
   return nullptr;
+}
+
+std::string describeBits(uint16_t addr, bool me1, uint8_t value) {
+  std::string out;
+  for (const auto& b : kBitFields) {
+    if (b.addr == addr && b.me1 == me1 && (value & b.mask) != 0) {
+      if (!out.empty()) out += ",";
+      out += b.name;
+    }
+  }
+  return out;
 }
 
 bool loadUserSymbolsFile(const std::string& path, std::vector<UserSymbol>* out, std::string* error) {

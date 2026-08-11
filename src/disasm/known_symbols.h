@@ -35,6 +35,29 @@ struct KnownSymbol {
 // nullptr.
 const KnownSymbol* findKnownSymbol(uint16_t addr, bool me1);
 
+// A single named bit within a byte-wide flags/status register -- distinct
+// from KnownSymbol, which documents a whole *address*; this documents one
+// specific *bit* of one, for a bii/ani/ori-style instruction whose
+// immediate operand tests/sets/clears it (e.g. `bii (0x764E),0x02`
+// touches just the SHIFT bit, not "STATUS1" generically). mask always has
+// exactly one bit set.
+struct KnownBitField {
+  uint16_t addr;
+  bool me1;
+  uint8_t mask;
+  const char* name;
+};
+
+// Returns the name(s) of every bit set in `value` (as tested/set/cleared
+// by a bii/ani/ori-style instruction with immediate operand `value`
+// against `addr`) that this project has a name for, comma-joined -- or an
+// empty string if `addr` has no known bit fields at all, or `value`
+// doesn't set any of them (e.g. a multi-purpose mask this table doesn't
+// individually break down). A mask can legitimately touch more than one
+// named bit at once (e.g. clearing two flags together), so more than one
+// name can come back.
+std::string describeBits(uint16_t addr, bool me1, uint8_t value);
+
 // A user-supplied symbol, loaded from a --symbols-file at CLI startup --
 // see loadUserSymbolsFile. Unlike KnownSymbol (a constexpr table pointing
 // at string literals), this owns its strings: name/comment come from a
