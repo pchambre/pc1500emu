@@ -75,6 +75,37 @@ comment explaining it.
 - **`4000H-40C4H` is live BASIC firmware state**, not free RAM, despite
   being in the "user RAM" chip-select region — see the "reserve area
   gotcha" in `docs/pc1500_hardware_reference.md`.
+- **OPB (F00FH bit 5) and IF (F00BH bit 1) are two different views of the
+  same RTC TP signal** — OPB is a live, continuous level; IF is a
+  one-shot edge latch — and WAIT/BEEP's shared poll loop (`LE89C`-`LE8BC`)
+  reads OPB first, falling back to IF only when OPB reads low, treating
+  "IF set while OPB was low" as BREAK. Confirmed live: the ROM's own poll
+  loop has a real, measured ~61us gap between the two actual register
+  reads (not just a few CPU cycles — a `vmj` plus a helper routine sits in
+  between), so any emulation of this needs to keep the two answers
+  consistent across that gap or WAIT spuriously aborts. See `Upd1990ac`'s
+  class comment in `src/bus/bus.h` for the fix (an OPB-anchored debounce,
+  not a shared time grid) and why the naive fix makes it worse.
+
+## Debugging timing-sensitive emulator code
+
+- **A deterministic clock plus a fixed-cycle poll loop can turn a
+  "rare" hardware race into a "fails every single time" bug**, and vice
+  versa: fixing it by snapping timestamps to a shared fixed grid can make
+  it *worse*, not better, since "does this iteration straddle the grid
+  line" becomes itself a fixed yes/no that repeats identically on every
+  tick. If two related signals derived from the same lazily-resynced
+  clock need to agree when read close together, anchor debouncing to
+  "time since whichever signal is authoritative last actually resampled,"
+  not to a fixed time grid — see the RTC fact above for a worked example.
+- **Don't infer the timing gap between two points from a trace hook's own
+  "cycles since I last printed" delta** — that measures the cost of
+  executing the instruction that landed at the print site, not the true
+  gap to whatever happens next. Cost real time in this project once
+  (assumed ~6-8 cycles between two register reads from instruction
+  counting; the real gap, measured by instrumenting the actual internal
+  timestamp directly, was ~79 cycles / 61us). When a gap matters, print
+  the actual internal state/timestamp at each point, not a step counter.
 
 ## Writing and testing ML programs on real PC-1500 hardware
 
