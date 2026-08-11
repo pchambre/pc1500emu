@@ -364,10 +364,47 @@ Install the extension by copying `tools/vscode-lh5801-asm/` into
 `%USERPROFILE%\.vscode\extensions\` (Windows) or `~/.vscode/extensions/`
 (Linux/Mac), then reload the window.
 
+The extension also has three commands that take you from source to a
+running (or debugged) program without leaving the editor:
+
+- **"LH5801: Assemble to BIN"** — right-click a `.asm`/`.s` file (or run
+  from the Command Palette against the active editor) to run
+  `sdaslh5801` → `sdld` → `makebin` and produce a flat, loadable
+  `<name>.bin` beside the source (plus `<name>.lst`/`.ihx`/`.map`/etc.,
+  left in place rather than cleaned up, in case a link error needs
+  investigating). No load-address prompt is needed: the address comes
+  straight from the source file's own `.area ... (ABS)` / `.org`
+  (matching this project's convention — see `ce150.asm`-style output),
+  read back out of the linked `.ihx`'s first data record. Requires
+  `lh5801.sdasCommand`, `lh5801.linkCommand`, and `lh5801.makebinCommand`
+  set in `settings.json` — a plain native path on any platform (Windows:
+  an MSVC or MSYS2 build, e.g. `sdcc/bin_vc/sdaslh5801.exe`; Linux/Mac:
+  e.g. `sdcc/bin/sdaslh5801`), or `wsl <path>` on Windows for a WSL-only
+  build (see each setting's own description for the exact forms).
+- **"LH5801: Build C to BIN"** — the same idea for a `.c` file, running
+  sdcc-pc1500's own `build-lh5801.sh` (prompts once for the load
+  address, since a C program's base isn't self-evident the way a
+  hand-assembled/disassembled `.asm`'s `.org` is). Requires
+  `lh5801.buildCCommand` — since it's a bash script, that's always the
+  `wsl ...` form on Windows, or a plain path (or `bash <path>`) on
+  Linux/Mac.
+- **"LH5801: Run in pc1500emu"** and **"LH5801: Debug in pc1500emu"** —
+  available on `.asm`/`.s`/`.c` files (assembling/building first) or an
+  already-built `.bin`/`.rom`. Prompts for how to load it (as a plain
+  application via `loadbinary`, or as a CE-150/153/158-style plug-in ROM
+  via `loadrommodule`, picking one of four independent slots), then
+  either drives an already-running (or freshly-launched, via
+  `lh5801.emulatorPath`/`lh5801.romPath`) `pc1500emu` directly over the
+  command pipe and `call`s the entry point, or starts an `lh5801` debug
+  session the same way F5 would (see Debugger below) — you're asked
+  whether to attach to a running instance or launch a fresh one.
+
 Opening this repo in VS Code also picks up:
 - `.vscode/settings.json` — associates `*.asm`/`*.s` with the extension's
-  grammar (scoped to this project only), and holds `lh5801.disasmCommand`
-  (above) and `lh5801.sdasCommand` (below).
+  grammar (scoped to this project only), and holds `lh5801.disasmCommand`,
+  `lh5801.sdasCommand` (below), and the `lh5801.linkCommand`/
+  `lh5801.makebinCommand`/`lh5801.buildCCommand`/`lh5801.emulatorPath`/
+  `lh5801.romPath` settings the commands above use.
 - `.vscode/tasks.json` — a build task (`Ctrl+Shift+B`) that runs
   `sdaslh5801` on the active file and reports errors in the Problems panel.
   Fill in `lh5801.sdasCommand` in `settings.json` with your own built
@@ -396,6 +433,13 @@ configurations:
   first, then F5 to load a program into it and start debugging.
 - **"LH5801: Launch pc1500emu and debug"** — starts `pc1500emu` itself
   (fill in `romPath` for your machine first).
+
+These are templates for a specific, already-assembled `program`/`listing`
+pair — fill in the paths and addresses by hand. The extension's own
+**"LH5801: Debug in pc1500emu"** command (see Editing disassembly output
+above) does the same thing but builds this configuration for you from a
+`.asm`/`.c`/`.bin` file directly, including the assemble/build and
+load-address steps, and is the easier path for day-to-day use.
 
 Both load a program (`program`/`loadAddress`/`loadMode` — raw binary via
 `loadbinary`, or a CE-150-style plug-in ROM via `loadrommodule`), set the

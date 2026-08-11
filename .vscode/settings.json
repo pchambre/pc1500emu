@@ -8,13 +8,29 @@
     "*.s": "lh5801-asm"
   },
 
-  // The command tasks.json's build task runs, as a single string split on
-  // spaces (no quoting support -- keep paths space-free, or point at a
-  // short wrapper script). Left blank until sdaslh5801 is actually built;
-  // fill in one of:
-  //   WSL build:   wsl /home/<you>/sdcc-pc1500/sdcc/sdas/aslh5801/sdaslh5801
-  //   MSYS2 build: C:/msys64/home/<you>/sdcc-pc1500/sdcc/sdas/aslh5801/sdaslh5801.exe
-  "lh5801.sdasCommand": "",
+  // The command tasks.json's build task (and the lh5801-asm extension's
+  // "LH5801: Assemble to BIN"/"Run"/"Debug in pc1500emu" commands) run, as
+  // a single string split on spaces (no quoting support -- keep paths
+  // space-free, or point at a short wrapper script). sdaslh5801/sdld/
+  // makebin all have a native MSVC build under sdcc-pc1500/sdcc/bin_vc/ on
+  // this machine, so these are plain .exe paths -- no "wsl" prefix/path-
+  // translation overhead needed (that convention still exists for a
+  // WSL-only build; see lh5801.buildCCommand below, and each setting's own
+  // package.json description).
+  "lh5801.sdasCommand": "C:/Users/paulc/sdcc-pc1500/sdcc/bin_vc/sdaslh5801.exe",
+
+  // sdld (the sdas-family linker) and makebin, both built alongside
+  // sdaslh5801 above -- used by "LH5801: Assemble to BIN" to turn a .rel
+  // into a flat, loadable .bin.
+  "lh5801.linkCommand": "C:/Users/paulc/sdcc-pc1500/sdcc/bin_vc/sdld.exe",
+  "lh5801.makebinCommand": "C:/Users/paulc/sdcc-pc1500/sdcc/bin_vc/makebin.exe",
+
+  // build-lh5801.sh (sdcc-pc1500's own C-to-flat-binary pipeline for the
+  // LH5801 SDCC port) -- used by "LH5801: Build C to BIN". Always the
+  // "wsl" form since it's a bash script, and there's no native sdcc.exe
+  // under bin_vc/ (only the three assembler-toolchain pieces above are
+  // built there) -- so this one still goes through WSL.
+  "lh5801.buildCCommand": "wsl /mnt/c/Users/paulc/sdcc-pc1500/sdcc/support/scripts/build-lh5801.sh",
 
   // Path to pc1500disasm(.exe), used by the lh5801-asm extension's
   // "LH5801: Disassemble to ASM" command (right-click a .ROM/.BIN file in
@@ -22,5 +38,11 @@
   // above, this one is built by this repo's own CMake build, so it has a
   // real default here rather than being left blank -- adjust for Linux/Mac
   // (drop the RelWithDebInfo path segment and the .exe: build/src/disasm/pc1500disasm).
-  "lh5801.disasmCommand": "${workspaceFolder}/build/src/disasm/RelWithDebInfo/pc1500disasm.exe"
+  "lh5801.disasmCommand": "${workspaceFolder}/build/src/disasm/RelWithDebInfo/pc1500disasm.exe",
+
+  // Used by "LH5801: Run in pc1500emu" / "LH5801: Debug in pc1500emu" to
+  // launch a fresh instance when one isn't already running. romPath
+  // matches this repo's own pc1500emu.json.
+  "lh5801.emulatorPath": "${workspaceFolder}/build/src/host/RelWithDebInfo/pc1500emu.exe",
+  "lh5801.romPath": "C:\\Users\\paulc\\Documents\\PC1500\\ROM1.BIN"
 }

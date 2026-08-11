@@ -10,12 +10,39 @@
   },
   "categories": ["Programming Languages", "Debuggers"],
   "main": "./extension.js",
-  "activationEvents": ["onCommand:lh5801-asm.disassemble"],
+  "extensionKind": ["ui"],
+  "activationEvents": [
+    "onCommand:lh5801-asm.disassemble",
+    "onCommand:lh5801-asm.assemble",
+    "onCommand:lh5801-asm.buildC",
+    "onCommand:lh5801-asm.run",
+    "onCommand:lh5801-asm.debugInEmulator"
+  ],
   "contributes": {
     "commands": [
       {
         "command": "lh5801-asm.disassemble",
         "title": "Disassemble to ASM (pc1500disasm)",
+        "category": "LH5801"
+      },
+      {
+        "command": "lh5801-asm.assemble",
+        "title": "Assemble to BIN (sdaslh5801)",
+        "category": "LH5801"
+      },
+      {
+        "command": "lh5801-asm.buildC",
+        "title": "Build C to BIN (build-lh5801.sh)",
+        "category": "LH5801"
+      },
+      {
+        "command": "lh5801-asm.run",
+        "title": "Run in pc1500emu",
+        "category": "LH5801"
+      },
+      {
+        "command": "lh5801-asm.debugInEmulator",
+        "title": "Debug in pc1500emu",
         "category": "LH5801"
       }
     ],
@@ -25,6 +52,48 @@
           "command": "lh5801-asm.disassemble",
           "when": "resourceExtname =~ /\\.(rom|bin)$/i",
           "group": "navigation"
+        },
+        {
+          "command": "lh5801-asm.assemble",
+          "when": "resourceExtname =~ /\\.(asm|s)$/i",
+          "group": "navigation"
+        },
+        {
+          "command": "lh5801-asm.buildC",
+          "when": "resourceExtname == .c",
+          "group": "navigation"
+        },
+        {
+          "command": "lh5801-asm.run",
+          "when": "resourceExtname =~ /\\.(asm|s|c|bin|rom)$/i",
+          "group": "navigation@1"
+        },
+        {
+          "command": "lh5801-asm.debugInEmulator",
+          "when": "resourceExtname =~ /\\.(asm|s|c|bin|rom)$/i",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "lh5801-asm.assemble",
+          "when": "resourceExtname =~ /\\.(asm|s)$/i",
+          "group": "navigation"
+        },
+        {
+          "command": "lh5801-asm.buildC",
+          "when": "resourceExtname == .c",
+          "group": "navigation"
+        },
+        {
+          "command": "lh5801-asm.run",
+          "when": "resourceExtname =~ /\\.(asm|s|c|bin|rom)$/i",
+          "group": "navigation@1"
+        },
+        {
+          "command": "lh5801-asm.debugInEmulator",
+          "when": "resourceExtname =~ /\\.(asm|s|c|bin|rom)$/i",
+          "group": "navigation@2"
         }
       ]
     },
@@ -35,6 +104,36 @@
           "type": "string",
           "default": "",
           "description": "Path to your built pc1500disasm executable, used by 'LH5801: Disassemble to ASM'. Supports ${workspaceFolder}. E.g. ${workspaceFolder}/build/src/disasm/RelWithDebInfo/pc1500disasm.exe on Windows, or ${workspaceFolder}/build/src/disasm/pc1500disasm on Linux/Mac."
+        },
+        "lh5801.sdasCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Command to run sdaslh5801, used by 'LH5801: Assemble to BIN'. A single string split on spaces (no quoting support -- keep paths space-free, or point at a wrapper script). Windows: a plain native-exe path, e.g. 'C:/path/to/sdcc/bin_vc/sdaslh5801.exe' (an MSVC or MSYS2 build), or 'wsl /mnt/c/path/to/sdcc/bin/sdaslh5801' for a WSL-only build (a Windows-style absolute path -- C:\\... -- given as a later argument is auto-translated to /mnt/c/... for the wsl case, since WSL itself does not reliably do this). Linux/Mac: a plain path, e.g. '/home/you/sdcc/bin/sdaslh5801' -- no prefix needed."
+        },
+        "lh5801.linkCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Command to run sdld (the sdas-family linker), used by 'LH5801: Assemble to BIN' to turn sdaslh5801's .rel output into a flat binary. Same convention as lh5801.sdasCommand -- normally lives right next to it (sdcc/bin/sdld or sdcc/bin_vc/sdld.exe)."
+        },
+        "lh5801.makebinCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Command to run makebin, used by 'LH5801: Assemble to BIN' and 'LH5801: Build C to BIN' to turn a linked .ihx into a flat .bin. Same convention as lh5801.sdasCommand -- normally lives right next to it (sdcc/bin/makebin or sdcc/bin_vc/makebin.exe)."
+        },
+        "lh5801.buildCCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Command to run build-lh5801.sh (sdcc-pc1500's support/scripts/build-lh5801.sh), used by 'LH5801: Build C to BIN'. This is a bash script: on Windows it always needs the 'wsl ...' form (e.g. 'wsl /mnt/c/path/to/sdcc-pc1500/sdcc/support/scripts/build-lh5801.sh' -- there's no native sdcc.exe build, so this is WSL-only regardless of whether sdasCommand/linkCommand/makebinCommand above are native); on Linux/Mac, a plain path (e.g. '/home/you/sdcc-pc1500/sdcc/support/scripts/build-lh5801.sh', already executable) or 'bash <path>' works directly, no prefix."
+        },
+        "lh5801.emulatorPath": {
+          "type": "string",
+          "default": "${workspaceFolder}/build/src/host/RelWithDebInfo/pc1500emu.exe",
+          "description": "Path to pc1500emu(.exe), used by 'LH5801: Run in pc1500emu' and 'LH5801: Debug in pc1500emu' to launch a fresh instance when one isn't already running. Supports ${workspaceFolder}. Default is this repo's own Windows (Visual Studio generator) build output; on Linux, use ${workspaceFolder}/build/src/host/pc1500emu (no RelWithDebInfo path segment, no .exe)."
+        },
+        "lh5801.romPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to ROM1.BIN, passed to a freshly-launched pc1500emu by 'LH5801: Run in pc1500emu' / 'LH5801: Debug in pc1500emu'. Not needed if you always attach to an already-running instance."
         }
       }
     },

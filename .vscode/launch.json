@@ -6,12 +6,14 @@
       // yourself first, e.g. via the pc1500emu target or a terminal) and
       // loads the currently-open .asm's assembled program into it.
       //
-      // Known gap as of this writing: sdaslh5801 produces a relocatable
-      // .rel, not a raw loadable binary -- there's no aslink-based link
-      // step wired up yet to turn that into the flat "program" file this
-      // expects. Point "program"/"listing" at a real assembled+linked
-      // binary and its .lst once that toolchain exists; until then this
-      // configuration is a template, not a working one-click debug.
+      // This is a template: point "program"/"listing" at a real
+      // assembled+linked binary and its .lst (sdaslh5801 alone only
+      // produces a relocatable .rel -- sdld+makebin turn that into the
+      // flat binary this expects). The lh5801-asm extension's own
+      // "LH5801: Assemble to BIN" command runs that whole pipeline for
+      // you, and "LH5801: Debug in pc1500emu" builds an equivalent
+      // configuration automatically instead of needing this filled in by
+      // hand -- see README.md's "Editing disassembly output" section.
       "type": "lh5801",
       "request": "launch",
       "name": "LH5801: Attach to running pc1500emu",
