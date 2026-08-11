@@ -166,10 +166,14 @@ constexpr KnownSymbol kSymbols[] = {
     {0xEDF6, false, "DISP_HEX_BYTE", "output one byte as two hex digits to LCD"},
     {0xED95, false, "ASCII_TO_HEX", "convert two ASCII hex chars (X=addr of first) to one byte; X+=2, ACC=result"},
 
+    // -- PC-1500 Technical Reference Manual, p.120's own system-subroutine
+    // table -- entries not already covered above --
+    {0xEDEF, false, "DISP_GRAPHIC", "graphic display (falls into DISP_HEX_BYTE/EDF6H per this project's own ROM1.BIN disassembly)"},
+
     // -- PC-2 manual, same source -- string functions (BASIC keyword entry points) --
     {0xD925, false, "STRCAT", "string concatenation"},
     {0xD9B1, false, "CHR$", "BASIC CHR$ function entry point"},
-    {0xD9CF, false, "STR$", "BASIC STR$ function entry point; numeric value in 7A00H-7A07H, 7894H=10H, result string at 7B10H+ (p.26's memory-map table gives D9C7H instead -- an OCR discrepancy between the two passes; D9CFH used here as the more structured/individually-labeled source, worth confirming against a real ROM1.BIN disassembly)"},
+    {0xD9CF, false, "STR$", "BASIC STR$ function entry point; numeric value in 7A00H-7A07H, 7894H=10H, result string at 7B10H+ (p.26's memory-map table gives D9C7H instead -- an OCR discrepancy between the two passes; D9CFH confirmed correct against the PC-1500 Technical Reference Manual's own system-subroutine table, p.120)"},
     {0xD9D7, false, "VAL", "BASIC VAL function entry point"},
     {0xD9DD, false, "ASC_LEN", "BASIC ASC (YL=60H) / LEN (YL=64H) function entry point"},
     {0xD9F3, false, "RIGHT_LEFT_MID", "BASIC RIGHT$/LEFT$/MID$ function entry point; register conventions differ per variant"},
@@ -178,7 +182,7 @@ constexpr KnownSymbol kSymbols[] = {
     {0xD0F9, false, "STRCMP", "magnitude comparison for character strings"},
     {0xD2EA, false, "FINDLINE", "search for a BASIC program line number"},
     {0xD461, false, "FINDVAR", "find the address of a BASIC variable"},
-    {0xD9D2, false, "NUMCMP", "magnitude comparison for numeric values"},
+    {0xD0D2, false, "NUMCMP", "magnitude comparison for numeric values (corrected from an earlier D9D2H -- likely a 9/0 transcription error in the original source; confirmed against a real ROM1.BIN disassembly, which shows plausible sign-compare-then-FSUB code at D0D2H versus keyword-table glue code at D9D2H, and independently against the PC-1500 Technical Reference Manual's own system-subroutine table, p.120, which agrees with D0D2H)"},
 
     // -- PC-2 manual, same source -- numeric functions (BCD; operands 7A00H-7A07H/7A10H-7A17H) --
     {0xEFB6, false, "FSUB", "X-Y -> X (BCD)"},
@@ -203,28 +207,54 @@ constexpr KnownSymbol kSymbols[] = {
     {0xF59D, false, "FSGN", "SGN(X) -> X (BCD)"},
     {0xF5BE, false, "FINT", "INT(X) -> X (BCD)"},
 
-    // -- PC-2 manual, same source -- cassette I/O, 8000H-BFFFH expansion
-    // ROM (CE-150 module required, PV low -- src/bus/bus.h's Bus::RomModule,
+    // -- PC-2 manual, same source -- cassette I/O, CE-150 expansion ROM
+    // (CE-150 module required, PV low -- src/bus/bus.h's Bus::RomModule,
     // not the PC-2 manual, is the source for the PV-low requirement; the
-    // manual itself only says PU, not PV, gates the printer ROM) --
+    // manual itself only says PU, not PV, gates the printer ROM). These
+    // addresses load at A000H, not the 8000H the PC-2 manual's own prose
+    // says -- confirmed against the PC-1500 Technical Reference Manual's
+    // own memory map (Memory Map I) and this project's own CE-150.ROM
+    // disassembly (every address below only resolves to sensible code at
+    // an A000H base) --
     {0xBF11, false, "TAPE_MOTOR_ON", "turn cassette tape drive on; 7879H bit7=port select, bit4=Remote (CE-150 module required, PV low)"},
     {0xBF43, false, "TAPE_MOTOR_OFF", "turn cassette tape drive off (CE-150 module required, PV low)"},
     {0xBBD6, false, "TAPE_HDR_WRITE", "construct tape sync header/filename; ACC=file mode (00=object,01=program,02=reserve,04=data); header written 7B60H-7B67H, mode at 7B68H (CE-150 module required, PV low)"},
     {0xBCE8, false, "TAPE_HDR_READ", "read tape sync header/search for filename; optional filename at 7B69H-7B78H, 7879H bit7=1 (CE-150 module required, PV low)"},
-    {0xBD3C, false, "TAPE_RW", "read/write a tape file (source article lists a single entry point for both; gating unclear, worth confirming against a real disassembly) (CE-150 module required, PV low)"},
+    {0xBD3C, false, "TAPE_RW", "transfer (read/write) a tape file -- the PC-2 manual's source article lists a single entry point for both and left the gating unclear; the PC-1500 Technical Reference Manual's own system-subroutine table (p.121) confirms this address and calls it \"Transfer file\", resolving that uncertainty (CE-150 module required, PV low)"},
     {0xBDCC, false, "TAPE_PUTC", "send one character to tape; ACC=char, must call TAPE_HDR_WRITE (BBD6H) first (CE-150 module required, PV low)"},
     {0xBDF0, false, "TAPE_GETC", "read one character from tape; ACC=result, Carry=1 on BREAK (CE-150 module required, PV low)"},
+    {0xBBF5, false, "TAPE_IO_CONTROL", "CMT I/O control; confirmed calling TAPE_PUTC in this project's own CE-150.ROM disassembly (CE-150 module required, PV low)"},
 
-    // -- PC-2 manual, same source -- printer, 8000H-BFFFH expansion ROM
-    // (CE-150 module required, PV low -- see the cassette-I/O group's own
-    // comment above for why this cites bus.h rather than the manual) --
+    // -- PC-2 manual, same source -- printer, CE-150 expansion ROM (CE-150
+    // module required, PV low -- see the cassette-I/O group's own comment
+    // above for why this cites bus.h rather than the manual, and for the
+    // A000H-not-8000H correction, which applies here too) --
     {0xA519, false, "PRT_PEN_COLOR", "change printer pen color (CE-150 module required, PV low)"},
     {0xA769, false, "PRT_MOTOR_OFF", "printer motor off (CE-150 module required, PV low)"},
     {0xA781, false, "PRT_PUTC", "send one ASCII char to printer, no line feed (CE-150 module required, PV low)"},
-    {0xA8DD, false, "PRT_LF", "send a line feed to printer (CE-150 module required, PV low)"},
+    // A8DDH was previously mislabeled PRT_LF ("send a line feed") here --
+    // corrected against the PC-1500 Technical Reference Manual's own
+    // system-subroutine table (p.121, CE-150 ROM version 1 -- confirmed
+    // this project's own CE-150.ROM is version 1 via its A800H marker byte
+    // (0BEH); the manual gives different addresses for version 0, in
+    // parentheses), which calls this address "Motor drive" instead and
+    // gives A9F1H for the real Linefeed entry. Disassembling this
+    // project's own CE-150.ROM at both addresses (--mode program, sliced
+    // at each address, base A000H -- see this project's own memory-map
+    // notes for why A000H and not 8000H) didn't clearly disambiguate A8DDH
+    // by code shape alone, so this correction rests on the manual being
+    // Sharp's own authoritative source, not on independently-traced
+    // behavior the way most of this file's other entries are.
+    {0xA8DD, false, "PRT_MOTOR_DRIVE", "printer motor drive (CE-150 module required, PV low, ROM version 1 -- A8B7H on version 0)"},
+    {0xA9F1, false, "PRT_LF", "send a line feed to printer (CE-150 module required, PV low, ROM version 1 -- A9CBH on version 0)"},
     {0xAA04, false, "PRT_N_LF", "send n line feeds to printer (CE-150 module required, PV low)"},
-    {0xAA09, false, "PRT_PEN_UPDOWN", "printer pen up/down (CE-150 module required, PV low)"},
+    // AA09H was previously labeled PRT_PEN_UPDOWN here -- the Technical
+    // Reference Manual's own table doesn't list this address at all, and
+    // gives AAE3H for "Pen up/down" instead (see below); this entry is
+    // removed rather than kept alongside a guess at what AA09H actually is.
+    {0xAAE3, false, "PRT_PEN_UPDOWN", "printer pen up/down (CE-150 module required, PV low, ROM version 1 -- AABDH on version 0)"},
     {0xABEF, false, "PRT_GRAPHIC_MODE", "switch printer from text to graphic mode (CE-150 module required, PV low)"},
+    {0xACBB, false, "PRT_TEXT_MODE", "get printer TEXT mode ready (the counterpart to PRT_GRAPHIC_MODE); confirmed calling PRT_GRAPHIC_MODE and touching GRAPH_TEXT/SCISSORING_COUNTER_YH in this project's own CE-150.ROM disassembly (CE-150 module required, PV low, ROM version 1 -- AC8FH on version 0)"},
 };
 // clang-format on
 

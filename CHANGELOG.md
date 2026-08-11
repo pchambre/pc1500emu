@@ -4,6 +4,29 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.6.5] - 2026-08-11
+
+### Fixed
+- `NUMCMP` (numeric comparison entry point) was cataloged at `D9D2H` --
+  corrected to `D0D2H` (likely a 9/0 transcription error in the original
+  source), confirmed against both a real `ROM1.BIN` disassembly and the
+  PC-1500 Technical Reference Manual's own system-subroutine table.
+- Two `CE-150` printer entry points were mislabeled: `A8DDH` (was
+  `PRT_LF`, is actually printer motor drive) and `AA09H` (was
+  `PRT_PEN_UPDOWN`, an address the manual doesn't list at all) -- the
+  real `PRT_LF` is `A9F1H` and the real `PRT_PEN_UPDOWN` is `AAE3H`, both
+  confirmed against this project's own `CE-150.ROM`.
+- The cassette/printer `CE-150` module entries' own comments said they
+  load at `8000H` (per the PC-2 Assembly manual's prose) -- corrected to
+  `A000H`, confirmed against both the Technical Reference Manual's own
+  memory map and this project's `CE-150.ROM` disassembly.
+
+### Added
+- Three new confirmed `CE-150`/ROM entry points from the PC-1500
+  Technical Reference Manual's own system-subroutine table (p.120-121):
+  `PRT_TEXT_MODE` (`ACBBH`), `DISP_GRAPHIC` (`EDEFH`), and
+  `TAPE_IO_CONTROL` (`BBF5H`).
+
 ## [0.6.4] - 2026-08-11
 
 ### Added
