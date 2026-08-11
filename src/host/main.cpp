@@ -1565,6 +1565,13 @@ int main(int argc, char** argv) {
     int used = (c > 0) ? c : 1;
     cyclesSinceTimerTick += used;
     bus.advanceCycles(used);
+    // See Upd1990ac::useManualClock()'s own comment: advancing the RTC's
+    // manual clock per instruction (scaled by its own cycle cost), rather
+    // than letting real-time-dependent register reads call the host clock
+    // directly, is what keeps WAIT/BEEP's poll loop from missing TP
+    // transitions during a burst of instructions that executes in a tiny
+    // fraction of a millisecond of real time.
+    bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
     while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
       cpu.tickTimer();
       cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -3418,6 +3425,13 @@ int main(int argc, char** argv) {
     auto audioNow = std::chrono::steady_clock::now();
     double elapsedSeconds = std::chrono::duration<double>(audioNow - lastAudioTime).count();
     lastAudioTime = audioNow;
+    // Re-anchors the RTC's manual clock to the real host clock's current
+    // instant for this frame -- see Upd1990ac::useManualClock()'s own
+    // comment. Instructions stepped below (both the debug and normal
+    // paths) advance it smoothly from here by their own cycle cost,
+    // rather than every register read calling the host clock directly
+    // and seeing one frozen snapshot for the whole frame's burst.
+    bus.ioPort().useManualRtcClock();
     bus.pollRtc();
     audioSampleAccumulator += elapsedSeconds * kAudioSampleRate;
     int samplesThisFrame = static_cast<int>(audioSampleAccumulator);
@@ -3455,6 +3469,8 @@ int main(int argc, char** argv) {
         cyclesRun += used;
         cyclesSinceTimerTick += used;
         bus.advanceCycles(used);
+        // See the useManualRtcClock() call above this loop.
+        bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
         while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
           cpu.tickTimer();
           cyclesSinceTimerTick -= kCyclesPerTimerTick;

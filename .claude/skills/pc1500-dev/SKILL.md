@@ -86,6 +86,44 @@ comment explaining it.
   consistent across that gap or WAIT spuriously aborts. See `Upd1990ac`'s
   class comment in `src/bus/bus.h` for the fix (an OPB-anchored debounce,
   not a shared time grid) and why the naive fix makes it worse.
+- **`Upd1990ac`'s `tpConfigured_` is a one-way latch by default — nothing
+  in the datasheet's own command semantics ever turns TP back off, and
+  WAIT/BEEP is the *only* caller that ever configures it.** Confirmed:
+  once any WAIT/BEEP call has run, TP oscillates in the background for
+  the rest of the process's life unless something explicitly disables it,
+  and *any* later, unrelated read of IF (the idle READY-prompt loop's own
+  BREAK check, `KEYSCAN_WAIT`/`LE269`; the generic statement-boundary
+  break-check `LC42A`) picks up genuine RTC ticks and misreads them as
+  BREAK, since both share the same bit with no way to tell the source
+  apart — symptom confirmed live: the screen visibly cleared periodically
+  at the idle prompt long after any WAIT had finished. Fixed by resetting
+  `tpConfigured_` (and the TP level/edge state) whenever a Group 0
+  (register-mode, C2=0) RTC command is latched — confirmed via
+  disassembly that both WAIT's poll-loop abort path (`LE8B4`) *and* its
+  normal successful-completion path (`LE8C3`-`LE8C5`) issue this exact
+  command as their own cleanup, so this reliably fires either way.
+- **A rendered frame's entire CPU cycle budget executes in well under a
+  millisecond of real time on any modern host** (a simple interpreted
+  8-bit core easily retires tens of millions of instructions/sec) — so
+  code that reads the real host clock directly on every register access,
+  once per rendered frame, sees essentially the *same* timestamp for the
+  whole frame's burst. `main.cpp`'s frame loop bursts through
+  `kCyclesPerFrame` cycles near-instantly, then sleeps out the rest of
+  the ~16.7ms frame via a trailing `SDL_Delay` — so anything needing
+  finer-than-one-frame real-time resolution (WAIT/BEEP's poll loop,
+  needing ~7.8ms resolution at 64Hz) must not read the host clock
+  directly. Fixed by promoting the RTC's test-only manual/frozen clock
+  (`Upd1990ac::useManualClock()`/`advanceManualClock()`, formerly
+  `testFreezeClock()`/`testAdvanceSeconds()`) to production use too: the
+  main loop re-anchors it to the real clock once per frame, then advances
+  it after every CPU instruction by that instruction's own cycle cost —
+  smooth, monotonic progress within a frame, still re-synced to real time
+  every frame so it can't drift over a long session. Confirmed live via
+  direct `U`-register-decrement-rate measurement (poll `status` at known
+  `Stopwatch` intervals — see the live-testing section above), not just
+  by re-running the headless suite: the headless tests already modeled
+  smooth per-instruction time advancement and were passing throughout,
+  so they could not have caught this class of bug on their own.
 
 ## Debugging timing-sensitive emulator code
 
@@ -106,6 +144,46 @@ comment explaining it.
   counting; the real gap, measured by instrumenting the actual internal
   timestamp directly, was ~79 cycles / 61us). When a gap matters, print
   the actual internal state/timestamp at each point, not a step counter.
+
+## Driving the live emulator for manual verification
+
+Headless `ctest` coverage is not a substitute for actually running the
+live `pc1500emu.exe` and checking real behavior — see the "Debugging
+timing-sensitive emulator code" section above for a case where the
+headless suite passed cleanly while the live build was still measurably
+broken (the headless RTC clock advances smoothly per instruction; the
+live build's actual CPU stepping is bursty, once per rendered frame, and
+only production code exercises that difference). Drive the live build via
+the FIFO/pipe command interface (`tools/send-command.ps1` on Windows,
+plain FIFO redirection on Linux — see `README.md`'s "Scriptable command
+interface" section for the full command list) rather than trying to
+automate real keypresses. Mistakes made (and fixed) doing this:
+
+1. **Always send `automation on` first.** Without it, a stray real
+   keypress landing on the window (or just normal window-focus churn)
+   can interleave with and corrupt a scripted command sequence.
+2. **A fresh boot (or after a `reset` command) needs `CL` then `NEW0`
+   (typed, then Enter) before anything else** — typing/loading a program
+   or expecting clean state without this first can get silently rejected
+   or behave oddly. `reset` in particular does not reliably leave the
+   machine in a state a second `loadbasictext` can load cleanly into
+   (confirmed: reloading over an existing line 1 without a fresh `CL`
+   +`NEW0` first got rejected) — when in doubt, kill and relaunch the
+   process instead of trusting `reset` alone.
+3. **Changing extension RAM size also needs `reset`, `CL`, and `NEW0`**
+   to actually take effect.
+4. **`RUN` only works from RUN mode, not PRO mode** (the mode the
+   machine is in right after loading/typing a program). Press `key mode`
+   to toggle into RUN mode before typing `RUN` and pressing Enter —
+   typing `RUN` while still in PRO mode does nothing useful (BASIC either
+   ignores it or treats it as program-text input, not a command).
+5. **To measure real timing precisely, poll `status` and read a specific
+   register's value at known wall-clock intervals (via a `Stopwatch`),
+   rather than waiting for a single terminal condition to appear.**
+   Watching a register count down at 3-4 sampled points and computing the
+   rate directly is far more reliable, and much faster to get an answer
+   from, than polling `displaytext` in a loop hoping to catch the exact
+   moment something completes.
 
 ## Writing and testing ML programs on real PC-1500 hardware
 

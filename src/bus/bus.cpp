@@ -81,6 +81,31 @@ void Upd1990ac::latchCommand(bool c0, bool c1, bool c2) {
     // arrives) is externally indistinguishable to anything that only reads
     // the result afterward, and far simpler.
     if (oldMode == Mode::TimeSet && mode_ != Mode::TimeSet) commitShiftRegisterToTime();
+    // Any Group 0 (register-mode) command means WAIT/BEEP is done with TP
+    // -- confirmed via disassembly: both LE8B4 (poll loop abort) and LE8C3
+    // (poll loop's own successful completion, after the full 16-bit
+    // countdown reaches zero) issue this exact "ldi a,0 / vmj 0x5A"
+    // sequence (Group 0, sel=0/RegisterHold) as their own cleanup, and
+    // nothing else in the ROM ever issues a Group 1 (TP-rate-select)
+    // command at all -- WAIT/BEEP is TP's only caller. Without this,
+    // tpConfigured_ stayed permanently latched true after the *first*
+    // WAIT/BEEP ever run for the life of the process: TP kept oscillating
+    // in the background forever, and consumeRisingEdge() (called by any
+    // later, unrelated IF read -- e.g. the idle READY-prompt loop's own
+    // BREAK check, KEYSCAN_WAIT/LE269, or the generic statement-boundary
+    // break-check LC42A) kept discovering and reporting genuine RTC ticks
+    // as if they were BREAK presses, since both share this same bit with
+    // no way to tell the source apart -- confirmed live: the screen
+    // visibly cleared periodically at the idle prompt, long after any
+    // WAIT statement had actually finished running. Resetting here is
+    // symmetric with the *other* end of this same gate (see
+    // consumeRisingEdge()'s "Returns false unconditionally until..."
+    // comment for why TP shouldn't mean anything before WAIT/BEEP
+    // configures it either).
+    tpConfigured_ = false;
+    tpLevel_ = false;
+    tpEdgePending_ = false;
+    everOpbSynced_ = false;
   } else {
     switch (sel) {
       case 0: tpRateHz_ = 64; tpConfigured_ = true; break;

@@ -202,12 +202,12 @@ std::unique_ptr<BootedMachine> bootAndSettle(const std::vector<uint8_t>& rom,
                                               size_t extRam4800Bytes = 0) {
   auto m = std::make_unique<BootedMachine>();
   // Freeze the RTC's clock to a fake, manually-advanced one (see
-  // Upd1990ac::testFreezeClock()) so real elapsed wall-clock time
+  // Upd1990ac::useManualClock()) so real elapsed wall-clock time
   // (including this test binary's own printf/instrumentation overhead)
   // never bleeds into TP timing -- without this, the same test could
   // observe different RTC state run to run, purely from host timing
   // jitter, since tp()/consumeRisingEdge() otherwise read the real clock.
-  m->bus.ioPort().testFreezeRtcClock();
+  m->bus.ioPort().useManualRtcClock();
   m->bus.loadME0(0xC000, rom.data(), rom.size());
   if (extRam4800Bytes > 0) m->bus.setExtRam4800Size(extRam4800Bytes);
   m->cpu.reset();
@@ -478,7 +478,7 @@ std::set<uint16_t> runProgramAndSamplePc(pc1500::Bus& bus, lh5801::CPU& cpu,
     checkDispNChars();
     int c = cpu.step();
     int used = (c > 0) ? c : 1;
-    bus.ioPort().testAdvanceRtcSeconds(static_cast<double>(used) / kCyclesPerSecond);
+    bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
     cyclesSinceTimerTick += used;
     bus.advanceCycles(used);
     while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
@@ -491,7 +491,7 @@ std::set<uint16_t> runProgramAndSamplePc(pc1500::Bus& bus, lh5801::CPU& cpu,
       checkDispNChars();
       int c = cpu.step();
       int used = (c > 0) ? c : 1;
-      bus.ioPort().testAdvanceRtcSeconds(static_cast<double>(used) / kCyclesPerSecond);
+      bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
       i += used;
       cyclesSinceTimerTick += used;
       bus.advanceCycles(used);
@@ -784,7 +784,7 @@ void testWaitMemoryDump() {
   // WAIT 20 should need if working correctly, matching the real-hardware
   // test's single WAIT 20 checkpoint.
   for (int frame = 0; frame < 60; frame++) {
-    m->bus.ioPort().testAdvanceRtcSeconds(1.0 / 60.0); m->bus.pollRtc();
+    m->bus.ioPort().advanceManualRtcClock(1.0 / 60.0); m->bus.pollRtc();
     for (int i = 0; i < kCyclesPerFrame; i++) {
       int c = m->cpu.step();
       int used = (c > 0) ? c : 1;
@@ -1049,7 +1049,7 @@ void testSteadyStateLoop() {
   std::vector<uint16_t> tailPcs;
   constexpr size_t kTailLen = 60;
   for (int frame = 0; frame < kFrames; frame++) {
-    m->bus.ioPort().testAdvanceRtcSeconds(1.0 / 60.0); m->bus.pollRtc();
+    m->bus.ioPort().advanceManualRtcClock(1.0 / 60.0); m->bus.pollRtc();
     for (int i = 0; i < kCyclesPerFrame; i++) {
       uint16_t pc = m->cpu.p();
       pcHistogram[pc]++;
@@ -1219,7 +1219,7 @@ void testWaitPollTrace() {
     // in production, or this) where that same race is proportional to how
     // close together the two reads are relative to the RTC's own period,
     // not to the test's own frame granularity.
-    m->bus.ioPort().testAdvanceRtcSeconds(static_cast<double>(used) / kCyclesPerSecond);
+    m->bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
     m->cyclesSinceTimerTick += used;
     m->bus.advanceCycles(used);
     while (m->cyclesSinceTimerTick >= kCyclesPerTimerTick) {
@@ -1347,7 +1347,7 @@ void testWaitTimingIsAccurate() {
       int used = (c > 0) ? c : 1;
       double dt = static_cast<double>(used) / kCyclesPerSecond;
       simulatedSeconds += dt;
-      m->bus.ioPort().testAdvanceRtcSeconds(dt);
+      m->bus.ioPort().advanceManualRtcClock(dt);
       m->cyclesSinceTimerTick += used;
       m->bus.advanceCycles(used);
       while (m->cyclesSinceTimerTick >= kCyclesPerTimerTick) {

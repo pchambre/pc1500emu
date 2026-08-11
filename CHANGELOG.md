@@ -4,6 +4,25 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.6.2] - 2026-08-11
+
+### Fixed
+- `WAIT n` (and BEEP's gap-timer) could run many times slower than its
+  true `n/64` seconds -- confirmed live (WAIT 64 took ~10 real seconds
+  instead of 1). A rendered frame's entire CPU cycle budget executes in
+  well under a millisecond of real host time, so reading the real clock
+  directly on every register access meant WAIT's poll loop saw the same
+  frozen timestamp for an entire frame's burst, missing most RTC ticks.
+  Fixed by advancing the RTC's clock smoothly per instruction (scaled by
+  its own cycle cost), re-anchored to the real clock once per frame.
+- After any WAIT/BEEP had run once, the screen could clear spuriously at
+  the idle READY prompt from then on, for the rest of the session -- the
+  real-time clock's TP output never stopped oscillating once configured
+  (nothing ever turned it back off), so its ticks kept leaking into a bit
+  shared with BREAK detection, which the idle loop misread as BREAK
+  presses. Fixed by disabling TP once WAIT/BEEP's own poll loop is done
+  with it.
+
 ## [0.6.1] - 2026-08-11
 
 ### Added

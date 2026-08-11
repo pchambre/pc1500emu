@@ -179,34 +179,64 @@ class Upd1990ac {
   bool debugTpLevel() const { return tp(); }
   int debugTotalToggleCount() const { return debugTotalToggleCount_; }
 
-  // Test-only: freezes syncTp()'s notion of "now" to a fake, manually
-  // advanced clock instead of the real host clock (see now()). Without
-  // this, a test driving many instructions between calls would have real
-  // wall-clock time (including the test's own instrumentation/printf
-  // overhead) bleed into the RTC's state on top of whatever the test
-  // itself intended to simulate -- confirmed as a real source of
-  // nondeterminism (the same test producing different traces run to run)
-  // before this existed. First call establishes the frozen starting
-  // point; call testAdvanceSeconds() to move it forward deterministically.
-  void testFreezeClock() {
-    testClockFrozen_ = true;
-    testClockValue_ = std::chrono::steady_clock::now();
+  // Switches syncTp()'s notion of "now" from directly reading the real
+  // host clock to a manually-advanced one (see now()/advanceManualClock()),
+  // re-anchored to the real host clock's current instant right now. Used
+  // in two different calling patterns:
+  //
+  // - Tests call this *once*, before driving any instructions, then only
+  //   ever move time forward via advanceManualClock() -- a fully frozen,
+  //   deterministic clock. Without this, a test driving many instructions
+  //   between calls would have real wall-clock time (including the
+  //   test's own instrumentation/printf overhead) bleed into the RTC's
+  //   state on top of whatever the test itself intended to simulate --
+  //   confirmed as a real source of nondeterminism (the same test
+  //   producing different traces run to run) before this existed.
+  // - Production (main.cpp) calls this *once per rendered frame*, then
+  //   advances it after every CPU instruction stepped within that frame
+  //   by that instruction's own cycle cost (see advanceManualClock()).
+  //   This is not just a style choice: a rendered frame's entire CPU
+  //   cycle budget executes in a small fraction of a millisecond on any
+  //   modern host (a simple interpreted 8-bit core can retire tens of
+  //   millions of instructions per second), so reading the real host
+  //   clock directly on every register access -- as this class did before
+  //   -- means every read within one frame's burst sees essentially the
+  //   *same* timestamp. WAIT/BEEP's tight ROM poll loop (LE89C-LE8BC in
+  //   _bisect/rom1.asm) can then go an entire frame (~16.7ms) without
+  //   ever observing a TP transition (~7.8ms half-period at 64Hz) at all
+  //   -- and since a frame period is close to *two* TP half-periods,
+  //   transitions frequently net-cancel between one frame's single
+  //   snapshot and the next, so WAIT n could complete many times slower
+  //   than its true n/64 seconds (confirmed live: WAIT 64 took roughly
+  //   10 real seconds instead of 1). Re-anchoring to the real clock once
+  //   per frame (rather than leaving it to drift on cycle-count alone)
+  //   keeps this from accumulating error against real wall-clock time
+  //   over a long session, the same way the audio sample position is
+  //   re-anchored to real elapsed time every frame rather than purely
+  //   interpolated from cycle count.
+  void useManualClock() {
+    manualClockActive_ = true;
+    manualClockValue_ = std::chrono::steady_clock::now();
   }
 
-  // Test-only: advances the frozen fake clock (see testFreezeClock()) by
-  // `seconds`, without actually sleeping and without any real elapsed
-  // time bleeding in between calls.
-  void testAdvanceSeconds(double seconds) {
-    testClockValue_ += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+  // Advances the manual clock (see useManualClock()) by `seconds`,
+  // without actually sleeping and without any real elapsed time bleeding
+  // in between calls. Tests call this with a fixed simulated duration;
+  // production calls this after every CPU instruction, scaled by that
+  // instruction's own cycle count over the emulated clock rate (see
+  // main.cpp's kCyclesPerSecond), so real-time-dependent reads within a
+  // frame see smooth, monotonic progress instead of one frozen snapshot.
+  void advanceManualClock(double seconds) {
+    manualClockValue_ += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(seconds));
   }
 
  private:
-  // now() abstracts the clock source syncTp() uses -- real host time in
-  // production, a frozen/manually-advanced fake clock under
-  // testFreezeClock() (see its own comment for why that matters).
+  // now() abstracts the clock source syncTp() uses -- real host time by
+  // default, a manually-advanced clock once useManualClock() has been
+  // called (see its own comment for the two different ways that's used).
   std::chrono::steady_clock::time_point now() const {
-    return testClockFrozen_ ? testClockValue_ : std::chrono::steady_clock::now();
+    return manualClockActive_ ? manualClockValue_ : std::chrono::steady_clock::now();
   }
 
   // Recomputes tpLevel_/tpEdgePending_ from real elapsed wall-clock time
@@ -257,9 +287,9 @@ class Upd1990ac {
   mutable std::chrono::steady_clock::time_point lastOpbSyncTime_{};
   mutable bool everOpbSynced_ = false;
 
-  // See testFreezeClock()/now().
-  mutable bool testClockFrozen_ = false;
-  mutable std::chrono::steady_clock::time_point testClockValue_{};
+  // See useManualClock()/now().
+  mutable bool manualClockActive_ = false;
+  mutable std::chrono::steady_clock::time_point manualClockValue_{};
 
   // now() + timeOffset_ is this chip's notion of "now". Starts at 0 (i.e.
   // matches host wall-clock time) rather than an arbitrary epoch, so
@@ -346,14 +376,15 @@ class IoPortController {
   bool rtcDebugTpLevel() const { return rtc_.debugTpLevel(); }
   int rtcDebugTotalToggleCount() const { return rtc_.debugTotalToggleCount(); }
 
-  // Test-only, forward to Upd1990ac::testFreezeClock()/testAdvanceSeconds()
-  // -- see their own comments. Call testFreezeRtcClock() once up front,
-  // before any testAdvanceRtcSeconds() calls, or real elapsed wall-clock
-  // time (including the test's own instrumentation overhead) will keep
-  // bleeding into the RTC's state on top of what the test intends to
-  // simulate.
-  void testFreezeRtcClock() { rtc_.testFreezeClock(); }
-  void testAdvanceRtcSeconds(double seconds) { rtc_.testAdvanceSeconds(seconds); }
+  // Forward to Upd1990ac::useManualClock()/advanceManualClock() -- see
+  // their own comments for the two different ways these get used (a
+  // one-time freeze for tests; a once-per-frame resync plus
+  // per-instruction advance in production). Call useManualRtcClock()
+  // before any advanceManualRtcClock() calls, or real elapsed wall-clock
+  // time (including, in a test, the test's own instrumentation overhead)
+  // will keep bleeding in on top of what the caller intends.
+  void useManualRtcClock() { rtc_.useManualClock(); }
+  void advanceManualRtcClock(double seconds) { rtc_.advanceManualClock(seconds); }
   int debugOpcWriteCount() const { return debugOpcWriteCount_; }
   uint8_t debugLastOpcValue() const { return debugLastOpcValue_; }
   const std::vector<uint8_t>& debugOpcWriteHistory() const { return debugOpcWriteHistory_; }
