@@ -447,35 +447,61 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
     uint16_t lineNumber = static_cast<uint16_t>(std::stoul(numberStr));
     std::vector<std::string> segments = splitIntoAtoms(content);
 
-    size_t segIdx = 0;
-    std::string pass1Text = numberStr + " ";
-    while (segIdx < segments.size() && pass1Text.size() + segments[segIdx].size() <= 79) {
-      pass1Text += segments[segIdx];
-      segIdx++;
+    size_t maxPack = 0;
+    {
+      std::string probe = numberStr + " ";
+      while (maxPack < segments.size() && probe.size() + segments[maxPack].size() <= 79) {
+        probe += segments[maxPack];
+        maxPack++;
+      }
     }
-    if (segIdx == 0) {
+    if (maxPack == 0) {
       *error = "line " + numberStr +
                " has a single unsplittable token too long to enter even as the first pass: " +
                segments[0];
       return false;
     }
-    for (char c : pass1Text) {
-      if (!typeChar(c)) {
-        *error = "no keystroke mapping for character '" + std::string(1, c) + "' in line: " + fullLine;
-        return false;
+    // The ROM's tokenizer rejects a pass outright if it ends with an
+    // unbalanced paren (confirmed via DungeonQuest.bas line 35: greedily
+    // packing to the 79-char limit lands mid-"A$(X,Y)", cutting right
+    // after the "(", and the ROM refuses to store the line at all rather
+    // than accepting the partial expression). Rather than special-casing
+    // parens specifically -- there may be other tokenizer rules like this
+    // one that haven't been hit yet -- back the packed atom count off by
+    // one and retry whenever the ROM rejects a pass entirely, down to a
+    // single atom if it comes to that.
+    size_t atomCount = maxPack;
+    std::string pass1Text;
+    bool accepted = false;
+    while (atomCount > 0) {
+      pass1Text = numberStr + " ";
+      for (size_t i = 0; i < atomCount; i++) pass1Text += segments[i];
+      for (char c : pass1Text) {
+        if (!typeChar(c)) {
+          *error = "no keystroke mapping for character '" + std::string(1, c) + "' in line: " + fullLine;
+          return false;
+        }
       }
-    }
-    pressEnter();
-    stepCycles(4L * kIdleFrames * cyclesPerFrame);
-    {
+      pressEnter();
+      stepCycles(4L * kIdleFrames * cyclesPerFrame);
       std::string verifyError;
       std::string detok = detokenizeStoredLine(bus, lineNumber, &verifyError);
-      if (stripSpacesForCompare(detok).find(stripSpacesForCompare(pass1Text)) == std::string::npos) {
-        *error = "line " + numberStr + ": first pass wasn't accepted (rejected by the ROM?): " +
-                 pass1Text;
-        return false;
+      if (stripSpacesForCompare(detok).find(stripSpacesForCompare(pass1Text)) != std::string::npos) {
+        accepted = true;
+        break;
       }
+      // Rejected outright -- clear the failed attempt and retry with one
+      // fewer atom packed in.
+      pressCl();
+      atomCount--;
     }
+    if (!accepted) {
+      *error = "line " + numberStr +
+               ": the ROM rejected every first-pass packing down to a single token, starting with: " +
+               segments[0];
+      return false;
+    }
+    size_t segIdx = atomCount;
 
     // `carry`: leftover text from a pass that got partially, silently
     // truncated by the ROM -- must be retyped (from exactly where it left
@@ -486,10 +512,18 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
     std::string carry;
     size_t carryTargetIdx = segIdx;
     int carryStalls = 0;
+    // Caps how many atoms a fresh (non-carry) pack may pack in, beyond the
+    // ordinary kContinuationPassBudget constraint -- normally no extra
+    // limit, but ratcheted down by one atom whenever a freshly-packed pass
+    // is rejected outright (see below), so the next attempt lands on an
+    // earlier split point instead of retrying the identical text. Reset
+    // once a pack actually lands.
+    size_t maxFreshPackAtoms = segments.size();
     while (segIdx < segments.size() || !carry.empty()) {
       if (onProgress) onProgress();
       std::string passText;
       size_t startIdx = segIdx;
+      bool freshPack = carry.empty();
       if (!carry.empty()) {
         passText = carry;
       } else {
@@ -505,7 +539,7 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
                    std::to_string(storedSize) + ") to append: " + segments[segIdx];
           return false;
         }
-        while (segIdx < segments.size() &&
+        while (segIdx < segments.size() && segIdx - startIdx < maxFreshPackAtoms &&
                static_cast<int>(passText.size() + segments[segIdx].size()) <= room) {
           passText += segments[segIdx];
           segIdx++;
@@ -543,7 +577,21 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
       if (acceptedLen >= passText.size()) {
         // Fully accepted: commit the atoms this pass represented.
         carry.clear();
+        maxFreshPackAtoms = segments.size();
         segIdx = carryTargetIdx;
+        continue;
+      }
+      if (freshPack && acceptedLen == 0 && carryTargetIdx - startIdx > 1) {
+        // Rejected outright (nothing landed at all), same tokenizer
+        // behavior as typeLongLine's pass-1 packing above (e.g. an
+        // unbalanced paren mid-expression) -- not the silent-truncation
+        // case below, which always lands *something*. Retrying the exact
+        // same text would just fail the same way every time, so back this
+        // fresh pack off by one atom and retry the packing from scratch
+        // instead of falling into the carry-retry path.
+        pressCl();
+        maxFreshPackAtoms = (carryTargetIdx - startIdx) - 1;
+        segIdx = startIdx;
         continue;
       }
       // Partially (or not at all) accepted -- the ROM's own input buffer

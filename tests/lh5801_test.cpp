@@ -105,6 +105,38 @@ void testAttTtaBitLayout() {
   CHECK(cpu.a() == 0x1D);
 }
 
+// Direct, timing-independent check of DEC UL's carry output on a plain
+// (non-underflowing) decrement, and BCS's use of it -- written to settle a
+// question that came up tracing the ROM's WAIT poll loop (LE8BC in
+// _bisect/rom1.asm: "dec ul / bcs LE89C"), where a nonzero-to-nonzero
+// decrement (0x20 -> 0x1F) was expected to set carry (looping the poll
+// back around) but live tracing kept showing the branch falling through
+// instead -- isolating just these three opcodes, with no RTC/bus timing
+// involved at all, to check whether that's a genuine CPU-core bug or a
+// tracing artifact elsewhere.
+void testDecNonzeroSetsCarryForBcs() {
+  TestBus bus;
+  lh5801::CPU cpu(bus);
+  cpu.reset();
+  bus.writeME0(0, 0x6A);
+  bus.writeME0(1, 0x20);  // LDI UL,0x20
+  bus.writeME0(2, 0x62);  // DEC UL          (target of the branch below)
+  bus.writeME0(3, 0x93);
+  bus.writeME0(4, 0x03);  // BCS-03H (-> back to the DEC UL at offset 2)
+  cpu.setP(0);
+  cpu.step();  // LDI UL,0x20
+  CHECK((cpu.u() & 0xFF) == 0x20);
+  cpu.step();  // DEC UL -- 0x20 -> 0x1F, no underflow
+  CHECK((cpu.u() & 0xFF) == 0x1F);
+  uint16_t beforeBranch = cpu.p();
+  CHECK(beforeBranch == 3);
+  cpu.step();  // BCS-03H
+  // A plain nonzero decrement must set carry (doAdd: 0x1F... wait, opA was
+  // 0x20 going in; opA + 0xFF = 0x11F > 0xFF -> carry set), so BCS must
+  // branch back to the DEC UL instruction at offset 2.
+  CHECK(cpu.p() == static_cast<uint16_t>(beforeBranch + 2 - 3));
+}
+
 void testBranchPolarityBothDirectionsSameCondition() {
   TestBus bus;
   lh5801::CPU cpu(bus);
@@ -393,6 +425,7 @@ void testManualDisplayShiftRightExample() {
 
 int main() {
   testReset();
+  testDecNonzeroSetsCarryForBcs();
   testAdcCarry();
   testCpaConvention();
   testAttTtaBitLayout();

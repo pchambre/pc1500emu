@@ -31,14 +31,76 @@ namespace pc1500 {
 // "set OPC low 6 bits + pulse STB" helper at E573 -- i.e. C2=1,C1=0,C0=0 on
 // PC5/PC4/PC3 -- which is exactly the datasheet's "TP=64Hz Set" command,
 // before polling PB5 (TP's live level) and IF bit 1 (latched from TP's
-// rising edge, see IoPortController::advanceRealTime()). That's what
-// resolved the mystery of what BEEP's gap timer actually depends on.
+// rising edge). That's what resolved the mystery of what BEEP's gap
+// timer actually depends on -- and, later, of why the *emulator's* WAIT n
+// exited early with a spurious "BREAK IN n": WAIT's own ROM poll loop
+// (LE89C-LE8BC in _bisect/rom1.asm) busy-polls PB5/IF at CPU-instruction
+// granularity, expecting to see every individual TP rising edge, while an
+// earlier version of this class only updated tpLevel_/IF once per
+// *rendered frame* (~16.7ms) via a batched advanceRealTime(elapsedSeconds)
+// call. Since one frame can span multiple TP half-periods (64Hz's own
+// half-period is ~7.8ms), that batch update could process a full
+// low->high->low excursion atomically inside one call, latching IF bit 1
+// for the edge but leaving PB5 back at low by the time any CPU instruction
+// actually ran and could observe it -- a transition genuinely invisible to
+// a busy-poll loop, no matter how tightly it polled, and indistinguishable
+// from a stale leftover flag from an earlier tick. Fixed by computing TP's
+// level *lazily*, from real elapsed wall-clock time, every time it's
+// actually read (see tp()/consumeRisingEdge()) rather than in per-frame
+// batches -- still driven by real time (this chip has its own independent
+// 32.768kHz crystal per the Service Manual's block diagram, so its rate
+// must stay correct regardless of the emulated CPU's own speed), just
+// checked at whatever granularity code actually polls it, so no edge can
+// ever occur without some read eventually being the one to observe it.
 //
-// TP is driven by real elapsed wall-clock time (advanceRealTime()), not
-// CPU cycles: this chip has its own independent 32.768kHz crystal (per the
-// Service Manual's block diagram), so its rate is correct regardless of
-// how fast the emulated CPU itself is running -- same reasoning as
-// main.cpp's audio sample accumulator, just for a different signal.
+// A second, subtler bug survived that first fix: OPB (PB5, level) and IF
+// bit 1 (edge latch) are two *different* views of the same signal -- OPB
+// answers "is TP high right now", IF answers "has TP gone high since I
+// last checked" -- and LE89C-LE8BC's own structure depends on both
+// answers independently and correctly: it busy-spins on OPB alone while
+// TP is genuinely still high (thousands of CPU cycles, ~7.8ms at 64Hz),
+// only falling back to IF when OPB reads low, on the assumption that IF
+// being set at that specific moment can only mean BREAK, since a genuine
+// tick would already show up via OPB. An earlier version of
+// IoPortController::read()'s OPB case (F00FH) helpfully also latched a
+// caught edge into IF bit 1 for a later IF read's benefit -- but that
+// left the bit sitting there, unconsumed, for the *entire* rest of that
+// tick's high phase, so the very next busy-spin iteration's IF check
+// (there is one on every iteration OPB reads high, since it's the only
+// way to distinguish "still waiting" from "BREAK") found it stale-set
+// and took the abort path (LE8B4) -- one tick after every single
+// decrement, not just the first. Fixed by not sharing state between the
+// two register reads at all: IF bit 1's RTC contribution is now computed
+// entirely within IoPortController::read()'s own IF case (0x0B), via its
+// own independent consumeRisingEdge() call, so OPB's read (case 0x0F)
+// has nothing to latch and nothing to leave stale.
+//
+// That still left a narrow race in the *opposite* direction: if a rising
+// edge lands in the handful of CPU cycles between OPB's own read (finding
+// TP still low) and IF's fallback read a few instructions later, IF can
+// genuinely, correctly see a fresh edge OPB itself hasn't observed yet --
+// which LE8A9's branch structure reads as BREAK. Measured live
+// (testWaitPollTrace, direct instrumentation) at ~61us between the two
+// actual register reads (OPB's bii, then a vmj plus the E451 helper's own
+// bii+rtn before IF's read happens), against a ~15us OPB-to-OPB full loop
+// iteration -- initially assumed rare relative to TP's ~7.8ms
+// half-period, but with a fully deterministic clock and a fixed-cycle
+// poll loop this isn't actually rare at all: whatever phase relationship
+// exists between the loop's own cadence and a tick's arrival repeats
+// identically on every tick within one WAIT/BEEP call, so an unlucky
+// alignment fails *every* tick, confirmed live (e8bcCount stuck at 1-2
+// regardless of the requested duration). A fixed time grid was tried next
+// (round both reads' timestamps to a shared quantum before comparing) and
+// made it *worse* for the same determinism reason, just relocating which
+// phase is unlucky rather than removing the phenomenon. What actually
+// fixes it: consumeRisingEdge() (IF's read) is debounced specifically
+// against tp()'s (OPB's read) own most recent timestamp, not a shared
+// grid -- if OPB was checked within the last kTpResyncDebounceSeconds, IF
+// trusts what OPB already established instead of independently
+// resampling, guaranteeing the two agree by construction regardless of
+// absolute phase, since OPB is always the earlier of the two within one
+// poll iteration. OPB's own read is never debounced (always fresh), so it
+// can never itself go stale the way a shared-window approach caused.
 class Upd1990ac {
  public:
   // Forward every OPC write here with its six control-line levels
@@ -48,17 +110,39 @@ class Upd1990ac {
   // need to track state themselves.
   void setControlPins(bool dataIn, bool stb, bool clk, bool c0, bool c1, bool c2);
 
-  // PB5 (TP) / PB6 (DATA OUT) live levels -- see IoPortController::read()'s
-  // OPB case, which reads these unconditionally regardless of DDB (same
+  // PB5 (TP)'s bit as OPB (F00FH) should report it: the live level,
+  // OR'd with any not-yet-independently-observed pending edge (so a read
+  // landing in the handful of CPU cycles between a rising edge and TP's
+  // live level catching up still sees it as high -- the fix for WAIT n's
+  // ROM poll loop, LE89C-LE8BC in _bisect/rom1.asm, missing individual TP
+  // edges that an earlier per-frame-batched model could hide between
+  // polls). Lazily recomputed from real elapsed wall-clock time since TP
+  // was last (re-)configured (see latchCommand) -- see this class's own
+  // comment for why lazy-at-read beats a periodic batch update. Always a
+  // genuine fresh resample, never debounced -- see consumeRisingEdge()'s
+  // own comment for why OPB specifically must never be allowed to go
+  // stale, and why it's the one other reads are debounced against rather
+  // than the reverse. const (mutates the internal tpLevel_/tpEdgePending_
+  // cache plus lastOpbSyncTime_/everOpbSynced_, all mutable below, same
+  // pattern as IoPortController::if_).
+  bool tp() const;
+
+  // PB6 (DATA OUT) live level -- see IoPortController::read()'s OPB case,
+  // which reads both this and tp() unconditionally regardless of DDB (same
   // treatment as PB7/onKeyLine_, since these are fixed hardwired
   // connections on a stock PC-1500, not general-purpose I/O).
-  bool tp() const { return tpLevel_; }
   bool dataOut() const;
 
-  // Advances TP's phase by elapsedSeconds of real time. Returns true if at
-  // least one rising edge occurred since the last call (multiple edges
-  // within one call collapse to a single "true" -- IF is a level flag, not
-  // a counter, so software polling it can't tell the difference anyway).
+  // Returns true, and clears the pending flag, if a TP rising edge has
+  // occurred (per real elapsed wall-clock time) since the last call to
+  // either this or tp() -- called independently by both
+  // IoPortController::read()'s OPB case (F00FH, so a read landing exactly
+  // on the edge still sees TP as high) and its IF case (F00BH bit 1, so
+  // IF alone can detect a fresh edge with no OPB read involved at all --
+  // see that case's own comment for why the two reads deliberately don't
+  // share state beyond both drawing on this same method). Also recomputes
+  // tp()'s cached level as a side effect (both draw from the same lazy
+  // resync), so callers don't need to call tp() first.
   //
   // Returns false unconditionally until the ROM has issued at least one
   // TP-rate-select command (see latchCommand) -- confirmed necessary by a
@@ -74,7 +158,7 @@ class Upd1990ac {
   // TP mean anything before it's actually configured is the simplest fix
   // that resolves the regression while keeping BEEP working (it always
   // configures TP=64Hz before ever polling).
-  bool advanceRealTime(double elapsedSeconds);
+  bool consumeRisingEdge() const;
 
   // Explicitly (re-)syncs this chip's notion of "now" to the host's
   // current wall-clock time -- the same effect BASIC's own TIME command
@@ -87,7 +171,49 @@ class Upd1990ac {
   // the meantime.
   void syncToHostClock() { timeOffset_ = std::chrono::seconds{0}; }
 
+  // TEMPORARY debug accessors for the DungeonQuest.bas WAIT-hang
+  // investigation -- remove once root-caused. Non-invasive (plain const
+  // reads, no behavior change).
+  bool debugTpConfigured() const { return tpConfigured_; }
+  int debugTpRateHz() const { return tpRateHz_; }
+  bool debugTpLevel() const { return tp(); }
+  int debugTotalToggleCount() const { return debugTotalToggleCount_; }
+
+  // Test-only: freezes syncTp()'s notion of "now" to a fake, manually
+  // advanced clock instead of the real host clock (see now()). Without
+  // this, a test driving many instructions between calls would have real
+  // wall-clock time (including the test's own instrumentation/printf
+  // overhead) bleed into the RTC's state on top of whatever the test
+  // itself intended to simulate -- confirmed as a real source of
+  // nondeterminism (the same test producing different traces run to run)
+  // before this existed. First call establishes the frozen starting
+  // point; call testAdvanceSeconds() to move it forward deterministically.
+  void testFreezeClock() {
+    testClockFrozen_ = true;
+    testClockValue_ = std::chrono::steady_clock::now();
+  }
+
+  // Test-only: advances the frozen fake clock (see testFreezeClock()) by
+  // `seconds`, without actually sleeping and without any real elapsed
+  // time bleeding in between calls.
+  void testAdvanceSeconds(double seconds) {
+    testClockValue_ += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(seconds));
+  }
+
  private:
+  // now() abstracts the clock source syncTp() uses -- real host time in
+  // production, a frozen/manually-advanced fake clock under
+  // testFreezeClock() (see its own comment for why that matters).
+  std::chrono::steady_clock::time_point now() const {
+    return testClockFrozen_ ? testClockValue_ : std::chrono::steady_clock::now();
+  }
+
+  // Recomputes tpLevel_/tpEdgePending_ from real elapsed wall-clock time
+  // since tpEpoch_ -- shared by tp() and consumeRisingEdge() so they never
+  // disagree about the current state. const (see tpLevel_ etc.'s own
+  // mutable comment).
+  void syncTp() const;
   // Per the datasheet's command table: Group 0 (C2=0) selects one of these
   // four register-control modes; Group 1 (C2=1, handled separately via
   // tpRateHz_) selects the TP output rate instead.
@@ -103,7 +229,7 @@ class Upd1990ac {
 
   Mode mode_ = Mode::RegisterHold;
   int tpRateHz_ = 64;
-  bool tpConfigured_ = false;  // see advanceRealTime()
+  bool tpConfigured_ = false;  // see consumeRisingEdge()
   // 40 bits used: bits [3:0]=units-of-seconds ... bits [39:36]=month (see
   // liveTimeAsBcd40()). Shifts right on each CLK edge while mode_ is
   // RegisterShift or TimeSet (the two modes the datasheet lists as
@@ -112,8 +238,28 @@ class Upd1990ac {
   // from DATA IN enters at bit 39.
   uint64_t shiftRegister_ = 0;
 
-  bool tpLevel_ = false;
-  double tpPhaseSeconds_ = 0.0;
+  // TP's real-time reference point: reset to now() every time TP is
+  // (re-)configured (see latchCommand), so tpLevel_ can be recomputed on
+  // demand as a pure function of elapsed wall-clock time since then --
+  // see syncTp(). mutable since tp()/consumeRisingEdge() are const (same
+  // read-triggers-a-side-effect pattern as IoPortController::if_).
+  mutable std::chrono::steady_clock::time_point tpEpoch_{};
+  mutable bool tpLevel_ = false;
+  mutable bool tpEdgePending_ = false;
+  mutable int debugTotalToggleCount_ = 0;  // TEMPORARY
+
+  // Records when tp() (OPB's read) last actually resampled -- see
+  // consumeRisingEdge()'s own comment for why IF's read is debounced
+  // against *this* specifically. everOpbSynced_ starts false (and is
+  // reset false whenever TP is (re-)configured, alongside tpEpoch_ -- see
+  // latchCommand) so consumeRisingEdge() never trusts a stale
+  // pre-(re-)configure timestamp.
+  mutable std::chrono::steady_clock::time_point lastOpbSyncTime_{};
+  mutable bool everOpbSynced_ = false;
+
+  // See testFreezeClock()/now().
+  mutable bool testClockFrozen_ = false;
+  mutable std::chrono::steady_clock::time_point testClockValue_{};
 
   // now() + timeOffset_ is this chip's notion of "now". Starts at 0 (i.e.
   // matches host wall-clock time) rather than an arbitrary epoch, so
@@ -174,15 +320,43 @@ class IoPortController {
   // when a transmission completes.
   void advanceCycles(int cycles);
 
-  // Drives the RTC's TP output (see Upd1990ac and rtc_ below): call once
-  // per rendered frame, same as Bus::advanceRealTime (which forwards to
-  // this), with real elapsed wall-clock seconds. Latches IF bit 1 on each
-  // TP rising edge -- see rtc_'s class comment for why BASIC's BEEP
-  // actually depends on this.
-  void advanceRealTime(double elapsedSeconds);
+  // Non-consuming peek at the RTC's TP output level -- main.cpp's frame
+  // loop calls this once per rendered frame (~16.7ms), a cadence entirely
+  // uncorrelated with WAIT/BEEP's own CPU-instruction-granularity poll
+  // loop (LE89C-LE8BC in _bisect/rom1.asm). An earlier version of this
+  // consumed a pending edge and latched it into IF as a side effect --
+  // which meant this call could "steal" a tick out from under the ROM's
+  // own poll loop (or latch it into IF well before/after the ROM's own
+  // OPB read would have), independently of and inconsistently with
+  // whatever the CPU's own reads were doing -- reintroducing, at frame
+  // granularity, the exact same class of missed/duplicated-edge bug the
+  // lazy-per-read rework (see Upd1990ac's class comment) was meant to
+  // fix at the OPB/IF-register level. Kept as a public entry point mainly
+  // so main.cpp's frame loop (and tests) can force a sync even in
+  // stretches with no register reads at all; genuinely harmless to call
+  // as often or as rarely as convenient now that it has no side effects.
+  bool pollRtc() { return rtc_.tp(); }
 
   // Forwards to the RTC -- see Upd1990ac::syncToHostClock().
   void syncRtcToHostClock() { rtc_.syncToHostClock(); }
+
+  // TEMPORARY, see Upd1990ac's own debug accessors -- remove together.
+  bool rtcDebugTpConfigured() const { return rtc_.debugTpConfigured(); }
+  int rtcDebugTpRateHz() const { return rtc_.debugTpRateHz(); }
+  bool rtcDebugTpLevel() const { return rtc_.debugTpLevel(); }
+  int rtcDebugTotalToggleCount() const { return rtc_.debugTotalToggleCount(); }
+
+  // Test-only, forward to Upd1990ac::testFreezeClock()/testAdvanceSeconds()
+  // -- see their own comments. Call testFreezeRtcClock() once up front,
+  // before any testAdvanceRtcSeconds() calls, or real elapsed wall-clock
+  // time (including the test's own instrumentation overhead) will keep
+  // bleeding into the RTC's state on top of what the test intends to
+  // simulate.
+  void testFreezeRtcClock() { rtc_.testFreezeClock(); }
+  void testAdvanceRtcSeconds(double seconds) { rtc_.testAdvanceSeconds(seconds); }
+  int debugOpcWriteCount() const { return debugOpcWriteCount_; }
+  uint8_t debugLastOpcValue() const { return debugLastOpcValue_; }
+  const std::vector<uint8_t>& debugOpcWriteHistory() const { return debugOpcWriteHistory_; }
 
  private:
   uint8_t dda_ = 0;
@@ -190,6 +364,9 @@ class IoPortController {
   uint8_t opa_ = 0;
   uint8_t opb_ = 0;
   uint8_t opc_ = 0;
+  int debugOpcWriteCount_ = 0;    // TEMPORARY, see debugOpcWriteCount()
+  uint8_t debugLastOpcValue_ = 0;  // TEMPORARY, see debugLastOpcValue()
+  std::vector<uint8_t> debugOpcWriteHistory_;  // TEMPORARY, see debugOpcWriteHistory()
   uint8_t f_ = 0;
   uint8_t g_ = 0;
   uint8_t msk_ = 0;
@@ -238,7 +415,7 @@ class IoPortController {
   int txCyclesRemaining_ = 0;
 
   // IF bit 1: latched from the RTC's TP rising edge -- see
-  // advanceRealTime() and Upd1990ac's class comment. Unlike TD/RD (bits
+  // pollRtc()/read()'s own OPB case and Upd1990ac's class comment. Unlike TD/RD (bits
   // 3/2), this one *is* ROM-confirmed (BASIC BEEP's repeat-gap wait polls
   // exactly this bit after commanding TP=64Hz). Also confirmed shared
   // with PB7 (see setOnKeyLine()) -- rather than a dedicated bit per
@@ -428,10 +605,11 @@ class Bus : public lh5801::MemoryBus {
   void advanceCycles(int cycles);
 
   // Forwards to the I/O port controller's RTC -- see
-  // IoPortController::advanceRealTime(). Call once per rendered frame with
-  // real elapsed wall-clock seconds (main.cpp already computes this for
-  // its audio sample accumulator).
-  void advanceRealTime(double elapsedSeconds) { io_.advanceRealTime(elapsedSeconds); }
+  // IoPortController::pollRtc(). Harmless to call as often or as rarely as
+  // convenient (see its own comment); main.cpp's frame loop calls this
+  // once per rendered frame mainly so IF bit 1 stays reasonably current
+  // even during stretches where nothing happens to read OPB directly.
+  bool pollRtc() { return io_.pollRtc(); }
 
   // Session state save/load -- narrow scope: RAM contents
   // (me0_[0x0000,0x8000) only -- covers both extension-RAM windows, the

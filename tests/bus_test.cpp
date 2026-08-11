@@ -227,18 +227,19 @@ void testRtcTpRateSelectAndIfBitLatch() {
   // to prove the command genuinely changes behavior rather than
   // coincidentally matching the default.
   pc1500::IoPortController io;
+  io.testFreezeRtcClock();  // see its own comment -- must precede latchCommand
   rtcLatchCommand(io, /*c0=*/true, /*c1=*/false, /*c2=*/true);  // TP = 256 Hz
 
   CHECK((io.read(0x0B) & 0x02) == 0x00);  // IF bit 1 clear initially
   CHECK((io.read(0x0F) & 0x20) == 0x00);  // PB5 (TP) starts low
 
   double halfPeriod = 0.5 / 256.0;
-  io.advanceRealTime(halfPeriod * 1.01);   // just over one half-period -> one rising edge
+  io.testAdvanceRtcSeconds(halfPeriod * 1.01);  // just over one half-period -> one rising edge
   CHECK((io.read(0x0B) & 0x02) == 0x02);  // IF bit 1 now latched
   CHECK((io.read(0x0F) & 0x20) == 0x20);  // PB5 mirrors TP's new (high) level
 
   io.write(0x0B, 0x00);  // ROM clears IF explicitly before re-polling
-  io.advanceRealTime(halfPeriod * 1.01);  // one more half-period -> falling edge only
+  io.testAdvanceRtcSeconds(halfPeriod * 1.01);  // one more half-period -> falling edge only
   CHECK((io.read(0x0B) & 0x02) == 0x00);  // falling edge must not re-set IF bit 1
   CHECK((io.read(0x0F) & 0x20) == 0x00);  // PB5 now low again
 }

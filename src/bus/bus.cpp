@@ -20,6 +20,28 @@ namespace pc1500 {
 
 namespace {
 uint8_t toBcd(int v) { return static_cast<uint8_t>(((v / 10) << 4) | (v % 10)); }
+
+// Debounce window for Upd1990ac::consumeRisingEdge(), anchored to
+// Upd1990ac::tp()'s (OPB's) own most recent read -- see consumeRisingEdge()'s
+// own comment for why this specific anchor (as opposed to a single window
+// shared by both reads, or a fixed time grid -- both tried first and made
+// things worse). 100us: measured live (testWaitPollTrace, direct
+// instrumentation of Upd1990ac's own internal debounce timestamp, not
+// inferred from instruction counts -- an initial ~6us estimate from
+// counting traced instructions turned out to only be measuring the cost
+// of the *bii+bzr pair itself*, not the actual gap to IF's read) that
+// WAIT/BEEP's poll loop's OPB read and its IF fallback read (LE89C-LE8BC
+// in _bisect/rom1.asm, F00FH bit 5, then a vmj + the E451 helper's own
+// bii+rtn, F00BH bit 1) are ~61us apart at 1.3MHz -- so 100us comfortably
+// covers that gap with margin (guaranteeing the two always agree) while
+// staying well below TP's own half-period even at its fastest configured
+// rate (2048Hz, ~244us -- the 64Hz case this code path actually exercises
+// has an ~7.8ms half-period, wider still), so no genuine edge can hide
+// between polls the way one could under the old once-per-rendered-frame
+// model, and a tick caught via IF instead of OPB (BREAK, or the rare read
+// with no recent OPB check) is never delayed by more than 100us of real
+// time -- still negligible against a millisecond-scale period.
+constexpr double kTpResyncDebounceSeconds = 0.0001;
 }  // namespace
 
 void Upd1990ac::setControlPins(bool dataIn, bool stb, bool clk, bool c0, bool c1, bool c2) {
@@ -66,6 +88,21 @@ void Upd1990ac::latchCommand(bool c0, bool c1, bool c2) {
       case 2: tpRateHz_ = 2048; tpConfigured_ = true; break;
       default: break;  // TEST MODE -- not modeled, treated as a no-op
     }
+    // Every (re-)configure resets TP's phase to a fresh, known boundary --
+    // matching the observable effect of the datasheet's own TP-rate-select
+    // command (which necessarily also has some real reset effect on the
+    // divider chain), and giving WAIT/BEEP's own poll loop a clean edge to
+    // synchronize against right after each configure, same as it does on
+    // real hardware.
+    if (tpConfigured_) {
+      tpEpoch_ = now();
+      tpLevel_ = false;
+      tpEdgePending_ = false;
+      // Force consumeRisingEdge() to do its own genuine fresh sample on
+      // the next read rather than trusting a now-stale pre-(re-)configure
+      // OPB timestamp -- see its own comment.
+      everOpbSynced_ = false;
+    }
   }
 }
 
@@ -83,17 +120,82 @@ bool Upd1990ac::dataOut() const {
   return ((ms / 500) % 2) != 0;                                // 1 Hz
 }
 
-bool Upd1990ac::advanceRealTime(double elapsedSeconds) {
-  if (!tpConfigured_) return false;
+void Upd1990ac::syncTp() const {
+  if (!tpConfigured_) return;
+  double elapsed = std::chrono::duration<double>(now() - tpEpoch_).count();
   double halfPeriod = 0.5 / tpRateHz_;
-  tpPhaseSeconds_ += elapsedSeconds;
-  bool risingEdge = false;
-  while (tpPhaseSeconds_ >= halfPeriod) {
-    tpPhaseSeconds_ -= halfPeriod;
-    tpLevel_ = !tpLevel_;
-    if (tpLevel_) risingEdge = true;
+  // Parity of the number of half-periods elapsed since tpEpoch_ -- a pure
+  // function of real elapsed time, recomputed fresh on every call rather
+  // than incrementally accumulated, so it's exact regardless of how long
+  // it's been since the last sync (no batching, no possibility of a
+  // transition happening "between" two syncs without one of them landing
+  // exactly on it -- see this class's own comment for why that mattered).
+  long long intervals = static_cast<long long>(elapsed / halfPeriod);
+  bool newLevel = (intervals % 2) != 0;
+  if (newLevel && !tpLevel_) {
+    tpEdgePending_ = true;
+    debugTotalToggleCount_++;
+  } else if (newLevel != tpLevel_) {
+    debugTotalToggleCount_++;
   }
-  return risingEdge;
+  tpLevel_ = newLevel;
+}
+
+bool Upd1990ac::tp() const {
+  // Always a fresh, undebounced resample -- OPB (F00FH bit 5) is the
+  // "primary" signal here; see consumeRisingEdge()'s own comment for why
+  // IF's read (F00BH bit 1), when it happens shortly afterward, instead
+  // trusts what THIS just established rather than independently
+  // re-checking. Combines the live level with any not-yet-consumed
+  // pending edge, and consumes it, in one atomic step -- deliberately
+  // *not* split into two separately-callable pieces (an earlier version
+  // had IoPortController::read()'s OPB case call consumeRisingEdge() and
+  // tp() as two separate statements, in the wrong order, which silently
+  // defeated this whole debounce scheme: the edge-check ran first,
+  // against the *previous* read's OPB timestamp, before this call had a
+  // chance to establish a fresh one).
+  syncTp();
+  lastOpbSyncTime_ = now();
+  everOpbSynced_ = true;
+  bool edge = tpEdgePending_;
+  tpEdgePending_ = false;
+  return tpLevel_ || edge;
+}
+
+bool Upd1990ac::consumeRisingEdge() const {
+  // Debounced relative to OPB's own most recent read -- see
+  // kTpResyncDebounceSeconds's own comment for why a debounce at all, and
+  // why *this* specific anchor. WAIT/BEEP's poll loop (LE89C-LE8BC in
+  // _bisect/rom1.asm) always reads OPB (tp(), above) first, falling back
+  // to this only a handful of instructions later -- and the two must
+  // agree, or the ROM's own branch structure reads "IF set while OPB was
+  // low" as BREAK when it's really just this read seeing an edge OPB's
+  // read a moment earlier genuinely hadn't reached yet. A single debounce
+  // window covering *both* tp() and this was tried first and made things
+  // *worse*: measured live, the actual OPB-to-IF gap (~61us, via a vmj
+  // plus the E451 helper's own bii+rtn) is *longer* than one full
+  // OPB-to-OPB loop iteration (~15us) -- so no single shared window can
+  // both be wide enough to let IF reuse OPB's answer and narrow enough
+  // for OPB's own next read to still count as "new"; picking one tried
+  // first (a fixed grid wide enough to cover the OPB-to-IF gap) just
+  // debounced OPB's own reads against each other too, leaving OPB just as
+  // capable of going stale as IF was, and -- being fully deterministic --
+  // failing the same way on every single tick rather than a rare few.
+  // Exempting OPB entirely (tp() always resamples) and debouncing only
+  // this method against OPB's own
+  // timestamp keeps OPB authoritative while still giving this a fixed
+  // reference point to agree with. Falls back to an independent fresh
+  // resample when no recent OPB read exists at all -- BREAK's own
+  // detection path (KEYSCAN_WAIT/LE269, C400/LC42A) never reads OPB, and
+  // neither does bus_test.cpp's standalone testRtcTpRateSelectAndIfBitLatch.
+  if (!everOpbSynced_ ||
+      std::chrono::duration<double>(now() - lastOpbSyncTime_).count() >=
+          kTpResyncDebounceSeconds) {
+    syncTp();
+  }
+  bool edge = tpEdgePending_;
+  tpEdgePending_ = false;
+  return edge;
 }
 
 uint64_t Upd1990ac::liveTimeAsBcd40() const {
@@ -152,7 +254,44 @@ uint8_t IoPortController::read(uint8_t reg) const {
     case 0x08: return opc_;
     case 0x09: return g_;
     case 0x0A: return msk_;
-    case 0x0B: return if_;
+    case 0x0B: {
+      // BREAK's own detection path (KEYSCAN_WAIT/LE269, C400/LC42A) reads
+      // IF directly, never through OPB (F00FH) -- so this needs its own
+      // lazy RTC resync, independent of OPB's read (see its case above),
+      // confirmed necessary by testRtcTpRateSelectAndIfBitLatch (bus_test.cpp),
+      // which reads IF alone, well after a rising edge, with no OPB read
+      // ever happening first.
+      //
+      // Deliberately does NOT share state with OPB's read beyond both
+      // drawing on the same rtc_ -- earlier versions had OPB's read *also*
+      // latch a caught edge into if_ (so a subsequent IF check would see
+      // it too), which looked reasonable but actually caused the exact
+      // bug it was trying to prevent: TP's high phase lasts ~7.8ms (64Hz),
+      // thousands of CPU cycles, so WAIT's poll loop (LE89C-LE8BC in
+      // _bisect/rom1.asm) re-checks OPB *many* times while still
+      // genuinely, correctly mid-tick -- and every one of those re-checks
+      // used to re-discover the *same* already-actioned edge sitting in
+      // if_ (nothing had cleared it yet), which LE89C's own busy-spin
+      // structure has no path back from for "OPB still high, IF also
+      // still set" -- it falls straight to the abort path (LE8B4) on the
+      // very next iteration after every single decrement, not just the
+      // first. Since IF only ever needs to answer "did a *rising edge*
+      // happen" (not "is TP currently high", which is OPB's own job), and
+      // this case already independently, correctly answers that via its
+      // own consumeRisingEdge() call, OPB's read has nothing useful left
+      // to contribute here.
+      if (rtc_.consumeRisingEdge()) if_ |= kTpFlagBit;
+      uint8_t v = if_;
+      // Reading IF consumes kTpFlagBit (bit 1), same "read acknowledges
+      // and clears the latch" convention as kRdFlagBit above. Safe for
+      // BREAK's own use of this bit: a genuine ON-key press is a one-shot
+      // event, and the first read after it (whichever poll happens to
+      // notice first) is the one meant to observe and consume it -- the
+      // same "first reader wins" contract any edge-latched interrupt flag
+      // register has.
+      if_ &= static_cast<uint8_t>(~kTpFlagBit);
+      return v;
+    }
     case 0x0C: return dda_;
     case 0x0D: return ddb_;
     case 0x0E: return opa_;
@@ -171,9 +310,19 @@ uint8_t IoPortController::read(uint8_t reg) const {
       // silently never worked on this export-ROM build. Forcing this bit
       // high (matching VCC) is what real export hardware's dispatch code
       // is actually reading.
+      // Deliberately does NOT touch if_ (IF, F00BH) at all -- see case
+      // 0x0B's own comment for why cross-latching OPB's read into IF
+      // turned out to be the actual bug, not the fix it looks like at
+      // first glance. rtc_.tp() itself combines the live level with any
+      // not-yet-consumed pending edge (see its own comment) -- must be
+      // called as this one atomic step, not split into a separate
+      // edge-check-then-level-check pair (that ordering bug is exactly
+      // what silently defeated the debounce scheme the first time this
+      // was written).
+      bool tpBit = rtc_.tp();
       uint8_t v = static_cast<uint8_t>(opb_ & 0x1F);
       v = static_cast<uint8_t>(v | 0x08);
-      v = static_cast<uint8_t>(v | (rtc_.tp() ? 0x20 : 0x00));
+      v = static_cast<uint8_t>(v | (tpBit ? 0x20 : 0x00));
       v = static_cast<uint8_t>(v | (rtc_.dataOut() ? 0x40 : 0x00));
       v = static_cast<uint8_t>(v | (onKeyLine_ ? 0x80 : 0x00));
       return v;
@@ -193,6 +342,9 @@ void IoPortController::write(uint8_t reg, uint8_t value) {
     case 0x07: f_ = value; break;
     case 0x08:
       opc_ = value;
+      debugOpcWriteCount_++;
+      debugLastOpcValue_ = value;
+      debugOpcWriteHistory_.push_back(value);
       buzzerOn_.store((value & 0x40) != 0, std::memory_order_relaxed);
       // PC0-PC5 -- see rtc_'s class comment for the confirmed pin mapping
       // (PC0=DATA IN, PC1=STB, PC2=CLK, PC3-5=C0-C2).
@@ -218,10 +370,6 @@ void IoPortController::advanceCycles(int cycles) {
     txCyclesRemaining_ = 0;
     if_ |= kTdFlagBit;
   }
-}
-
-void IoPortController::advanceRealTime(double elapsedSeconds) {
-  if (rtc_.advanceRealTime(elapsedSeconds)) if_ |= kTpFlagBit;
 }
 
 uint8_t IoPortController::opaOutput() const {

@@ -4,6 +4,34 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.6.1] - 2026-08-11
+
+### Added
+- `pc1500disasm` now cross-references BASIC keyword-table entries back
+  onto their implementation address (e.g. `LE86AH:  ; WAIT keyword`),
+  instead of requiring a manual keyword-table lookup to identify a
+  keyword's own entry point in a listing.
+
+### Fixed
+- `WAIT n` (and BEEP's identical gap-timer) could exit far too early with
+  a spurious "BREAK IN <line>" error, or otherwise complete noticeably
+  faster than its requested duration, due to a hardware-timing race
+  between two status registers (`OPB`/`IF`) both derived from the
+  real-time clock's tick signal. `WAIT n` now counts down its full
+  duration at the correct, linear 64Hz rate.
+- "Load BASIC Text": a long line whose greedy per-pass packing happened to
+  land mid-parenthesized-expression (e.g. right after the "(" in `A$(X,Y)`)
+  was rejected outright by the ROM's tokenizer and failed the whole load,
+  instead of being recognized as a rejection and retried with a shorter
+  pass. See `docs/pc1500_hardware_reference.md`'s "BASIC line editor"
+  section for the confirmed ROM behavior this is built on.
+- "Load BASIC Text": a validation error message could run off the edge of
+  the dialog instead of wrapping.
+
+### Removed
+- "Load BASIC Text": the redundant "Paste from Clipboard" button (the text
+  box already supports the platform's normal paste shortcut).
+
 ## [0.6.0] - 2026-08-09
 
 ### Added

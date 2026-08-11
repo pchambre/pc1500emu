@@ -433,6 +433,18 @@ had zero documentation of BASIC line-editor UI behavior before this.
   what it just typed that actually landed; if short, it retypes exactly
   the missing remainder as the next pass (via the same `LIST`+navigate
   sequence) rather than trusting the estimate to be exact.
+- **A pass ending with an unbalanced paren is rejected outright, not
+  silently truncated.** Confirmed 2026-08-10 via a real-world listing
+  (`DungeonQuest.bas` line 35): greedy 79-character packing lands mid-
+  `A$(X,Y)`, right after the `(`, and Enter is refused -- nothing gets
+  stored at all, unlike the silent-truncation case above where *something*
+  always lands. This is a real tokenizer-level check at Enter time, not
+  the "syntax only checked at RUN time" rule above -- paren balance is
+  apparently verified per input pass regardless. `typeLongLine` doesn't
+  special-case parens specifically (there may be other rules like this one
+  not yet hit): it detects a pass rejected outright (nothing of it landed)
+  and backs the packed atom count off by one, retrying until the ROM
+  accepts a shorter split.
 - **A single BASIC line's total stored size is capped independent of how
   many passes are used** (an emergent consequence of the budget above
   applying fresh on every pass) -- content that doesn't tokenize well

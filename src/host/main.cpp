@@ -3188,14 +3188,6 @@ int main(int argc, char** argv) {
               loadFileIntoTextBuf();
             }
             ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (ImGui::Button("Paste from Clipboard")) {
-              const char* clip = ImGui::GetClipboardText();
-              if (clip) {
-                std::strncpy(basicTextBuf.get(), clip, kBasicTextBufSize - 1);
-                basicTextBuf[kBasicTextBufSize - 1] = '\0';
-              }
-            }
           } else {
             if (ImGui::Button("Copy to Clipboard")) {
               ImGui::SetClipboardText(basicTextBuf.get());
@@ -3205,7 +3197,9 @@ int main(int argc, char** argv) {
                                      ImVec2(-1, -60));
         }
         if (!dialogError.empty()) {
-          ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", dialogError.c_str());
+          ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+          ImGui::TextWrapped("%s", dialogError.c_str());
+          ImGui::PopStyleColor();
         }
         bool doAction = ImGui::Button(actionLabel);
         ImGui::SameLine();
@@ -3353,12 +3347,12 @@ int main(int argc, char** argv) {
           ImGui::SetNextWindowPos(ImVec2(0, 0));
           ImGui::SetNextWindowSize(progressIo.DisplaySize);
           // Mirrors the normal LoadBasicText layout exactly (Filename+Browse
-          // row, Read File/Paste row, the big text box, *then*
-          // the action row) -- everything disabled/read-only, since it's
-          // non-interactive while loading -- so nothing visibly jumps
-          // position compared to the dialog's usual look. An earlier
-          // version put the Load/Cancel/"Loading..." row first, which
-          // pushed the text box down; confirmed wrong, fixed here.
+          // row, Read File row, the big text box, *then* the action row) --
+          // everything disabled/read-only, since it's non-interactive while
+          // loading -- so nothing visibly jumps position compared to the
+          // dialog's usual look. An earlier version put the Load/Cancel/
+          // "Loading..." row first, which pushed the text box down;
+          // confirmed wrong, fixed here.
           if (ImGui::Begin("##dialog", nullptr,
                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse)) {
@@ -3368,8 +3362,6 @@ int main(int argc, char** argv) {
             ImGui::Button("Browse...");
             ImGui::SameLine();
             ImGui::Button("Read File");
-            ImGui::SameLine();
-            ImGui::Button("Paste from Clipboard");
             ImGui::InputTextMultiline("##basicText", basicTextBuf.get(), kBasicTextBufSize,
                                        ImVec2(-1, -60));
             ImGui::Button("Load");
@@ -3426,7 +3418,7 @@ int main(int argc, char** argv) {
     auto audioNow = std::chrono::steady_clock::now();
     double elapsedSeconds = std::chrono::duration<double>(audioNow - lastAudioTime).count();
     lastAudioTime = audioNow;
-    bus.advanceRealTime(elapsedSeconds);
+    bus.pollRtc();
     audioSampleAccumulator += elapsedSeconds * kAudioSampleRate;
     int samplesThisFrame = static_cast<int>(audioSampleAccumulator);
     if (samplesThisFrame > kMaxAudioSamplesPerFrame) samplesThisFrame = kMaxAudioSamplesPerFrame;
