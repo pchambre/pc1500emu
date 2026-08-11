@@ -306,16 +306,31 @@ uint8_t IoPortController::read(uint8_t reg) const {
       // own consumeRisingEdge() call, OPB's read has nothing useful left
       // to contribute here.
       if (rtc_.consumeRisingEdge()) if_ |= kTpFlagBit;
-      uint8_t v = if_;
-      // Reading IF consumes kTpFlagBit (bit 1), same "read acknowledges
-      // and clears the latch" convention as kRdFlagBit above. Safe for
-      // BREAK's own use of this bit: a genuine ON-key press is a one-shot
-      // event, and the first read after it (whichever poll happens to
-      // notice first) is the one meant to observe and consume it -- the
-      // same "first reader wins" contract any edge-latched interrupt flag
-      // register has.
-      if_ &= static_cast<uint8_t>(~kTpFlagBit);
-      return v;
+      // Deliberately does NOT clear kTpFlagBit here (unlike kRdFlagBit
+      // above, which genuinely is a per-read-consumed latch) -- an
+      // earlier version did, and it broke BREAK: the MI interrupt handler
+      // itself (LE171) reads this exact register to test a *different*
+      // bit (bit 0, LE17E's "bii #(0xF00B),0x01") as part of its own,
+      // unrelated dispatch logic -- and since read() returns/clears the
+      // whole byte regardless of which bits the caller's own bii
+      // instruction actually tests, that read was silently eating
+      // kTpFlagBit as a side effect, on literally every BREAK-triggered
+      // MI dispatch, before the interpreter's own statement-boundary
+      // break-check (LC42A) ever got a chance to see it -- confirmed live
+      // via cycle-accurate tracing (a held BREAK during a running FOR/NEXT
+      // loop had zero effect; the ~microsecond-long window right after
+      // OPB's own read consumed a tick, before this register was next
+      // read for something unrelated, was the only time BREAK could ever
+      // slip through). Safe to leave set until an explicit write clears
+      // it (LC4C6/LC4ED's "ani #(0xF00B),0xFD" -- the only such write
+      // anywhere in the ROM, and the same real hardware convention this
+      // whole register already follows) instead of clearing on every
+      // read: OPB's own read (tp(), case 0x0F above) already consumes
+      // rtc_'s pending edge before this line ever runs during WAIT's own
+      // poll loop (which always checks OPB first), so this line is
+      // already a no-op for RTC-caused activity in the only place that
+      // used to depend on it self-clearing.
+      return if_;
     }
     case 0x0C: return dda_;
     case 0x0D: return ddb_;

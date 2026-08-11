@@ -124,6 +124,41 @@ comment explaining it.
   by re-running the headless suite: the headless tests already modeled
   smooth per-instruction time advancement and were passing throughout,
   so they could not have caught this class of bug on their own.
+- **`main.cpp` has ~17 separate places that call `cpu.step()` in their own
+  stepping loop** (the main frame loop, debug single-stepping, and a
+  handful of FIFO-command-specific loops for `break`/`run`/`trace`/
+  `typeline`/`entertrace`/etc.), not just the one or two you're likely to
+  touch first. When adding a per-instruction hook (like the manual-clock
+  advance above), grep for every `cpu.step()` call site and check each
+  one individually — missing one doesn't fail loudly, it just makes
+  *that specific* FIFO command behave subtly wrong for anything real-time-
+  sensitive that happens to be active while it runs (confirmed: the
+  `break <cycles>` command's own loop was missed on the first pass, which
+  silently starved an active `WAIT` of RTC progress during any `break`
+  call synchronous enough to matter).
+- **A register's "read consumes the flag" behavior must be scoped to the
+  specific bit(s) actually being tested, not the whole byte.** The MI
+  interrupt handler (`LE171`) reads IF (`F00BH`) to test bit 0 for its
+  own, unrelated purpose (`LE17E`'s `bii #(0xF00B),0x01`) — but
+  `IoPortController::read()`'s IF case cleared `kTpFlagBit` (bit 1,
+  BREAK's own flag) unconditionally on *any* read of the register,
+  regardless of which bit the caller's own `bii` instruction cared about.
+  Since the MI handler runs on literally the *next* instruction after
+  `requestMI()` (regardless of what triggered it), this silently ate
+  BREAK's own flag on every single BREAK-triggered interrupt, before the
+  interpreter's own statement-boundary break-check (`LC42A`) ever got a
+  chance to see it — confirmed live: a BREAK held for over a real second
+  had zero effect on a running `FOR`/`NEXT` loop. The emulator can't know
+  which bits a real `bii #(addr),mask` instruction is testing (`read()`
+  just returns the whole byte), so the fix was to stop clearing on read
+  entirely and rely on the RTC's own edge-consumption (`Upd1990ac::tp()`,
+  always checked first by WAIT's own poll loop) to prevent the *original*
+  stale-tick bug this "clear on read" behavior was added for.
+- **`reset` (the FIFO command) does not reliably leave the machine in a
+  state a fresh `loadbasictext` can load into cleanly** — reloading over
+  an existing line got rejected in testing here. When a live test needs a
+  guaranteed-clean starting point, kill and relaunch the process (or pass
+  `--no-state` on launch) rather than trusting `reset` alone.
 
 ## Debugging timing-sensitive emulator code
 

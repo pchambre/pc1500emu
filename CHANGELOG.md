@@ -4,6 +4,29 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.6.3] - 2026-08-11
+
+### Fixed
+- BREAK (F12) stopped working to interrupt a running program. The MI
+  interrupt handler itself reads the IF register to check an unrelated
+  bit as part of its own dispatch logic, and an earlier fix cleared
+  BREAK's own flag as an unintended side effect of *any* read of that
+  register -- so every BREAK-triggered interrupt silently consumed its
+  own flag before the interpreter's break-check ever saw it.
+- Several less-common ways of driving the CPU (the `break`/`run`/`trace`
+  FIFO commands, debugger single-stepping, and a few internal keystroke-
+  typing helpers) didn't advance the real-time clock the same way the
+  main loop does, so a `WAIT`/`BEEP` in progress during one of those could
+  stall or run at the wrong rate.
+- Escape now dismisses the "Special Keys" and "About" dialogs, matching
+  every other dialog.
+
+### Added
+- `--no-state` command-line flag: boot cold this run without touching the
+  configured state file (skips both auto-load and auto-save-on-exit for
+  the session), for testing/reproduction runs that need a known starting
+  point.
+
 ## [0.6.2] - 2026-08-11
 
 ### Fixed

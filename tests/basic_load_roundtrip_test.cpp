@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <set>
 #include <string>
@@ -1393,6 +1394,125 @@ void testWaitTimingIsAccurate() {
   }
 }
 
+// Regression test for a real bug: the MI interrupt handler (LE171 in
+// _bisect/rom1.asm) reads IF (F00BH) to test a completely unrelated bit
+// (bit 0, LE17E's "bii #(0xF00B),0x01") as part of its own dispatch logic
+// -- and an earlier version of IoPortController::read()'s IF case cleared
+// kTpFlagBit (bit 1, BREAK's own flag) unconditionally on *any* read of
+// the register, regardless of which bit the caller's own bii instruction
+// actually cared about. That meant every BREAK-triggered MI dispatch
+// silently ate BREAK's own flag as a side effect, before the interpreter's
+// statement-boundary break-check (LC42A) ever got a chance to see it --
+// confirmed live: a BREAK held for over a real second had zero effect on
+// a running FOR/NEXT loop. Covers both a poll loop that reads IF itself
+// (WAIT, which has its own -- narrower -- history of IF-related bugs) and
+// plain interpreter code that doesn't touch IF at all until the next
+// statement boundary (a FOR/NEXT loop), since the fix needed to hold for
+// both without reverting WAIT's own timing fix.
+void testBreakStopsRunningProgram() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  if (rom.empty()) {
+    std::printf("SKIP: testBreakStopsRunningProgram -- ROM1.BIN not found.\n");
+    return;
+  }
+  constexpr uint16_t kIdleAddr = 0xE2AA;
+  constexpr uint16_t kWaitPollAddr = 0xE8A9;  // inside WAIT's own poll loop (LE89C-LE8BC)
+
+  // triggerBreakAt: runs the program, presses+releases BREAK (matching a
+  // quick real F12 tap -- see IoPortController::setOnKeyLine()'s own
+  // comment) at the first instant `stopCondition` is true, then keeps
+  // stepping and returns whether the CPU reached the idle prompt address
+  // within a generous bounded window.
+  auto testCase = [&](const char* label, const std::string& program,
+                       const std::function<bool(BootedMachine&)>& stopCondition) {
+    auto m = bootAndSettle(rom);
+    std::string loadError;
+    bool loaded = pc1500::basic::typeBasicProgramText(m->bus, m->cpu, program, kCyclesPerFrame,
+                                                       kCyclesPerTimerTick, &loadError);
+    CHECK(loaded);
+    if (!loaded) {
+      std::printf("  %s: loadError: %s\n", label, loadError.c_str());
+      return;
+    }
+    auto tracedStep = [&]() {
+      int c = m->cpu.step();
+      int used = (c > 0) ? c : 1;
+      m->bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
+      m->cyclesSinceTimerTick += used;
+      m->bus.advanceCycles(used);
+      while (m->cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+        m->cpu.tickTimer();
+        m->cyclesSinceTimerTick -= kCyclesPerTimerTick;
+      }
+    };
+    auto runKeyAction = [&](pc1500::Key key, bool pressed, int framesToWait) {
+      m->bus.setKeyState(key, pressed);
+      for (int f = 0; f < framesToWait; f++)
+        for (int i = 0; i < kCyclesPerFrame; i++) tracedStep();
+    };
+    runKeyAction(pc1500::Key::Mode, true, pc1500::basic::kTapFrames);
+    runKeyAction(pc1500::Key::Mode, false, pc1500::basic::kIdleFrames);
+    for (char c : std::string("RUN")) {
+      std::deque<pc1500::basic::QueuedKeyAction> actions;
+      if (!pc1500::basic::charToTapActions(c, &actions)) continue;
+      for (const auto& a : actions) runKeyAction(a.key, a.pressed, a.framesToWait);
+    }
+    runKeyAction(pc1500::Key::Ent, true, pc1500::basic::kTapFrames);
+    runKeyAction(pc1500::Key::Ent, false, pc1500::basic::kIdleFrames);
+
+    constexpr long kMaxInstructionsToTrigger = 20'000'000;
+    bool reachedCondition = false;
+    for (long i = 0; i < kMaxInstructionsToTrigger; i++) {
+      if (stopCondition(*m)) {
+        reachedCondition = true;
+        break;
+      }
+      tracedStep();
+    }
+    CHECK(reachedCondition);
+    if (!reachedCondition) {
+      std::printf("  %s: never reached the BREAK trigger condition\n", label);
+      return;
+    }
+
+    // A plain, fire-and-forget press+release -- same as tools/send-command.ps1's
+    // "break" FIFO command with no cycle count, which is the realistic case
+    // (even a fast real F12 tap holds far longer than a single instruction).
+    m->cpu.pressOnKey();
+    m->bus.ioPort().setOnKeyLine(true);
+    m->cpu.requestMI();
+    m->bus.ioPort().setOnKeyLine(false);
+
+    constexpr long kMaxInstructionsAfterBreak = 5'000'000;
+    bool reachedIdle = false;
+    for (long i = 0; i < kMaxInstructionsAfterBreak; i++) {
+      if (m->cpu.p() == kIdleAddr && m->cpu.halted()) {
+        reachedIdle = true;
+        break;
+      }
+      tracedStep();
+    }
+    std::printf("  %s: reachedIdle=%d final P=%04X halted=%d\n", label, reachedIdle, m->cpu.p(),
+                m->cpu.halted());
+    CHECK(reachedIdle);
+  };
+
+  testCase(
+      "BREAK during WAIT's own poll loop", "1 WAIT 2000:PRINT \"DONE\"\n",
+      [](BootedMachine& m) { return m.cpu.p() == kWaitPollAddr; });
+
+  // Matches the user's own real-world reproduction: WAIT 0 (negligible
+  // delay, but still configures then disables TP -- see
+  // Upd1990ac::latchCommand()'s Group 0 reset) followed by a FOR/NEXT loop
+  // that never touches IF/OPB itself at all, so BREAK can only ever be
+  // caught by the interpreter's own statement-boundary check, not by any
+  // poll loop's own IF read.
+  testCase("BREAK during FOR/NEXT loop after a prior WAIT",
+           "1 WAIT 0\n2 FOR I=1 TO 5000\n3 PRINT \"L\"+STR$(I)\n4 NEXT I\n",
+           [](BootedMachine& m) { return m.cpu.p() == 0xC42A; });
+}
+
 void testFindWaitArgumentStorage() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   std::vector<uint8_t> rom = readFile(kRomPath);
@@ -1523,6 +1643,7 @@ int main() {
   testSteadyStateLoop();
   testWaitPollTrace();
   testWaitTimingIsAccurate();
+  testBreakStopsRunningProgram();
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

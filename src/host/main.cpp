@@ -958,6 +958,7 @@ bool typeImmediateLine(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& li
       i += used;
       cyclesSinceTimerTick += used;
       bus.advanceCycles(used);
+      bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
       while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
         cpu.tickTimer();
         cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -1002,6 +1003,7 @@ bool typeImmediateLinePartialIdle(pc1500::Bus& bus, lh5801::CPU& cpu, const std:
       i += used;
       cyclesSinceTimerTick += used;
       bus.advanceCycles(used);
+      bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
       while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
         cpu.tickTimer();
         cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -1056,6 +1058,7 @@ bool typeImmediateLinePartialIdleTraced(pc1500::Bus& bus, lh5801::CPU& cpu, cons
       i += used;
       cyclesSinceTimerTick += used;
       bus.advanceCycles(used);
+      bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
       while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
         cpu.tickTimer();
         cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -1131,6 +1134,7 @@ bool typeImmediateLineWatch(pc1500::Bus& bus, lh5801::CPU& cpu, const std::strin
       i += used;
       cyclesSinceTimerTick += used;
       bus.advanceCycles(used);
+      bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
       while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
         cpu.tickTimer();
         cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -1196,6 +1200,7 @@ bool typeImmediateLineWithTrace(pc1500::Bus& bus, lh5801::CPU& cpu, const std::s
       i += used;
       cyclesSinceTimerTick += used;
       bus.advanceCycles(used);
+      bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
       while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
         cpu.tickTimer();
         cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -1224,6 +1229,7 @@ bool typeImmediateLineWithTrace(pc1500::Bus& bus, lh5801::CPU& cpu, const std::s
       i += used;
       cyclesSinceTimerTick += used;
       bus.advanceCycles(used);
+      bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
       while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
         cpu.tickTimer();
         cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -1250,6 +1256,7 @@ bool typeImmediateLineWithTrace(pc1500::Bus& bus, lh5801::CPU& cpu, const std::s
     i += used;
     cyclesSinceTimerTick += used;
     bus.advanceCycles(used);
+    bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
     while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
       cpu.tickTimer();
       cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -1276,6 +1283,13 @@ void printUsage(const char* argv0) {
       "  --conf <path>        Load settings (ROM path, state-file path, auto-load/\n"
       "                       auto-save preferences) from a JSON conf file. See\n"
       "                       README.md's state save/load section for the schema.\n"
+      "  --no-state           Skip auto-loading the configured state file this run\n"
+      "                       (even if Auto-Load State on Start is enabled), and\n"
+      "                       boot cold instead -- for testing/reproduction runs\n"
+      "                       that need to start from a known, empty state rather\n"
+      "                       than wherever a previous session left off. Does not\n"
+      "                       change the Auto-Load setting itself, and does not\n"
+      "                       affect Auto-Save on Exit for this run.\n"
       "  -h, --help, /h, /?   Show this help and exit.\n",
       argv0);
 }
@@ -1311,6 +1325,7 @@ int main(int argc, char** argv) {
   // precedence.
   std::string confPath;
   std::string positionalRomPath;
+  bool noState = false;
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
     if (arg == "--conf") {
@@ -1319,6 +1334,8 @@ int main(int argc, char** argv) {
         return 1;
       }
       confPath = argv[++i];
+    } else if (arg == "--no-state") {
+      noState = true;
     } else if (positionalRomPath.empty()) {
       positionalRomPath = arg;
     }
@@ -1384,7 +1401,16 @@ int main(int argc, char** argv) {
   // configured path isn't an error (first run, nothing saved yet) --
   // cpu.reset() still runs in that case, same as always. A present-but-
   // corrupt one is a non-fatal warning, also falling back to reset().
-  std::string configuredStateFilePath = appConfig.stateFilePath.value_or(std::string());
+  // --no-state clears this entirely, not just skips the load below --
+  // leaving it set would still show the configured path in the status
+  // panel, and worse, autoSaveOnExit (checked much later, purely on
+  // "!configuredStateFilePath.empty()") would silently overwrite that
+  // saved file with this run's fresh, empty session on exit. Treating
+  // --no-state as "no state file configured this session" avoids both.
+  // The persisted conf file itself is untouched, so a normal launch
+  // (without --no-state) still resumes as configured.
+  std::string configuredStateFilePath =
+      noState ? std::string() : appConfig.stateFilePath.value_or(std::string());
   bool stateRestored = false;
   if (!configuredStateFilePath.empty() && appConfig.autoLoadOnStart) {
     std::ifstream probe(configuredStateFilePath, std::ios::binary);
@@ -1691,6 +1717,7 @@ int main(int argc, char** argv) {
           i += used;
           cyclesSinceTimerTick += used;
           bus.advanceCycles(used);
+          bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
           while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
             cpu.tickTimer();
             cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -1757,6 +1784,7 @@ int main(int argc, char** argv) {
           i += used;
           cyclesSinceTimerTick += used;
           bus.advanceCycles(used);
+          bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
           while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
             cpu.tickTimer();
             cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -2005,6 +2033,7 @@ int main(int argc, char** argv) {
         i += used;
         cyclesSinceTimerTick += used;
         bus.advanceCycles(used);
+        bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
         while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
           cpu.tickTimer();
           cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -2047,6 +2076,7 @@ int main(int argc, char** argv) {
           i += used;
           cyclesSinceTimerTick += used;
           bus.advanceCycles(used);
+          bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
           while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
             cpu.tickTimer();
             cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -2089,6 +2119,7 @@ int main(int argc, char** argv) {
           i += used;
           cyclesSinceTimerTick += used;
           bus.advanceCycles(used);
+          bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
           while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
             cpu.tickTimer();
             cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -2146,6 +2177,7 @@ int main(int argc, char** argv) {
         i += used;
         cyclesSinceTimerTick += used;
         bus.advanceCycles(used);
+        bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
         while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
           cpu.tickTimer();
           cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -2165,6 +2197,7 @@ int main(int argc, char** argv) {
         i += used;
         cyclesSinceTimerTick += used;
         bus.advanceCycles(used);
+        bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
         while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
           cpu.tickTimer();
           cyclesSinceTimerTick -= kCyclesPerTimerTick;
@@ -3008,6 +3041,7 @@ int main(int argc, char** argv) {
       ImGui::OpenPopup("Special Keys");
     }
     if (ImGui::BeginPopupModal("Special Keys", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
       if (ImGui::BeginTable("##specialkeys", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
         auto row = [](const char* key, const char* fn) {
           ImGui::TableNextColumn();
@@ -3048,6 +3082,7 @@ int main(int argc, char** argv) {
       ImGui::OpenPopup("About pc1500emu");
     }
     if (ImGui::BeginPopupModal("About pc1500emu", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+      if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
       ImGui::Text("pc1500emu v%s", PC1500EMU_VERSION);
       ImGui::TextUnformatted("A from-scratch Sharp PC-1500 / LH5801 emulator.");
       ImGui::Separator();
@@ -3601,6 +3636,7 @@ int main(int argc, char** argv) {
         cycles -= used;
         cyclesSinceTimerTick += used;
         bus.advanceCycles(used);
+        bus.ioPort().advanceManualRtcClock(static_cast<double>(used) / kCyclesPerSecond);
         while (cyclesSinceTimerTick >= kCyclesPerTimerTick) {
           cpu.tickTimer();
           cyclesSinceTimerTick -= kCyclesPerTimerTick;
