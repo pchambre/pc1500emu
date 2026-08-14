@@ -2226,7 +2226,7 @@ int main(int argc, char** argv) {
   // first) is safe -- whichever context wasn't bound to that event's window
   // just ignores it.
   enum class ActiveDialog {
-    None,
+    NoDialog,
     LoadBasic,
     SaveBasic,
     LoadBinary,
@@ -2237,7 +2237,7 @@ int main(int argc, char** argv) {
     LoadState,
     SaveState
   };
-  ActiveDialog activeDialog = ActiveDialog::None;
+  ActiveDialog activeDialog = ActiveDialog::NoDialog;
   char filenameBuf[512] = "";
   // BASIC-text dialogs' multi-line editor -- fixed-size like every other
   // dialog field here (e.g. filenameBuf above), sized generously above
@@ -2521,7 +2521,7 @@ int main(int argc, char** argv) {
       } else if (dialogWindow && event.type == SDL_WINDOWEVENT &&
                  event.window.windowID == SDL_GetWindowID(dialogWindow) &&
                  event.window.event == SDL_WINDOWEVENT_CLOSE) {
-        activeDialog = ActiveDialog::None;
+        activeDialog = ActiveDialog::NoDialog;
         closeDialogWindow();
       } else if ((event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) &&
                  event.key.windowID != mainWindowID) {
@@ -3149,7 +3149,7 @@ int main(int argc, char** argv) {
         case ActiveDialog::SaveState:
           actionLabel = "Save";
           break;
-        case ActiveDialog::None:
+        case ActiveDialog::NoDialog:
           break;
       }
       ImGuiIO& dialogIo = ImGui::GetIO();
@@ -3353,7 +3353,7 @@ int main(int argc, char** argv) {
               }
               break;
             }
-            case ActiveDialog::None:
+            case ActiveDialog::NoDialog:
               break;
           }
           if (ok) closeRequested = true;
@@ -3434,7 +3434,7 @@ int main(int argc, char** argv) {
       }
 
       if (closeRequested) {
-        activeDialog = ActiveDialog::None;
+        activeDialog = ActiveDialog::NoDialog;
         closeDialogWindow();
       }
     }
