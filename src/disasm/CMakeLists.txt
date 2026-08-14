@@ -3,6 +3,7 @@ add_library(pc1500disasm STATIC
   analyzer.cpp
   formatter.cpp
   known_symbols.cpp
+  tasm_convert.cpp
 )
 target_include_directories(pc1500disasm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 

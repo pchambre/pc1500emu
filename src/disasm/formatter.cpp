@@ -3,6 +3,7 @@
 #include "formatter.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <optional>
 #include <sstream>
@@ -51,14 +52,22 @@ std::string keywordComment(uint16_t addr, const KeywordAddrMap& keywordAddrs) {
   return out;
 }
 
-std::string hex2(uint32_t v) {
+std::string hex2(uint32_t v, AsmDialect dialect) {
   char buf[8];
-  std::snprintf(buf, sizeof(buf), "0x%02X", v & 0xFF);
+  if (dialect == AsmDialect::Tasm) {
+    std::snprintf(buf, sizeof(buf), "$%02X", v & 0xFF);
+  } else {
+    std::snprintf(buf, sizeof(buf), "0x%02X", v & 0xFF);
+  }
   return buf;
 }
-std::string hex4(uint32_t v) {
+std::string hex4(uint32_t v, AsmDialect dialect) {
   char buf[8];
-  std::snprintf(buf, sizeof(buf), "0x%04X", v & 0xFFFF);
+  if (dialect == AsmDialect::Tasm) {
+    std::snprintf(buf, sizeof(buf), "$%04X", v & 0xFFFF);
+  } else {
+    std::snprintf(buf, sizeof(buf), "0x%04X", v & 0xFFFF);
+  }
   return buf;
 }
 std::string label(uint16_t addr) {
@@ -71,7 +80,12 @@ std::string label(uint16_t addr) {
 // syntax, and bare hex values. Target-address operands (Branch8, and the
 // Imm16 used by JMP/SJP) are handled separately in renderInstruction,
 // since only there is it known whether the value should render as a label.
-std::string renderOperand(Operand kind, uint32_t value) {
+// Always renders lowercase (sdas-cased) register/paren tokens; a Tasm-
+// dialect caller upcases renderInstruction's whole return value afterward
+// (safe there -- see renderInstruction's own comment -- but NOT safe here,
+// since this return value alone doesn't know whether it's about to be
+// wrapped in a label upcase or not).
+std::string renderOperand(Operand kind, uint32_t value, AsmDialect dialect) {
   switch (kind) {
     case Operand::None: return "";
     case Operand::RegXL: return "xl"; case Operand::RegYL: return "yl"; case Operand::RegUL: return "ul";
@@ -80,12 +94,12 @@ std::string renderOperand(Operand kind, uint32_t value) {
     case Operand::RegA: return "a"; case Operand::RegS: return "s"; case Operand::RegP: return "p";
     case Operand::Me0IndX: return "(x)"; case Operand::Me0IndY: return "(y)"; case Operand::Me0IndU: return "(u)";
     case Operand::Me1IndX: return "#(x)"; case Operand::Me1IndY: return "#(y)"; case Operand::Me1IndU: return "#(u)";
-    case Operand::Me0Abs: return "(" + hex4(value) + ")";
-    case Operand::Me1Abs: return "#(" + hex4(value) + ")";
-    case Operand::Imm8: return hex2(value);
-    case Operand::Imm16: return hex4(value);
-    case Operand::VejSelf: return hex2(value);
-    case Operand::VecIdx8: return hex2(value);
+    case Operand::Me0Abs: return "(" + hex4(value, dialect) + ")";
+    case Operand::Me1Abs: return "#(" + hex4(value, dialect) + ")";
+    case Operand::Imm8: return hex2(value, dialect);
+    case Operand::Imm16: return hex4(value, dialect);
+    case Operand::VejSelf: return hex2(value, dialect);
+    case Operand::VecIdx8: return hex2(value, dialect);
     case Operand::Branch8: return "?";  // never reached -- see renderInstruction
   }
   return "?";
@@ -105,13 +119,23 @@ bool isTargetSlot(const DecodedInstruction& d, Operand slotKind) {
   return false;
 }
 
-std::string renderInstruction(const DecodedInstruction& d) {
+std::string renderInstruction(const DecodedInstruction& d, AsmDialect dialect) {
   std::string text = d.mnemonic;
   if (d.op1 != Operand::None) {
-    text += " " + (isTargetSlot(d, d.op1) ? label(d.branchTarget) : renderOperand(d.op1, d.value1));
+    text += " " + (isTargetSlot(d, d.op1) ? label(d.branchTarget) : renderOperand(d.op1, d.value1, dialect));
     if (d.op2 != Operand::None) {
-      text += "," + (isTargetSlot(d, d.op2) ? label(d.branchTarget) : renderOperand(d.op2, d.value2));
+      text += "," + (isTargetSlot(d, d.op2) ? label(d.branchTarget) : renderOperand(d.op2, d.value2, dialect));
     }
+  }
+  // Blanket-upcasing the whole composed line is safe (and simpler than
+  // threading case through every renderOperand branch) only because this
+  // string never contains free-text prose -- just the mnemonic, register/
+  // paren tokens, and hex2/hex4/label output (all of which are meant to be
+  // uppercase in Tasm dialect anyway). symbolComment's "-- comment" text is
+  // appended separately by the caller, after this returns, specifically so
+  // it's never subjected to this transform.
+  if (dialect == AsmDialect::Tasm) {
+    for (char& c : text) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
   }
   return text;
 }
@@ -207,7 +231,7 @@ struct SpecialRegion {
 void appendAnnotation(std::ostringstream& out, const FormatOptions& opts,
                        const std::vector<uint8_t>& image, uint16_t base, uint16_t addr, int length) {
   if (!opts.annotate) return;
-  out << " ; " << hex4(addr) << ":";
+  out << " ; " << hex4(addr, opts.dialect) << ":";
   for (int i = 0; i < length; i++) {
     char buf[8];
     std::snprintf(buf, sizeof(buf), " %02X", image[static_cast<size_t>(addr) + i - base]);
@@ -215,9 +239,16 @@ void appendAnnotation(std::ostringstream& out, const FormatOptions& opts,
   }
 }
 
+// Directive spellings that differ between dialects (see AsmDialect's own
+// comment in formatter.h). Comment text (the "; ..." parts callers append
+// after these) is never run through this -- it's prose, not syntax.
+const char* dbDirective(AsmDialect d) { return d == AsmDialect::Tasm ? "\t.DB " : "\t.db "; }
+const char* dwDirective(AsmDialect d) { return d == AsmDialect::Tasm ? "\t.DW " : "\t.dw "; }
+const char* asciiDirective(AsmDialect d) { return d == AsmDialect::Tasm ? "\t.TEXT \"" : "\t.ascii \""; }
+
 std::string renderKeywordTable(const std::vector<uint8_t>& image, uint16_t base,
                                 const KeywordTable& kt, const std::vector<UserSymbol>& userSymbols,
-                                const KeywordAddrMap& keywordAddrs) {
+                                const KeywordAddrMap& keywordAddrs, AsmDialect dialect) {
   std::ostringstream out;
   bool haveIndex = kt.indexAddr >= base &&
                     (static_cast<size_t>(kt.indexAddr) + 52) <= base + image.size();
@@ -227,21 +258,21 @@ std::string renderKeywordTable(const std::vector<uint8_t>& image, uint16_t base,
     for (int letter = 0; letter < 26; letter++) {
       uint16_t addr = static_cast<uint16_t>(kt.indexAddr + letter * 2);
       uint16_t v = static_cast<uint16_t>((image[addr - base] << 8) | image[addr + 1 - base]);
-      out << "\t.dw " << hex4(v) << "  ; " << static_cast<char>('A' + letter) << "\n";
+      out << dwDirective(dialect) << hex4(v, dialect) << "  ; " << static_cast<char>('A' + letter) << "\n";
     }
   }
   out << "; keyword table (marker/name/code/address per entry)\n";
   for (const auto& e : kt.entries) {
     out << labelLine(e.markerAddr, userSymbols, keywordAddrs);
-    out << "\t.db " << hex2((e.markerAddr < base ? 0 : image[e.markerAddr - base])) << "  ; marker (len="
-        << e.name.size() << ")\n";
-    out << "\t.ascii \"" << escapeAscii(e.name) << "\"\n";
-    out << "\t.dw " << hex4(e.code) << "  ; code\n";
-    out << "\t.dw " << label(e.address) << "  ; address\n";
+    out << dbDirective(dialect) << hex2((e.markerAddr < base ? 0 : image[e.markerAddr - base]), dialect)
+        << "  ; marker (len=" << e.name.size() << ")\n";
+    out << asciiDirective(dialect) << escapeAscii(e.name) << "\"\n";
+    out << dwDirective(dialect) << hex4(e.code, dialect) << "  ; code\n";
+    out << dwDirective(dialect) << label(e.address) << "  ; address\n";
   }
   // Terminator byte, if it's within range (endAddr-1).
   if (kt.endAddr > base && (static_cast<size_t>(kt.endAddr) - 1 - base) < image.size()) {
-    out << "\t.db " << hex2(image[kt.endAddr - 1 - base]) << "  ; table terminator\n";
+    out << dbDirective(dialect) << hex2(image[kt.endAddr - 1 - base], dialect) << "  ; table terminator\n";
   }
   return out.str();
 }
@@ -250,9 +281,12 @@ std::string renderKeywordTable(const std::vector<uint8_t>& image, uint16_t base,
 
 std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResult& result,
                            const FormatOptions& options) {
+  const AsmDialect dialect = options.dialect;
   std::ostringstream out;
-  out << "\t.area CODE (ABS)\n";
-  out << "\t.org " << hex4(result.base) << "\n\n";
+  // Tasm has no segment/relocation concept, so it gets a bare ".ORG" --
+  // see AsmDialect's comment in formatter.h.
+  if (dialect == AsmDialect::Sdas) out << "\t.area CODE (ABS)\n";
+  out << (dialect == AsmDialect::Tasm ? "\t.ORG " : "\t.org ") << hex4(result.base, dialect) << "\n\n";
 
   const KeywordAddrMap keywordAddrs = buildKeywordAddrMap(result);
 
@@ -263,19 +297,20 @@ std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResul
                        (static_cast<size_t>(kt.indexAddr) + 52) <= result.base + image.size())
                           ? kt.indexAddr
                           : kt.tableAddr;
-    specials.push_back({start, kt.endAddr,
-                         renderKeywordTable(image, result.base, kt, options.userSymbols, keywordAddrs)});
+    specials.push_back(
+        {start, kt.endAddr,
+         renderKeywordTable(image, result.base, kt, options.userSymbols, keywordAddrs, dialect)});
   };
   addKeywordTableRegion(result.baseKeywordTable);
   for (const auto& kt : result.moduleKeywordTables) addKeywordTableRegion(kt);
 
   for (const auto& v : result.vectorEntries) {
     std::ostringstream vout;
-    vout << label(v.slot) << ":\n\t.dw " << label(v.target) << "  ; ";
+    vout << label(v.slot) << ":\n" << dwDirective(dialect) << label(v.target) << "  ; ";
     if (v.name != nullptr) {
       vout << v.name << " vector\n";
     } else {
-      vout << "vector slot " << hex4(v.slot) << "\n";
+      vout << "vector slot " << hex4(v.slot, dialect) << "\n";
     }
     specials.push_back({v.slot, static_cast<uint16_t>(v.slot + 2), vout.str()});
   }
@@ -336,7 +371,7 @@ std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResul
           lookupSymbol(addr, /*me1=*/false, options.userSymbols).has_value()) {
         out << labelLine(addr, options.userSymbols, keywordAddrs);
       }
-      out << "\t" << renderInstruction(d) << symbolComment(d, options.userSymbols);
+      out << "\t" << renderInstruction(d, dialect) << symbolComment(d, options.userSymbols);
       appendAnnotation(out, options, image, result.base, addr, d.length);
       out << "\n";
       offset += static_cast<size_t>(d.length);
@@ -369,16 +404,16 @@ std::string formatListing(const std::vector<uint8_t>& image, const AnalysisResul
     }
     if (allPrintable) {
       std::string text(reinterpret_cast<const char*>(&image[runStart]), runLen);
-      out << "\t.ascii \"" << escapeAscii(text) << "\"";
+      out << asciiDirective(dialect) << escapeAscii(text) << "\"";
       appendAnnotation(out, options, image, result.base, runStartAddr, static_cast<int>(runLen));
       out << "\n";
     } else {
       for (size_t i = 0; i < runLen; i += 16) {
         size_t lineLen = std::min<size_t>(16, runLen - i);
-        out << "\t.db ";
+        out << dbDirective(dialect);
         for (size_t j = 0; j < lineLen; j++) {
           if (j) out << ", ";
-          out << hex2(image[runStart + i + j]);
+          out << hex2(image[runStart + i + j], dialect);
         }
         appendAnnotation(out, options, image, result.base, static_cast<uint16_t>(runStartAddr + i),
                           static_cast<int>(lineLen));

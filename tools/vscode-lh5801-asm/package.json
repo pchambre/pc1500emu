@@ -2,7 +2,7 @@
   "name": "lh5801-asm",
   "displayName": "LH5801 Assembly (sdaslh5801)",
   "description": "Syntax highlighting for the sdaslh5801 (PC-1500 LH5801) assembler dialect, matching pc1500emu's disassembler output and https://github.com/pchambre/sdcc-pc1500",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "pchambre",
   "private": true,
   "engines": {
@@ -13,6 +13,7 @@
   "extensionKind": ["ui"],
   "activationEvents": [
     "onCommand:lh5801-asm.disassemble",
+    "onCommand:lh5801-asm.convertTasm",
     "onCommand:lh5801-asm.assemble",
     "onCommand:lh5801-asm.buildC",
     "onCommand:lh5801-asm.run",
@@ -23,6 +24,11 @@
       {
         "command": "lh5801-asm.disassemble",
         "title": "Disassemble to ASM (pc1500disasm)",
+        "category": "LH5801"
+      },
+      {
+        "command": "lh5801-asm.convertTasm",
+        "title": "Convert TASM to SDAS (pc1500disasm)",
         "category": "LH5801"
       },
       {
@@ -54,6 +60,11 @@
           "group": "navigation"
         },
         {
+          "command": "lh5801-asm.convertTasm",
+          "when": "resourceExtname =~ /\\.(asm|s)$/i",
+          "group": "navigation"
+        },
+        {
           "command": "lh5801-asm.assemble",
           "when": "resourceExtname =~ /\\.(asm|s)$/i",
           "group": "navigation"
@@ -75,6 +86,11 @@
         }
       ],
       "editor/context": [
+        {
+          "command": "lh5801-asm.convertTasm",
+          "when": "resourceExtname =~ /\\.(asm|s)$/i",
+          "group": "navigation"
+        },
         {
           "command": "lh5801-asm.assemble",
           "when": "resourceExtname =~ /\\.(asm|s)$/i",

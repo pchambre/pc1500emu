@@ -3,6 +3,8 @@
 //
 // Commands this extension contributes:
 //   - Disassemble to ASM   -- run pc1500disasm on a ROM/BIN file.
+//   - Convert TASM to SDAS -- run pc1500disasm --mode convert on a
+//                             hand-written TASM (tasm5801.tab) .asm file.
 //   - Assemble to BIN      -- run sdaslh5801 + sdld + makebin on a .asm file.
 //   - Build C to BIN       -- run sdcc-pc1500's build-lh5801.sh on a .c file.
 //   - Run in pc1500emu     -- load an assembled/built program into a (possibly
@@ -64,6 +66,7 @@ function activate(context) {
   context.subscriptions.push(diagnostics);
   context.subscriptions.push(
     vscode.commands.registerCommand('lh5801-asm.disassemble', (clickedUri) => disassemble(clickedUri)),
+    vscode.commands.registerCommand('lh5801-asm.convertTasm', (clickedUri) => convertTasm(clickedUri)),
     vscode.commands.registerCommand('lh5801-asm.assemble', (clickedUri) => assembleCommand(clickedUri)),
     vscode.commands.registerCommand('lh5801-asm.buildC', (clickedUri) => buildCCommand(clickedUri)),
     vscode.commands.registerCommand('lh5801-asm.run', (clickedUri) => runCommand(clickedUri)),
@@ -117,6 +120,60 @@ async function disassemble(clickedUri) {
       // Non-fatal warnings (e.g. low-confidence keyword-table candidates
       // -- see --seed in README.md) -- the output was still written, but
       // this is worth surfacing, not discarding.
+      const firstLine = stderr.trim().split('\n')[0];
+      vscode.window.showWarningMessage(`pc1500disasm: ${firstLine}`);
+    }
+    const doc = await vscode.workspace.openTextDocument(outUri);
+    await vscode.window.showTextDocument(doc);
+  });
+}
+
+// ---------------------------------------------------------------------
+// Convert TASM to SDAS (pc1500disasm --mode convert)
+// ---------------------------------------------------------------------
+
+// Rewrites a hand-written TASM (tasm5801.tab) .asm file to this project's
+// sdas dialect, reassemblable by sdaslh5801 -- see src/disasm/
+// tasm_convert.h for exactly what's supported (single .ORG, no
+// #include/#define/#ifdef preprocessing, .EXPORT, or MACRO/ENDM) and why.
+// Same underlying tool as "Disassemble to ASM" (pc1500disasm), just a
+// different mode, so it shares lh5801.disasmCommand rather than adding a
+// new setting.
+async function convertTasm(clickedUri) {
+  const inputUri = await resolveInputUri(clickedUri, /\.(asm|s)$/i, { 'Assembly': ['asm', 's'], 'All files': ['*'] });
+  if (!inputUri) return;
+
+  const disasmCommand = resolveCommandSetting('lh5801.disasmCommand', inputUri);
+  if (!disasmCommand) {
+    await complainMissingSetting(
+      'lh5801.disasmCommand',
+      "point it at your built pc1500disasm(.exe) first -- 'Convert TASM to SDAS' uses the same tool (--mode convert)."
+    );
+    return;
+  }
+
+  const defaultOutUri = vscode.Uri.file(inputUri.fsPath.replace(/\.[^./\\]+$/, '') + '.sdas.asm');
+  const outUri = await vscode.window.showSaveDialog({
+    defaultUri: defaultOutUri,
+    filters: { 'LH5801 Assembly': ['asm'] },
+    saveLabel: 'Convert to',
+  });
+  if (!outUri) return;
+
+  const args = ['--mode', 'convert', inputUri.fsPath, '-o', outUri.fsPath];
+  const cwd = workspaceCwdFor(inputUri);
+
+  await withProgress(`Converting ${path.basename(inputUri.fsPath)} to sdas...`, async () => {
+    const { error, stderr } = await execPlainCommand(disasmCommand, args, cwd);
+    if (error) {
+      // Unlike disassemble()'s warnings (first line only, output still
+      // written), a convert failure means NO output was written and every
+      // reported line is a distinct unsupported construct the user needs
+      // to see -- show the whole thing, not just the first line.
+      vscode.window.showErrorMessage(`pc1500disasm --mode convert failed:\n${(stderr || error.message).trim()}`);
+      return;
+    }
+    if (stderr && stderr.trim()) {
       const firstLine = stderr.trim().split('\n')[0];
       vscode.window.showWarningMessage(`pc1500disasm: ${firstLine}`);
     }

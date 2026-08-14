@@ -10,7 +10,10 @@
 namespace {
 
 using pc1500::disasm::analyzeModuleRom;
+using pc1500::disasm::analyzeProgram;
+using pc1500::disasm::AsmDialect;
 using pc1500::disasm::formatListing;
+using pc1500::disasm::FormatOptions;
 
 int g_failures = 0;
 
@@ -63,10 +66,45 @@ void testKeywordBackLink() {
   CHECK(listing.find(".dw L9040  ; address") != std::string::npos);
 }
 
+// AsmDialect::Tasm renders uppercase mnemonics/registers and "$"-prefixed
+// hex, with no ".area" wrapper (see AsmDialect's own comment in
+// formatter.h) -- the reverse direction from tasm_convert.h's TASM->sdas
+// converter, for producing output a TASM user can read, not for
+// reassembly by this project's own sdaslh5801-based toolchain.
+void testTasmDialectEmit() {
+  constexpr uint16_t kBase = 0x8000;
+  std::vector<uint8_t> image(0x10, 0xFF);
+  // ldi a,0x11 ; sta (0x8010) ; rtn
+  image[0] = 0xB5;
+  image[1] = 0x11;
+  image[2] = 0xAE;
+  image[3] = 0x80;
+  image[4] = 0x10;
+  image[5] = 0x9A;
+  image.resize(6);
+
+  auto r = analyzeProgram(image, kBase);
+  FormatOptions opts;
+  opts.dialect = AsmDialect::Tasm;
+  std::string listing = formatListing(image, r, opts);
+
+  CHECK(listing.find("\t.ORG $8000\n") != std::string::npos);
+  CHECK(listing.find(".area") == std::string::npos);
+  CHECK(listing.find("\tLDI A,$11\n") != std::string::npos);
+  CHECK(listing.find("\tSTA (") != std::string::npos);
+  CHECK(listing.find("\tRTN\n") != std::string::npos);
+  // Sdas dialect (the default) is untouched by this -- still lowercase,
+  // still "0x"-prefixed, still wrapped in ".area".
+  std::string sdasListing = formatListing(image, r);
+  CHECK(sdasListing.find("\t.area CODE (ABS)\n") != std::string::npos);
+  CHECK(sdasListing.find("\tldi a,0x11\n") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
   testKeywordBackLink();
+  testTasmDialectEmit();
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

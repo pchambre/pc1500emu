@@ -348,6 +348,47 @@ aren't in `known_symbols.cpp` yet. One entry per line:
 line is skipped with a warning to stderr rather than aborting the whole
 file. An entry here at the same address as a built-in one overrides it.
 
+`--dialect sdas|tasm` (default `sdas`) chooses the output syntax for the
+byte-disassembly modes above. `sdas` is this project's own house dialect,
+reassemblable by `sdaslh5801`. `tasm` renders the same decoded
+instructions in the [Telemark Assembler](https://www.cpcalive.com/docs/TASMMAN.HTM)
+(`tasm5801.tab`) dialect real hand-written PC-1500 sources sometimes use
+instead: uppercase mnemonics/registers, `$`-prefixed hex, no `.area`
+wrapper (TASM has no segment/relocation concept) -- for reading/porting,
+not for reassembly by this project's own toolchain.
+
+### Converting a TASM source to sdas
+
+`--mode convert` goes the other direction: rewrites a hand-written TASM
+(`tasm5801.tab`) `.asm` file to this project's sdas dialect, reassemblable
+by `sdaslh5801`.
+
+```sh
+pc1500disasm --mode convert memtest.asm -o memtest.sdas.asm
+```
+
+Confirmed against two independent real TASM PC-1500 sources: a
+hand-written memory-test program, and a much larger ROM disassembly
+([github.com/Jeff-Birt/Sharp_CE-158](https://github.com/Jeff-Birt/Sharp_CE-158)).
+Handles `.EQU`/`.ORG`/`.DB`/`.BYTE`/`.DW`/`.WORD`/`.TEXT`/`.ASCII`, `$`-hex
+literals, uppercase mnemonics/registers, and three TASM mnemonics that
+alias LH5801 opcodes under Z80/8080-familiar names with no sdas
+equivalent -- `CALL`/`RET`/`SCF` for `SJP`/`RTN`/`SEC` -- these get a real
+rename, not just a case fold. A trailing `.END` is dropped rather than
+translated: this project's own disassembler never emits one, and a real
+`sdaslh5801` build actively rejects a trailing `.end`.
+
+Deliberately out of scope -- reported as errors rather than silently
+mis-converted, since these need a real preprocessor/macro-expander, not a
+syntax-level rewrite: `#include`/`#define`/`#ifdef` preprocessor
+directives, `.EXPORT` (cross-module linking), and `MACRO`/`ENDM` blocks.
+A second `.ORG` in one file is a warning, not an error (only the first
+gets a synthesized `.area CODE (ABS)` wrapper) -- multi-segment TASM
+sources aren't fully supported. An unrecognized mnemonic/directive token
+is also a warning: passed through unchanged, best-effort, so check the
+output actually assembles. See `src/disasm/tasm_convert.h`'s own comment
+for the full rationale.
+
 ### Editing disassembly output
 
 No dedicated LH5801 IDE exists anywhere (checked). `tools/vscode-lh5801-asm/`
@@ -363,6 +404,16 @@ the resulting `.asm`. Set `lh5801.disasmCommand` in `settings.json` first
 Install the extension by copying `tools/vscode-lh5801-asm/` into
 `%USERPROFILE%\.vscode\extensions\` (Windows) or `~/.vscode/extensions/`
 (Linux/Mac), then reload the window.
+
+**"LH5801: Convert TASM to SDAS"** — right-click a `.asm`/`.s` file (or run
+from the Command Palette against the active editor) to run `pc1500disasm
+--mode convert` (see above) and write/open the result via a Save dialog
+(defaulting to `<name>.sdas.asm` beside the source). Uses the same
+`lh5801.disasmCommand` setting as "Disassemble to ASM" — no separate
+setting needed. A conversion error (an unsupported construct) shows every
+reported line, since each is a distinct thing to fix; a warning (e.g. an
+unrecognized token, or a second `.ORG`) still opens the output, since it
+was written regardless.
 
 The extension also has three commands that take you from source to a
 running (or debugged) program without leaving the editor:
