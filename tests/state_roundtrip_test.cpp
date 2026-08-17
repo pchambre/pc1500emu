@@ -64,6 +64,15 @@ void testRoundTrip() {
   bus.loadRomModule(1, module2Data, sizeof(module2Data), 0x8000, /*requirePv=*/true,
                      /*usePuBank=*/true);
 
+  // An expansion module (writable data window + mock command processing) --
+  // slot 2 doesn't collide with module1/module2's PV/base combinations
+  // above, so it's live at the same time.
+  uint8_t module3Data[2] = {0x55, 0xAA};
+  bus.loadExpansionModule(2, module3Data, sizeof(module3Data), 0x9000, /*requirePv=*/false,
+                           /*usePuBank=*/false, /*dataWindowBase=*/0x8800,
+                           /*dataWindowSize=*/0x0100, /*instructionAddr=*/0x88FF);
+  bus.writeME0(0x8800, 0x7E);  // distinguishing byte in the data window
+
   // Distinguishing CPU state -- this is the whole point of the redesign
   // that dropped cpu.reset() from the restore path: a resumed session
   // must land exactly on these values, not a freshly-reset CPU.
@@ -98,8 +107,14 @@ void testRoundTrip() {
 
   CHECK(bus2.romModuleLoaded(0));
   CHECK(bus2.romModuleLoaded(1));
-  CHECK(!bus2.romModuleLoaded(2));
+  CHECK(bus2.romModuleLoaded(2));
   CHECK(!bus2.romModuleLoaded(3));
+
+  // Expansion module's data window survives the round trip, including the
+  // live write made before saving -- not just the static ROM bytes.
+  CHECK(bus2.readME0(0x9000) == 0x55);
+  CHECK(bus2.readME0(0x8800) == 0x7E);
+  CHECK(bus2.readME0(0x88FF) == 0xFF);  // untouched byte still at its power-up default
 
   CHECK(cpu2.p() == 0x1234);
   CHECK(cpu2.s() == 0x7A00);
@@ -108,6 +123,49 @@ void testRoundTrip() {
   CHECK(cpu2.u() == 0x3333);
   CHECK(cpu2.halted() == true);
   CHECK(cpu2.timerCounter() == cpu.timerCounter());
+
+  std::remove(path.c_str());
+}
+
+// CE-163 is mutually exclusive with the two extRam windows testRoundTrip
+// already exercises (see Bus::setCe163Enabled's own comment), so it needs
+// its own save/load pass: enabled flag, active bank, and -- the actual
+// point of having two banks -- BOTH banks' contents, not just the one
+// currently selected at save time.
+void testCe163RoundTrip() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  lh5801::CPU cpu(bus);
+
+  bus.setCe163Enabled(true);
+  bus.writeME0(0x0010, 0xAA);   // bank 0
+  bus.writeME0(0x3FFF, 0xBB);
+  bus.writeME0(0x5801, 0x00);   // switch to bank 1 (odd address; value irrelevant)
+  bus.writeME0(0x0010, 0xCC);   // bank 1
+  bus.writeME0(0x3FFF, 0xDD);
+  bus.writeME0(0x5801, 0x00);   // switch back to bank 1 again -- stay here for the save,
+                                 // to confirm the *active* bank round-trips too, not just 0
+
+  std::string path = tempPath("pc1500emu_state_roundtrip_test_ce163.state");
+  std::string err;
+  CHECK(pc1500host::saveStateFile(cpu, bus, path, &err));
+  CHECK(err.empty());
+
+  pc1500::Keyboard kb2;
+  pc1500::Bus bus2(kb2);
+  lh5801::CPU cpu2(bus2);
+  err.clear();
+  CHECK(pc1500host::loadStateFile(cpu2, bus2, path, &err));
+  CHECK(err.empty());
+
+  CHECK(bus2.ce163Enabled() == true);
+  CHECK(bus2.ce163Bank() == 1);
+  CHECK(bus2.readME0(0x0010) == 0xCC);  // bank 1, still selected after load
+  CHECK(bus2.readME0(0x3FFF) == 0xDD);
+
+  bus2.writeME0(0x5800, 0xFF);  // switch to bank 0 (even address; value irrelevant)
+  CHECK(bus2.readME0(0x0010) == 0xAA);  // bank 0's contents survived the round trip too
+  CHECK(bus2.readME0(0x3FFF) == 0xBB);
 
   std::remove(path.c_str());
 }
@@ -176,6 +234,7 @@ void testTruncatedFileRejected() {
 
 int main() {
   testRoundTrip();
+  testCe163RoundTrip();
   testCorruptMagicRejected();
   testTruncatedFileRejected();
 

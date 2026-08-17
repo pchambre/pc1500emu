@@ -424,10 +424,23 @@ uint8_t Bus::readME0(uint16_t addr) {
   lastAccessedSpace_ = MemorySpace::ME0;
   if (addr >= 0x8000 && addr <= 0xBFFF) {
     uint8_t v;
+    // Live data-window bytes take priority over static ROM bytes -- a
+    // module with hasDataWindow can genuinely be written to (see
+    // writeME0), unlike a plain read-only loadrommodule-style module.
+    for (const RomModule& m : romModules_) {
+      if (m.tryReadWindow(addr, pv_, v)) return v;
+    }
     for (const RomModule& m : romModules_) {
       if (m.tryRead(addr, pv_, pu_, v)) return v;
     }
     return 0xFF;  // empty socket, or a module present but not selected by the current PV level
+  }
+  // CE-163: reads its own separate 32K backing store directly, bypassing
+  // me0_ entirely, so the bank not currently selected keeps its contents
+  // (see Bus::setCe163Enabled's own comment for why this can't just be a
+  // size gate into me0_ like the other two extension-RAM windows).
+  if (ce163Enabled_ && addr <= 0x3FFF) {
+    return ce163Ram_[static_cast<size_t>(ce163Bank_) * 0x4000 + addr];
   }
   if (isUnmapped(addr)) return 0xFF;
   return me0_[effectiveAddr(addr)];
@@ -435,6 +448,39 @@ uint8_t Bus::readME0(uint16_t addr) {
 
 void Bus::writeME0(uint16_t addr, uint8_t value) {
   lastAccessedSpace_ = MemorySpace::ME0;
+  if (addr >= 0x8000 && addr <= 0xBFFF) {
+    // Unlike a plain loadrommodule-style module (whose whole claimed range
+    // is real ROM and can never be written -- isUnmapped's own blanket
+    // "CE-150/153/158 (not connected)" discard below still applies to
+    // those), a module with hasDataWindow genuinely has RAM there on real
+    // hardware. A write landing on that module's own instructionAddr
+    // additionally triggers mock command processing, mirroring the real
+    // board's DoCommand()/WriteStatus() protocol (write a command byte,
+    // poll the same address for a non-BUSY status) -- see ExpansionMock.
+    for (RomModule& m : romModules_) {
+      if (!m.tryWrite(addr, pv_, value)) continue;
+      if (m.hasDataWindow && addr == m.instructionAddr) {
+        uint8_t status = expansionMock_.processCommand(value, m.dataWindow);
+        m.dataWindow[m.instructionAddr - m.dataWindowBase] = status;
+      }
+      return;
+    }
+    return;  // not claimed by any module -- isUnmapped's own discard below covers this range anyway
+  }
+  // CE-163 bank-select trigger (PC-1500 wiring: pin 18 = S3 -> 5800H-5FFFH;
+  // a PC-1500A wires the same pin to S5 instead, a different range not
+  // emulated here). Pure address-line latch on real hardware -- the byte
+  // value is irrelevant, and nothing is actually stored at this address.
+  if (ce163Enabled_ && addr >= 0x5800 && addr <= 0x5FFF) {
+    ce163Bank_ = static_cast<uint8_t>(addr & 1);
+    return;
+  }
+  // CE-163 data write -- see readME0's own comment for why this bypasses
+  // me0_ and goes straight to the bank-selected slice of ce163Ram_.
+  if (ce163Enabled_ && addr <= 0x3FFF) {
+    ce163Ram_[static_cast<size_t>(ce163Bank_) * 0x4000 + addr] = value;
+    return;
+  }
   if (isUnmapped(addr) || isRom(addr)) return;
   me0_[effectiveAddr(addr)] = value;
 }
@@ -570,6 +616,15 @@ void saveRomModule(std::ostream& os, const Bus::RomModule& m) {
   writeU16(os, m.base);
   writeBool(os, m.requirePv);
   writeBool(os, m.usePuBank);
+  // Appended fields -- an older save file lacks these entirely, so loading
+  // one with newer code will misread past the end of the module's own
+  // data; accepted for this pre-1.0 dev tool rather than adding a format
+  // version just for this.
+  writeBool(os, m.hasDataWindow);
+  writeU32(os, static_cast<uint32_t>(m.dataWindow.size()));
+  writeBytes(os, m.dataWindow.data(), m.dataWindow.size());
+  writeU16(os, m.dataWindowBase);
+  writeU16(os, m.instructionAddr);
 }
 
 bool loadRomModuleState(std::istream& is, Bus::RomModule& m) {
@@ -580,6 +635,12 @@ bool loadRomModuleState(std::istream& is, Bus::RomModule& m) {
   m.base = readU16(is);
   m.requirePv = readBool(is);
   m.usePuBank = readBool(is);
+  m.hasDataWindow = readBool(is);
+  uint32_t windowSize = readU32(is);
+  m.dataWindow.assign(windowSize, 0);
+  readBytes(is, m.dataWindow.data(), m.dataWindow.size());
+  m.dataWindowBase = readU16(is);
+  m.instructionAddr = readU16(is);
   return !is.fail();
 }
 }  // namespace
@@ -589,6 +650,9 @@ void Bus::saveState(std::ostream& os) const {
   writeBytes(os, me0_.data(), kSavedRamSize);
   writeU32(os, static_cast<uint32_t>(extRam4800Size_));
   writeU32(os, static_cast<uint32_t>(extRam0000Size_));
+  writeBool(os, ce163Enabled_);
+  writeU8(os, ce163Bank_);
+  writeBytes(os, ce163Ram_.data(), ce163Ram_.size());
   for (const RomModule& m : romModules_) {
     saveRomModule(os, m);
   }
@@ -599,6 +663,9 @@ bool Bus::loadState(std::istream& is) {
   readBytes(is, me0_.data(), kSavedRamSize);
   extRam4800Size_ = readU32(is);
   extRam0000Size_ = readU32(is);
+  ce163Enabled_ = readBool(is);
+  ce163Bank_ = readU8(is);
+  readBytes(is, ce163Ram_.data(), ce163Ram_.size());
   bool ok = true;
   for (RomModule& m : romModules_) {
     ok = loadRomModuleState(is, m) && ok;

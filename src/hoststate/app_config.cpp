@@ -54,6 +54,7 @@ bool loadAppConfig(const std::string& path, AppConfig* out, std::string* error) 
   out->showStatusPanel = j.value("showStatusPanel", false);
   out->extRam4800Bytes = j.value("extRam4800Bytes", static_cast<size_t>(0));
   out->extRam0000Bytes = j.value("extRam0000Bytes", static_cast<size_t>(0));
+  out->ce163Enabled = j.value("ce163Enabled", false);
   return true;
 }
 
@@ -66,6 +67,7 @@ bool saveAppConfig(const AppConfig& config, const std::string& path, std::string
   j["showStatusPanel"] = config.showStatusPanel;
   j["extRam4800Bytes"] = config.extRam4800Bytes;
   j["extRam0000Bytes"] = config.extRam0000Bytes;
+  j["ce163Enabled"] = config.ce163Enabled;
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) {

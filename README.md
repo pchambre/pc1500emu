@@ -168,9 +168,20 @@ native OS menu) sits above the display:
 - **Settings > Extension RAM (4800H)** — None (default) / 4K / 8K / 10K of
   emulated module RAM at `4800H`. 4K/8K were the real 1982-era hardware
   options; 10K is the window's full physical span (`4800H`-`6FFFH`) --
-  not a real period-correct module, but easy to emulate.
-- **Settings > Extension RAM (0000H)** — None (default) / 16K of emulated
-  module RAM at `0000H`-`3FFFH`.
+  not a real period-correct module, but easy to emulate. Mutually
+  exclusive with CE-163 below (a real PC-1500 has one expansion port, and
+  CE-163's own bank-select range physically overlaps this window) --
+  selecting a size here turns CE-163 off, and vice versa.
+- **Settings > Extension RAM (0000H)** — None (default) / 16K (synthetic;
+  not a real 1982-era option, just easy headroom) / **CE-163** (a real
+  1982-era module: 32K of RAM, banked two 16K halves at a time into this
+  same `0000H`-`3FFFH` window). Bank selection on a real PC-1500 is a pure
+  write-triggered address-line latch at `5800H`-`5FFFH` — writing to an
+  *even* address there selects bank 0, an *odd* address selects bank 1;
+  the byte value written doesn't matter, and nothing is actually stored at
+  that address. (Wired to a different expansion-port pin/address range on
+  a PC-1500A — not emulated, since pc1500emu doesn't model a PC-1500A at
+  all yet.)
 - **Settings > Automation Mode** — when checked, real host keyboard input
   (typing, arrow keys, F-keys, etc.) is ignored entirely; only the
   scriptable command interface below can drive the emulator. An orange
@@ -229,6 +240,16 @@ Commands:
   host-Shift symbol.
 - `peek <addr>` / `poke <addr> <val>` — addresses and values in hex.
 - `dump <start> <end>` — hex bytes, 16 per line, address-prefixed.
+- `reset` — same as Ctrl+F12; re-runs `CPU::reset()` without touching RAM.
+  Needed after `setextram`/`setce163` below, since the ROM only detects
+  installed extension RAM at reset/cold-start, not on the fly (see "When
+  'adding' RAM" above).
+- `setextram <window> <bytes>` — FIFO equivalent of the Settings >
+  Extension RAM menu items. `<window>` is `4800` or `0000`; `<bytes>` is
+  decimal.
+- `setce163 <0|1>` — FIFO equivalent of Settings > Extension RAM (0000H) >
+  CE-163 (see that section above). Mutually exclusive with `setextram` —
+  enabling one clears the other.
 - `status` — CPU registers/flags and the fixed-segment indicator bits.
 - `display` — the 156x7 dot matrix as ASCII art (`#`/`.`).
 - `displaytext` — the ROM's own LCD text buffer (`7BB0H`-`7BFFH`, per the
@@ -239,6 +260,44 @@ Commands:
 - `savebasic <path>` / `loadbasic <path>` / `savebinary <addr> <len> <path>`
   / `loadbinary <addr> <path>` — the same functions the File menu's dialogs
   call, invokable directly without going through the GUI.
+- `loadrommodule[2-4] <base hex> <requirePv 0|1> <usePuBank 0|1> <path>` —
+  loads a CE-150/153/158-style plug-in ROM module into one of four
+  independent slots (no suffix = slot 1) at `0x8000`-`0xBFFF`. `requirePv`
+  is the PV level the CPU must have set for it to respond at all (`0`/low
+  matches CE-150, `1`/high matches CE-158); the module is otherwise
+  read-only ROM, matching real hardware. `unloadrommodule[2-4]` clears a
+  slot.
+- `loadexpansionmodule[2-4] <base hex> <requirePv 0|1> <usePuBank 0|1>
+  <dataWindowBase hex> <dataWindowSize hex> <instructionAddr hex> <path>
+  [sdDir]` — like `loadrommodule`, but for a module with a genuinely
+  writable data window backed by a mock command processor
+  (`src/bus/expansion_mock.h`), modeling boards like the PC1500-PSOC5
+  expansion where that whole address range is one real, shared RAM buffer
+  rather than true ROM. `path` is just the ROM bytes (a trimmed,
+  base-aligned binary — not a full window-sized image with the data-window
+  portion blanked out); the data window itself is separately allocated and
+  initialized to `0xFF` (matching real RAM's confirmed power-up default).
+  A CPU write to `instructionAddr` triggers mock command processing
+  synchronously, mirroring the real board's `DoCommand()`/`WriteStatus()`
+  protocol: write a command byte, poll that same address for a non-`BUSY`
+  status. The optional trailing `sdDir` points the mock's SD-card commands
+  (`LIST_SD_DIR`, create/open/read/write/close/remove a file, get file
+  size/status/name, get free space/volume size, format) at a real host
+  directory, so `SSAVE`/`SLOAD`/`SLS`/etc. can be developed and tested
+  against real files instead of an embedded list — drop files in and
+  `LIST_SD_DIR` sees them, `CREATE_SD_FILE`/`WRITE_TO_SD_FILE` write real
+  ones there. Filenames arriving over the wire are validated against path
+  traversal (rejects separators, `..`, drive letters, or anything that'd
+  resolve outside `sdDir`) before touching the filesystem. **`FORMAT_SD_CARD`
+  deletes every file directly inside `sdDir` — genuinely destructive,
+  matching the real command's own intent — don't point it at a directory
+  you care about.** Omitting `sdDir` leaves every SD command reporting
+  `EXP_STATUS_ERROR` ("no card inserted"), which is itself a legitimate
+  state to test. Everything else (`ROM_FROM_MCU`/`SRAM`,
+  `TEST_COPY_STRING`, ...) reports `NOT_IMPLEMENTED`, same as the real
+  firmware's own default case. Shares slots with `loadrommodule` (loading
+  either into an already-occupied slot replaces it) —
+  `unloadrommodule[2-4]` clears these too.
 - `savebasictext <path>` / `loadbasictext <path>` — the text-listing
   equivalents. `loadbasictext` drives the ROM's line editor internally (see
   File menu section above) by stepping CPU/bus cycles directly rather than
@@ -290,6 +349,40 @@ Commands:
 
 `type`/`key` commands queue onto the same mechanism real typing uses, so
 scripted and live keyboard input interleave safely rather than racing.
+
+**Debugging a specific keypress's dispatch.** `presskey`/`trace`/
+`releasekey` sent as three separate pipe commands is tempting but unsound:
+the live ~60fps frame loop keeps running in the real-world gaps between
+separate commands, so a key held across a large enough `trace` budget can
+get "seen" more than once by the ROM (confirmed: this let a single held
+Enter both dispatch and self-exit a custom keyword within one hold — a real
+bug in the debugging method, not the ROM). The commands below press, wait,
+and (where relevant) trace or watch as one atomic call instead, so nothing
+races them:
+- `entertrace <cycles>` — presses Enter, holds it a few frames, releases,
+  waits a few more idle frames, then traces `cycles` more instructions —
+  all as one unbroken CPU-stepping sequence. For watching exactly what a
+  keyword dispatch does immediately after Enter is pressed.
+- `enterwatch <watchAddr hex> <watchLen decimal> <cycles decimal>` — same
+  atomic Enter-press pattern as `entertrace`, but only logs writes to a
+  specific address range instead of every instruction — for watching one
+  piece of state (e.g. a status byte) change during a keyword's dispatch
+  without wading through a full instruction trace.
+- `typelinetrace <cycles> <text>` — types `<text>` (queued the same way as
+  `type`, with a trailing Enter), then traces `cycles` more instructions
+  once typing settles, atomically. The one-shot way to see what a whole
+  typed command (not just a bare Enter) does on dispatch.
+- `typelinewatch <watchAddr hex> <watchLen decimal> <extraCycles decimal>
+  <text>` — `typelinetrace`'s watch-only counterpart, for the same reason
+  `enterwatch` exists relative to `entertrace`.
+
+A large trace or watch response can be several megabytes; read the response
+file directly (e.g. with a shell tool that streams/counts lines) rather
+than piping it through a language's own "read whole file into one string
+variable" convenience call — that has silently truncated a multi-MB trace
+to a single line in practice, with no error raised, costing real debugging
+time before the mismatch between the reported line count and the file's
+actual size on disk was caught.
 
 ## Disassembler
 

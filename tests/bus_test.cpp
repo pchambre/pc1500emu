@@ -1,10 +1,15 @@
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
 
 #include "bus.h"
 #include "keyboard.h"
 
 namespace {
+
+namespace fs = std::filesystem;
 
 int g_failures = 0;
 
@@ -343,6 +348,365 @@ void testExtensionRam0000WindowSizeGatesMappedRange() {
   CHECK(bus.readME0(0x3FFF) == 0x88);
 }
 
+// CE-163: 32K module, banked two 16K halves at a time into 0000H-3FFFH.
+// Bank select is a pure write-triggered address-line latch at 5800H-5FFFH
+// (even address -> bank 0, odd -> bank 1; the byte value is irrelevant),
+// and each bank has to keep its own contents independently -- the whole
+// point of having two banks, as opposed to just a size gate like the other
+// two extension-RAM windows.
+void testCe163BankSwitchingKeepsBanksIndependent() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  CHECK(bus.ce163Enabled() == false);
+  CHECK(bus.ce163Bank() == 0);
+  CHECK(bus.readME0(0x0000) == 0xFF);  // disabled -- unmapped, matching stock hardware
+  bus.writeME0(0x0000, 0x11);
+  CHECK(bus.readME0(0x0000) == 0xFF);  // write ignored while disabled
+
+  bus.setCe163Enabled(true);
+  CHECK(bus.readME0(0x0000) == 0xFF);  // real RAM's confirmed power-up default, not 0x00
+  CHECK(bus.readME0(0x3FFF) == 0xFF);  // last byte of the window
+
+  // Bank 0 is active by default -- write a recognizable pattern.
+  bus.writeME0(0x0000, 0xAA);
+  bus.writeME0(0x3FFF, 0xBB);
+  CHECK(bus.readME0(0x0000) == 0xAA);
+  CHECK(bus.readME0(0x3FFF) == 0xBB);
+
+  // A write to an ODD address in 5800H-5FFFH selects bank 1 -- the value
+  // written is irrelevant (0x00 here), and nothing is actually stored at
+  // that address (it stays unmapped -- see the mutual-exclusion check
+  // below, and 4800H-6FFFH generally when CE-163 is enabled).
+  bus.writeME0(0x5801, 0x00);
+  CHECK(bus.ce163Bank() == 1);
+  CHECK(bus.readME0(0x0000) == 0xFF);  // bank 1's own fresh contents, not bank 0's 0xAA
+  CHECK(bus.readME0(0x3FFF) == 0xFF);
+
+  // Write a DIFFERENT pattern into bank 1.
+  bus.writeME0(0x0000, 0xCC);
+  bus.writeME0(0x3FFF, 0xDD);
+  CHECK(bus.readME0(0x0000) == 0xCC);
+  CHECK(bus.readME0(0x3FFF) == 0xDD);
+
+  // A write to an EVEN address in 5800H-5FFFH switches back to bank 0 --
+  // its earlier contents must still be there, untouched by bank 1's writes.
+  bus.writeME0(0x5800, 0xFF);  // value still irrelevant
+  CHECK(bus.ce163Bank() == 0);
+  CHECK(bus.readME0(0x0000) == 0xAA);
+  CHECK(bus.readME0(0x3FFF) == 0xBB);
+
+  // Switch to bank 1 one more time to confirm ITS contents also survived
+  // the round trip (not just bank 0's).
+  bus.writeME0(0x5801, 0x00);
+  CHECK(bus.readME0(0x0000) == 0xCC);
+  CHECK(bus.readME0(0x3FFF) == 0xDD);
+}
+
+// Real hardware has one expansion port -- CE-163 can't coexist with either
+// existing extension-RAM window. Enabling one clears the other; enforced
+// from both directions so Bus state can't end up contradictory regardless
+// of call order (see each setter's own comment in bus.h).
+void testCe163IsMutuallyExclusiveWithOtherExtensionRam() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+
+  bus.setExtRam0000Size(pc1500::Bus::kExtRam0000WindowSize);
+  CHECK(bus.extRam0000Size() == pc1500::Bus::kExtRam0000WindowSize);
+  bus.setCe163Enabled(true);
+  CHECK(bus.ce163Enabled() == true);
+  CHECK(bus.extRam0000Size() == 0);  // cleared by enabling CE-163
+
+  bus.setExtRam4800Size(pc1500::Bus::kExtRam4800WindowSize);
+  CHECK(bus.extRam4800Size() == pc1500::Bus::kExtRam4800WindowSize);
+  CHECK(bus.ce163Enabled() == false);  // cleared by setting a nonzero 4800H size
+
+  bus.setCe163Enabled(true);
+  CHECK(bus.ce163Enabled() == true);
+  CHECK(bus.extRam4800Size() == 0);  // cleared by enabling CE-163 again
+
+  bus.setExtRam0000Size(pc1500::Bus::kExtRam0000WindowSize);
+  CHECK(bus.ce163Enabled() == false);  // cleared by setting a nonzero 0000H size
+}
+
+// Unlike a plain loadrommodule-style module (testRomIsReadOnly-equivalent
+// for the 0x8000-0xBFFF region -- writes there are always discarded), a
+// module with a data window genuinely has RAM: writes stick, reads see
+// them back, and PV gating still applies exactly like the ROM sub-range.
+void testExpansionModuleDataWindowIsReadWrite() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  uint8_t romBytes[] = {0x55, 0xAA};
+  bus.loadExpansionModule(0, romBytes, sizeof(romBytes), /*base=*/0x9000, /*requirePv=*/false,
+                           /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
+                           /*dataWindowSize=*/0x1000, /*instructionAddr=*/0x8FFF);
+
+  CHECK(bus.readME0(0x9000) == 0x55);
+  bus.writeME0(0x9000, 0x99);
+  CHECK(bus.readME0(0x9000) == 0x55);  // ROM sub-range still read-only
+
+  CHECK(bus.readME0(0x8000) == 0xFF);  // real RAM's confirmed power-up default
+  bus.writeME0(0x8000, 0x42);
+  CHECK(bus.readME0(0x8000) == 0x42);
+  bus.writeME0(0x81FF, 0x77);
+  CHECK(bus.readME0(0x81FF) == 0x77);
+
+  bus.setPv(true);
+  CHECK(bus.readME0(0x8000) == 0xFF);  // module not selected at this PV level
+  bus.writeME0(0x8000, 0x11);
+  CHECK(bus.readME0(0x8000) == 0xFF);  // write also ignored -- wrong PV level
+  bus.setPv(false);
+  CHECK(bus.readME0(0x8000) == 0x42);  // unaffected by the ignored write above
+}
+
+// ---------------------------------------------------------------------
+// ExpansionMock SD-card commands, backed by a real host directory (not an
+// embedded mock list -- see ExpansionMock::setRootDir's own comment).
+
+fs::path makeTempTestDir(const char* name) {
+  fs::path dir = fs::temp_directory_path() / name;
+  std::error_code ec;
+  fs::remove_all(dir, ec);  // clean slate if a previous run left it behind
+  fs::create_directories(dir);
+  return dir;
+}
+
+pc1500::Bus* makeExpansionBus(pc1500::Keyboard& kb, const fs::path& rootDir) {
+  static uint8_t romBytes[] = {0x55};
+  auto* bus = new pc1500::Bus(kb);
+  bus->loadExpansionModule(0, romBytes, sizeof(romBytes), 0x9000, false, false, 0x8000, 0x1000,
+                            0x8FFF);
+  if (!rootDir.empty()) bus->expansionMock().setRootDir(rootDir);
+  return bus;
+}
+
+// Writes a 2-byte BE length prefix at window offset 0, then `text`'s raw
+// bytes right after -- the wire format every filename/volume-name
+// argument uses (StringFromBuffer's own convention in main.c).
+void writeLengthPrefixedArg(pc1500::Bus& bus, const std::string& text) {
+  bus.writeME0(0x8000, static_cast<uint8_t>(text.size() >> 8));
+  bus.writeME0(0x8001, static_cast<uint8_t>(text.size() & 0xFF));
+  for (size_t i = 0; i < text.size(); i++) {
+    bus.writeME0(static_cast<uint16_t>(0x8002 + i), static_cast<uint8_t>(text[i]));
+  }
+}
+
+uint8_t triggerCommand(pc1500::Bus& bus, uint8_t cmd) {
+  bus.writeME0(0x8FFF, cmd);
+  return bus.readME0(0x8FFF);
+}
+
+// A write to instructionAddr triggers ExpansionMock::processCommand
+// synchronously -- verifies EXP_COMMAND_LIST_SD_DIR's real wire format
+// (2-byte BE count, then per entry: 16-byte space-padded name, 10-byte
+// pre-rendered decimal size text, 4-byte BE binary size) lands correctly
+// against a real file in a real directory, matching PC_EXP.h/main.c's own
+// layout.
+void testExpansionModuleListSdDirReflectsRealDirectory() {
+  fs::path dir = makeTempTestDir("pc1500emu_bus_test_listdir");
+  {
+    std::ofstream f(dir / "HELLO.TXT", std::ios::binary);
+    f << "Hi there!";  // 9 bytes
+  }
+  pc1500::Keyboard kb;
+  pc1500::Bus* bus = makeExpansionBus(kb, dir);
+
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandListSdDir) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+
+  CHECK(bus->readME0(0x8000) == 0x00);  // count, BE
+  CHECK(bus->readME0(0x8001) == 0x01);
+
+  const char* name0 = "HELLO.TXT";
+  for (int i = 0; i < 16; i++) {
+    uint8_t expected = (i < 9) ? static_cast<uint8_t>(name0[i]) : ' ';
+    CHECK(bus->readME0(static_cast<uint16_t>(0x8002 + i)) == expected);
+  }
+  const char* sizeText0 = "         9";
+  for (int i = 0; i < 10; i++) {
+    CHECK(bus->readME0(static_cast<uint16_t>(0x8012 + i)) == static_cast<uint8_t>(sizeText0[i]));
+  }
+  CHECK(bus->readME0(0x801C) == 0x00);
+  CHECK(bus->readME0(0x801D) == 0x00);
+  CHECK(bus->readME0(0x801E) == 0x00);
+  CHECK(bus->readME0(0x801F) == 0x09);
+
+  // Summary line right after the one entry: offset 2 + 1*30 = 32 = 0x8020.
+  // Free space is a real (unpredictable) host-disk number, so only the
+  // prefix up to it is checked.
+  const char* summaryPrefix = "1 FILES 9B ";
+  for (size_t i = 0; i < std::string(summaryPrefix).size(); i++) {
+    CHECK(bus->readME0(static_cast<uint16_t>(0x8020 + i)) ==
+          static_cast<uint8_t>(summaryPrefix[i]));
+  }
+
+  delete bus;
+  fs::remove_all(dir);
+}
+
+// With no rootDir configured, every SD command reports EXP_STATUS_ERROR
+// ("no card inserted") rather than silently doing nothing or crashing.
+void testExpansionModuleWithNoRootDirReportsError() {
+  pc1500::Keyboard kb;
+  pc1500::Bus* bus = makeExpansionBus(kb, "");
+  writeLengthPrefixedArg(*bus, "TEST.BIN");
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandCreateSdFile) ==
+        pc1500::ExpansionMock::kStatusError);
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandGetSdFreeSpace) ==
+        pc1500::ExpansionMock::kStatusError);
+  delete bus;
+}
+
+// Full create -> write -> close -> open-read -> read -> close round trip
+// against real files, matching main.c's own single-open-file protocol.
+void testExpansionModuleFileWriteReadRoundTrip() {
+  fs::path dir = makeTempTestDir("pc1500emu_bus_test_fileio");
+  pc1500::Keyboard kb;
+  pc1500::Bus* bus = makeExpansionBus(kb, dir);
+
+  writeLengthPrefixedArg(*bus, "TEST.BIN");
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandCreateSdFile) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandGetSdFileStatus) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  CHECK(bus->readME0(0x8000) == pc1500::ExpansionMock::kFileStatusOpenWrite);
+
+  std::string payload = "Hello, PC-1500!";
+  bus->writeME0(0x8000, static_cast<uint8_t>(payload.size() >> 8));
+  bus->writeME0(0x8001, static_cast<uint8_t>(payload.size() & 0xFF));
+  for (size_t i = 0; i < payload.size(); i++) {
+    bus->writeME0(static_cast<uint16_t>(0x8002 + i), static_cast<uint8_t>(payload[i]));
+  }
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandWriteToSdFile) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandCloseSdFile) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  uint32_t closedSize = (static_cast<uint32_t>(bus->readME0(0x8000)) << 24) |
+                         (static_cast<uint32_t>(bus->readME0(0x8001)) << 16) |
+                         (static_cast<uint32_t>(bus->readME0(0x8002)) << 8) |
+                         bus->readME0(0x8003);
+  CHECK(closedSize == payload.size());
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandGetSdFileStatus) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  CHECK(bus->readME0(0x8000) == pc1500::ExpansionMock::kFileStatusClosed);
+
+  // The file genuinely exists on the host now, independent of the mock.
+  CHECK(fs::exists(dir / "TEST.BIN"));
+  CHECK(fs::file_size(dir / "TEST.BIN") == payload.size());
+
+  writeLengthPrefixedArg(*bus, "TEST.BIN");
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandOpenSdFileRead) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandGetSdFileSize) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  uint32_t openSize = (static_cast<uint32_t>(bus->readME0(0x8000)) << 24) |
+                       (static_cast<uint32_t>(bus->readME0(0x8001)) << 16) |
+                       (static_cast<uint32_t>(bus->readME0(0x8002)) << 8) |
+                       bus->readME0(0x8003);
+  CHECK(openSize == payload.size());
+
+  bus->writeME0(0x8000, 0x00);
+  bus->writeME0(0x8001, static_cast<uint8_t>(payload.size()));  // requestLen, BE, < 254
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandReadFromSdFile) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  uint16_t bytesRead = (static_cast<uint16_t>(bus->readME0(0x8000)) << 8) | bus->readME0(0x8001);
+  CHECK(bytesRead == payload.size());
+  for (size_t i = 0; i < payload.size(); i++) {
+    CHECK(bus->readME0(static_cast<uint16_t>(0x8002 + i)) == static_cast<uint8_t>(payload[i]));
+  }
+
+  writeLengthPrefixedArg(*bus, "TEST.BIN");  // GET_SD_FILE_NAME doesn't take an arg, but
+                                              // harmless to leave one queued -- confirms it's
+                                              // ignored by reading from EXP_SCRATCH_PAGE instead
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandGetSdFileName) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  CHECK(bus->readME0(0x8100) == 8);  // "TEST.BIN" length
+  const char* name = "TEST.BIN";
+  for (int i = 0; i < 8; i++) {
+    CHECK(bus->readME0(static_cast<uint16_t>(0x8101 + i)) == static_cast<uint8_t>(name[i]));
+  }
+
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandCloseSdFile) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+
+  writeLengthPrefixedArg(*bus, "TEST.BIN");
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandRemoveSdFile) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  CHECK(!fs::exists(dir / "TEST.BIN"));
+
+  delete bus;
+  fs::remove_all(dir);
+}
+
+// FORMAT_SD_CARD deletes every regular file directly in rootDir -- verify
+// against real files, and that it's genuinely destructive (by design).
+void testExpansionModuleFormatDeletesAllFiles() {
+  fs::path dir = makeTempTestDir("pc1500emu_bus_test_format");
+  { std::ofstream(dir / "A.TXT", std::ios::binary) << "a"; }
+  { std::ofstream(dir / "B.TXT", std::ios::binary) << "b"; }
+  pc1500::Keyboard kb;
+  pc1500::Bus* bus = makeExpansionBus(kb, dir);
+
+  writeLengthPrefixedArg(*bus, "PC1500");  // volume name arg -- content unused by the mock
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandFormatSdCard) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  CHECK(fs::is_empty(dir));
+
+  delete bus;
+  fs::remove_all(dir);
+}
+
+// Filenames straight off the wire are untrusted -- confirms path
+// traversal / absolute-path / embedded-separator attempts are rejected
+// (EXP_STATUS_ERROR) rather than escaping the configured root directory.
+void testExpansionModuleRejectsUnsafeFilenames() {
+  fs::path dir = makeTempTestDir("pc1500emu_bus_test_pathsafety");
+  pc1500::Keyboard kb;
+  pc1500::Bus* bus = makeExpansionBus(kb, dir);
+
+  const char* unsafeNames[] = {"../ESCAPED.TXT", "..\\ESCAPED.TXT", "/etc/passwd",
+                                "C:\\Windows\\evil.txt", "sub/dir.txt"};
+  for (const char* name : unsafeNames) {
+    writeLengthPrefixedArg(*bus, name);
+    CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandCreateSdFile) ==
+          pc1500::ExpansionMock::kStatusError);
+  }
+  // Nothing escaped into the parent of the sandbox directory.
+  CHECK(!fs::exists(dir.parent_path() / "ESCAPED.TXT"));
+  CHECK(fs::is_empty(dir));
+
+  delete bus;
+  fs::remove_all(dir);
+}
+
+// GET_SD_FREE_SPACE/GET_SD_VOLUME_SIZE return real (unpredictable) host-
+// disk numbers -- just confirm they succeed and report something nonzero,
+// not exact values.
+void testExpansionModuleFreeSpaceAndVolumeSizeSucceed() {
+  fs::path dir = makeTempTestDir("pc1500emu_bus_test_space");
+  pc1500::Keyboard kb;
+  pc1500::Bus* bus = makeExpansionBus(kb, dir);
+
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandGetSdFreeSpace) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  uint32_t freeSpace = (static_cast<uint32_t>(bus->readME0(0x8000)) << 24) |
+                        (static_cast<uint32_t>(bus->readME0(0x8001)) << 16) |
+                        (static_cast<uint32_t>(bus->readME0(0x8002)) << 8) |
+                        bus->readME0(0x8003);
+  CHECK(freeSpace > 0);
+
+  CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandGetSdVolumeSize) ==
+        pc1500::ExpansionMock::kStatusSuccess);
+  uint32_t volumeSize = (static_cast<uint32_t>(bus->readME0(0x8000)) << 24) |
+                         (static_cast<uint32_t>(bus->readME0(0x8001)) << 16) |
+                         (static_cast<uint32_t>(bus->readME0(0x8002)) << 8) |
+                         bus->readME0(0x8003);
+  CHECK(volumeSize > 0);
+
+  delete bus;
+  fs::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
@@ -361,6 +725,15 @@ int main() {
   testMe1MirrorsIoPortControllerWhereAd12Ad13BothSet();
   testExtensionRam4800WindowSizesGateMappedRange();
   testExtensionRam0000WindowSizeGatesMappedRange();
+  testCe163BankSwitchingKeepsBanksIndependent();
+  testCe163IsMutuallyExclusiveWithOtherExtensionRam();
+  testExpansionModuleDataWindowIsReadWrite();
+  testExpansionModuleListSdDirReflectsRealDirectory();
+  testExpansionModuleWithNoRootDirReportsError();
+  testExpansionModuleFileWriteReadRoundTrip();
+  testExpansionModuleFormatDeletesAllFiles();
+  testExpansionModuleRejectsUnsafeFilenames();
+  testExpansionModuleFreeSpaceAndVolumeSizeSucceed();
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

@@ -12,6 +12,7 @@
 #include <iosfwd>
 #include <vector>
 
+#include "expansion_mock.h"
 #include "keyboard.h"
 #include "lh5801.h"
 
@@ -485,6 +486,7 @@ class Bus : public lh5801::MemoryBus {
   explicit Bus(Keyboard& keyboard) : keyboard_(keyboard) {
     me0_.fill(0xFF);
     std::fill(me0_.begin() + 0x4008, me0_.begin() + 0x40C5, 0x00);
+    ce163Ram_.fill(0xFF);  // matches real RAM's confirmed 0xFF power-up default, not C++'s own 0
   }
 
   uint8_t readME0(uint16_t addr) override;
@@ -532,11 +534,27 @@ class Bus : public lh5801::MemoryBus {
   // halves (PU=0 selects the first, PU=1 the second) for modules whose
   // real ROM exceeds the 16K window (CE-158) -- false for modules that fit
   // in one 16K bank regardless of PU (CE-150).
+  //
+  // A module may additionally claim a writable data-window sub-range
+  // (`hasDataWindow`) -- unlike `data`, real hardware for a genuine
+  // RAM-backed expansion board (as opposed to a true ROM cartridge), so
+  // writes there actually stick instead of being discarded. `instructionAddr`
+  // is the one address within that window where a write also triggers
+  // mock command processing (see Bus::writeME0/ExpansionMock), mirroring
+  // the real PC1500-PSOC5 board's DoCommand()/WriteStatus() protocol:
+  // write a command byte there, poll the same address for a non-BUSY
+  // status. Plain `loadrommodule`-style pure-ROM modules leave
+  // `hasDataWindow` false and behave exactly as before.
   struct RomModule {
     std::vector<uint8_t> data;
     uint16_t base = 0xA000;
     bool requirePv = false;
     bool usePuBank = false;
+
+    bool hasDataWindow = false;
+    std::vector<uint8_t> dataWindow;
+    uint16_t dataWindowBase = 0;
+    uint16_t instructionAddr = 0;
 
     bool tryRead(uint16_t addr, bool pv, bool pu, uint8_t& out) const {
       if (data.empty() || pv != requirePv) return false;
@@ -548,19 +566,56 @@ class Bus : public lh5801::MemoryBus {
       out = data[offset];
       return true;
     }
+
+    bool tryReadWindow(uint16_t addr, bool pv, uint8_t& out) const {
+      if (!hasDataWindow || pv != requirePv) return false;
+      if (addr < dataWindowBase || addr >= dataWindowBase + dataWindow.size()) return false;
+      out = dataWindow[addr - dataWindowBase];
+      return true;
+    }
+
+    // Returns true if this module's data window claims `addr` (regardless
+    // of whether it's also `instructionAddr` -- Bus::writeME0 checks that
+    // separately, since triggering the mock is Bus's job, not RomModule's).
+    bool tryWrite(uint16_t addr, bool pv, uint8_t value) {
+      if (!hasDataWindow || pv != requirePv) return false;
+      if (addr < dataWindowBase || addr >= dataWindowBase + dataWindow.size()) return false;
+      dataWindow[addr - dataWindowBase] = value;
+      return true;
+    }
   };
   static constexpr int kNumRomModules = 4;
   void loadRomModule(int slot, const uint8_t* data, size_t size, uint16_t base, bool requirePv,
                       bool usePuBank) {
     RomModule& m = romModules_[slot];
+    m = RomModule{};
     m.data.assign(data, data + size);
     m.base = base;
     m.requirePv = requirePv;
     m.usePuBank = usePuBank;
   }
+  // Like loadRomModule, but additionally claims a writable data-window
+  // sub-range (initialized to 0xFF, matching real RAM's confirmed power-up
+  // default) with command processing at `instructionAddr` -- see
+  // RomModule's own comment and ExpansionMock.
+  void loadExpansionModule(int slot, const uint8_t* romData, size_t romSize, uint16_t base,
+                            bool requirePv, bool usePuBank, uint16_t dataWindowBase,
+                            uint16_t dataWindowSize, uint16_t instructionAddr) {
+    RomModule& m = romModules_[slot];
+    m = RomModule{};
+    m.data.assign(romData, romData + romSize);
+    m.base = base;
+    m.requirePv = requirePv;
+    m.usePuBank = usePuBank;
+    m.hasDataWindow = true;
+    m.dataWindow.assign(dataWindowSize, 0xFF);
+    m.dataWindowBase = dataWindowBase;
+    m.instructionAddr = instructionAddr;
+  }
   void unloadRomModule(int slot) { romModules_[slot] = RomModule{}; }
   bool romModuleLoaded(int slot) const { return !romModules_[slot].data.empty(); }
   const RomModule& romModule(int slot) const { return romModules_[slot]; }
+  ExpansionMock& expansionMock() { return expansionMock_; }
 
   // Forwarded from the CPU's own SPU/RPU/SPV/RPV opcode handlers (see
   // lh5801.cpp) -- Bus is the single source of truth for the *current*
@@ -582,16 +637,53 @@ class Bus : public lh5801::MemoryBus {
   // hardware options were 4K or 8K here; 10K (the window's full physical
   // span) wasn't a real period-correct module but is easy to emulate and
   // physically possible with denser modern RAM.
+  //
+  // Mutually exclusive with the CE-163 (see setCe163Enabled's own comment
+  // below) -- a real PC-1500 has one expansion port, and the CE-163's own
+  // bank-select range (5800H-5FFFH) physically overlaps this window.
   static constexpr size_t kExtRam4800WindowSize = 0x2800;  // 10K
-  void setExtRam4800Size(size_t bytes) { extRam4800Size_ = bytes; }
+  void setExtRam4800Size(size_t bytes) {
+    extRam4800Size_ = bytes;
+    if (bytes != 0) ce163Enabled_ = false;
+  }
   size_t extRam4800Size() const { return extRam4800Size_; }
 
   // 0000H-3FFFH window (option user memory slot, up to 16K span): not a
   // real 1982-era option at all (nothing plugged in there back then), but
   // physically possible now and worth emulating for headroom.
+  //
+  // Mutually exclusive with the CE-163 (see setCe163Enabled's own comment
+  // below) -- both occupy this exact same window.
   static constexpr size_t kExtRam0000WindowSize = 0x4000;  // 16K
-  void setExtRam0000Size(size_t bytes) { extRam0000Size_ = bytes; }
+  void setExtRam0000Size(size_t bytes) {
+    extRam0000Size_ = bytes;
+    if (bytes != 0) ce163Enabled_ = false;
+  }
   size_t extRam0000Size() const { return extRam0000Size_; }
+
+  // CE-163: a real 1982-era module, 32K of RAM banked into the 0000H-3FFFH
+  // window two 16K banks at a time (only one bank visible at once). Bank
+  // selection is a pure address-line trigger on real hardware: any WRITE
+  // to 5800H-5FFFH selects bank 0 (even address) or bank 1 (odd address)
+  // -- the byte value written is irrelevant, and nothing is actually
+  // stored at 5800H-5FFFH itself (see Bus::writeME0). This is the
+  // PC-1500's own wiring (pin 18 = S3); a PC-1500A wires the same pin to
+  // S5 instead, which would need a different trigger range -- pc1500emu
+  // doesn't emulate a PC-1500A yet, so only the PC-1500 wiring is modeled.
+  //
+  // Mutually exclusive with both extension-RAM windows above (enabling
+  // this clears them; setting either of them back to nonzero disables
+  // this) -- real hardware has one expansion port, so at most one of these
+  // three can be physically installed at a time.
+  void setCe163Enabled(bool enabled) {
+    ce163Enabled_ = enabled;
+    if (enabled) {
+      extRam0000Size_ = 0;
+      extRam4800Size_ = 0;
+    }
+  }
+  bool ce163Enabled() const { return ce163Enabled_; }
+  uint8_t ce163Bank() const { return ce163Bank_; }
 
   // Wraps Keyboard::setKeyState. The actual release is deferred by
   // kMinimumHoldCycles (see applyRelease) rather than applied immediately,
@@ -669,10 +761,16 @@ class Bus : public lh5801::MemoryBus {
 
 
   static bool isRom(uint16_t addr) { return addr >= 0xC000; }
+  // When ce163Enabled_, the 0000H window is always "mapped" here regardless
+  // of extRam0000Size_ (which is forced to 0 by the mutual exclusion in
+  // setCe163Enabled) -- the CE-163 has its own separate backing store
+  // (ce163Ram_), read/written directly in readME0/writeME0, not gated by
+  // this size check at all.
   bool isUnmapped(uint16_t addr) const {
     bool in0000Window = addr <= 0x3FFF;
     bool in4800Window = addr >= 0x4800 && addr <= 0x6FFF;
-    return (in0000Window && addr >= extRam0000Size_) ||       // beyond configured 0000H module RAM
+    return (in0000Window && addr >= extRam0000Size_ && !ce163Enabled_) ||  // beyond configured
+                                                                            // 0000H module RAM
            (in4800Window && (addr - 0x4800) >= extRam4800Size_) ||  // beyond configured 4800H module RAM
            (addr >= 0x8000 && addr <= 0xBFFF);                // CE-150/153/158 (not connected)
   }
@@ -703,7 +801,11 @@ class Bus : public lh5801::MemoryBus {
   MemorySpace lastAccessedSpace_ = MemorySpace::ME0;
   size_t extRam4800Size_ = 0;
   size_t extRam0000Size_ = 0;
+  bool ce163Enabled_ = false;
+  uint8_t ce163Bank_ = 0;
+  std::array<uint8_t, 0x8000> ce163Ram_{};  // 32K, two independent 16K banks back-to-back
   std::array<RomModule, kNumRomModules> romModules_;
+  ExpansionMock expansionMock_;
   bool pv_ = false;  // matches CPU::reset()'s own pv_/pu_ default
   bool pu_ = false;
 

@@ -917,6 +917,40 @@ bool loadRomModule(pc1500::Bus& bus, int slot, uint16_t base, bool requirePv, bo
   return true;
 }
 
+// Like loadRomModule, but for a module with a genuinely writable data
+// window (e.g. the PC1500-PSOC5 board) -- see Bus::RomModule's own comment.
+// `path` should be just the ROM bytes (e.g. a trimmed, base-aligned binary),
+// not a full window-sized image with the data-window portion blanked out --
+// the data window is separately zero/0xFF-initialized, not loaded from a
+// file. `sdDir`, if non-empty, points the module's ExpansionMock at a real
+// host directory for its SD-card commands (see ExpansionMock::setRootDir);
+// omitted/empty leaves it unconfigured ("no card inserted", every SD
+// command reports an error). Not validated as existing here -- a
+// nonexistent/inaccessible directory just makes every SD command fail at
+// call time, which is itself a legitimate state to be able to test.
+bool loadExpansionModule(pc1500::Bus& bus, int slot, uint16_t base, bool requirePv,
+                          bool usePuBank, uint16_t dataWindowBase, uint16_t dataWindowSize,
+                          uint16_t instructionAddr, const char* path, const std::string& sdDir,
+                          std::string* error) {
+  std::vector<uint8_t> data = readFile(path);
+  if (data.empty()) {
+    *error = "Could not read file (or file is empty).";
+    return false;
+  }
+  if (usePuBank && (data.size() % 2) != 0) {
+    *error = "PU-banked module ROM must have an even size (split into two equal banks).";
+    return false;
+  }
+  if (instructionAddr < dataWindowBase || instructionAddr >= dataWindowBase + dataWindowSize) {
+    *error = "instructionAddr must fall within [dataWindowBase, dataWindowBase+dataWindowSize).";
+    return false;
+  }
+  bus.loadExpansionModule(slot, data.data(), data.size(), base, requirePv, usePuBank,
+                           dataWindowBase, dataWindowSize, instructionAddr);
+  if (!sdDir.empty()) bus.expansionMock().setRootDir(sdDir);
+  return true;
+}
+
 bool saveBinary(pc1500::Bus& bus, uint16_t addr, uint32_t len, const char* path, std::string* error) {
   if (len == 0) {
     *error = "Length must be greater than 0.";
@@ -1432,6 +1466,10 @@ int main(int argc, char** argv) {
     // sizes (Bus::loadState), so this is skipped in that branch.
     bus.setExtRam4800Size(appConfig.extRam4800Bytes);
     bus.setExtRam0000Size(appConfig.extRam0000Bytes);
+    // Last, so it deterministically wins if a hand-edited conf file somehow
+    // has a contradictory combination -- setCe163Enabled(true) itself
+    // clears the two sizes above right back to 0 (see its own comment).
+    bus.setCe163Enabled(appConfig.ce163Enabled);
     cpu.reset();
   }
 
@@ -1751,6 +1789,15 @@ int main(int argc, char** argv) {
       } else {
         std::fprintf(stderr, "pc1500emu: setextram window must be 4800 or 0000\n");
       }
+    } else if (cmd == "setce163") {
+      // FIFO equivalent of the Settings > Extension RAM (0000H) > CE-163
+      // menu item. <enabled> is 0 or 1. Mutually exclusive with both
+      // setextram windows -- Bus::setCe163Enabled(true) clears them both;
+      // setextram with a nonzero size clears this back off (see each's own
+      // comment in bus.h). Needs `reset` after, same as setextram.
+      long enabled = 0;
+      iss >> std::dec >> enabled;
+      bus.setCe163Enabled(enabled != 0);
     } else if (cmd == "dump") {
       long start = 0, end = 0;
       iss >> std::hex >> start >> end;
@@ -2001,6 +2048,32 @@ int main(int argc, char** argv) {
       std::string error;
       bool ok = loadRomModule(bus, slot, static_cast<uint16_t>(base), requirePv != 0,
                                usePuBank != 0, path.c_str(), &error);
+      writeResponse(ok ? "OK" : ("ERROR: " + error));
+    } else if (cmd == "loadexpansionmodule" || cmd == "loadexpansionmodule2" ||
+               cmd == "loadexpansionmodule3" || cmd == "loadexpansionmodule4") {
+      // <base hex> <requirePv 0|1> <usePuBank 0|1> <dataWindowBase hex>
+      // <dataWindowSize hex> <instructionAddr hex> <path> [sdDir] -- like
+      // loadrommodule, but for a module with a genuinely writable data
+      // window and mock command processing (see Bus::RomModule's own
+      // comment and ExpansionMock). Same four independent slots as
+      // loadrommodule, sharing the same slot array. Optional trailing
+      // sdDir points the (single, Bus-wide) ExpansionMock's SD-card
+      // commands at a real host directory -- see loadExpansionModule's
+      // own comment; omitted leaves SD commands erroring ("no card").
+      int slot = (cmd == "loadexpansionmodule") ? 0 : (cmd.back() - '1');
+      long base = 0, requirePv = 0, usePuBank = 0, dataWindowBase = 0, dataWindowSize = 0,
+           instructionAddr = 0;
+      std::string path, sdDir;
+      iss >> std::hex >> base >> std::dec >> requirePv >> usePuBank;
+      iss >> std::hex >> dataWindowBase >> dataWindowSize >> instructionAddr;
+      iss >> path;
+      iss >> sdDir;
+      std::string error;
+      bool ok = loadExpansionModule(bus, slot, static_cast<uint16_t>(base), requirePv != 0,
+                                     usePuBank != 0, static_cast<uint16_t>(dataWindowBase),
+                                     static_cast<uint16_t>(dataWindowSize),
+                                     static_cast<uint16_t>(instructionAddr), path.c_str(), sdDir,
+                                     &error);
       writeResponse(ok ? "OK" : ("ERROR: " + error));
     } else if (cmd == "unloadrommodule" || cmd == "unloadrommodule2" ||
                cmd == "unloadrommodule3" || cmd == "unloadrommodule4") {
@@ -2873,6 +2946,11 @@ int main(int argc, char** argv) {
           auto setExtRam4800 = [&](size_t bytes) {
             bus.setExtRam4800Size(bytes);
             appConfig.extRam4800Bytes = bytes;
+            // Mutually exclusive with the CE-163 (see Bus::setCe163Enabled's
+            // own comment) -- Bus already cleared its side when bytes != 0;
+            // keep appConfig in sync so the conf file doesn't persist a
+            // contradictory combination.
+            if (bytes != 0) appConfig.ce163Enabled = false;
             persistActiveConf();
           };
           // Real 1982 hardware options were 4K/8K; 10K (the window's full
@@ -2890,17 +2968,32 @@ int main(int argc, char** argv) {
         if (ImGui::BeginMenu("Extension RAM (0000H)")) {
           if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
           size_t cur = bus.extRam0000Size();
+          bool ce163 = bus.ce163Enabled();
           auto setExtRam0000 = [&](size_t bytes) {
             bus.setExtRam0000Size(bytes);
             appConfig.extRam0000Bytes = bytes;
+            if (bytes != 0) appConfig.ce163Enabled = false;
             persistActiveConf();
           };
           // Not a real 1982-era option at all (nothing plugged in there
           // back then), but physically possible now.
-          if (ImGui::MenuItem("None", nullptr, cur == 0)) setExtRam0000(0);
+          if (ImGui::MenuItem("None", nullptr, cur == 0 && !ce163)) setExtRam0000(0);
           if (ImGui::MenuItem("16K (full window)", nullptr,
-                               cur == pc1500::Bus::kExtRam0000WindowSize)) {
+                               cur == pc1500::Bus::kExtRam0000WindowSize && !ce163)) {
             setExtRam0000(pc1500::Bus::kExtRam0000WindowSize);
+          }
+          // CE-163: a real 1982-era module, 32K banked two 16K halves at a
+          // time into this same window -- mutually exclusive with both the
+          // choices above and with Extension RAM (4800H), since its own
+          // bank-select range (5800H-5FFFH) physically overlaps that
+          // window and a real PC-1500 has only one expansion port. See
+          // Bus::setCe163Enabled's own comment.
+          if (ImGui::MenuItem("CE-163 (32K, banked)", nullptr, ce163)) {
+            bus.setCe163Enabled(true);
+            appConfig.ce163Enabled = true;
+            appConfig.extRam0000Bytes = 0;
+            appConfig.extRam4800Bytes = 0;
+            persistActiveConf();
           }
           ImGui::EndMenu();
         }
@@ -3002,7 +3095,9 @@ int main(int argc, char** argv) {
           } else {
             ImGui::TextUnformatted("Ext RAM 4800H: off");
           }
-          if (bus.extRam0000Size() > 0) {
+          if (bus.ce163Enabled()) {
+            ImGui::Text("Ext RAM 0000H: CE-163 (bank %u)", static_cast<unsigned>(bus.ce163Bank()));
+          } else if (bus.extRam0000Size() > 0) {
             ImGui::Text("Ext RAM 0000H: %uK", static_cast<unsigned>(bus.extRam0000Size() / 1024));
           } else {
             ImGui::TextUnformatted("Ext RAM 0000H: off");

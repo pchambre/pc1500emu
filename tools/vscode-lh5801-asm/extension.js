@@ -615,8 +615,19 @@ async function runCommand(clickedUri) {
       return;
     }
 
-    await sendCommandNoWait(`call ${program.entryHex}`);
-    vscode.window.showInformationMessage(`Running ${path.basename(program.binPath)} at 0x${program.entryHex} in pc1500emu.`);
+    if (loadMode.mode === 'binary') {
+      await sendCommandNoWait(`call ${program.entryHex}`);
+      vscode.window.showInformationMessage(`Running ${path.basename(program.binPath)} at 0x${program.entryHex} in pc1500emu.`);
+    } else {
+      // Extension ROM modules are discovered by BASIC's own boot-time
+      // keyword scan, not entered directly -- calling their base address
+      // would jump straight into the sentinel byte (0x55) as if it were
+      // code, corrupting machine state instead of running anything.
+      vscode.window.showInformationMessage(
+        `Attached ${path.basename(program.binPath)} at 0x${program.loadAddressHex} in pc1500emu. ` +
+          `If BASIC was already running, press CL then type NEW0 and Enter to re-scan before typing the module's keyword.`
+      );
+    }
   } catch {
     // already reported to the user above
   }

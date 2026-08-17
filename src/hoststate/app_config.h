@@ -32,6 +32,11 @@ struct AppConfig {
   // setExtRam0000Size.
   size_t extRam4800Bytes = 0;
   size_t extRam0000Bytes = 0;
+  // CE-163 module (32K, banked into the same window as extRam0000Bytes) --
+  // mutually exclusive with both fields above, see Bus::setCe163Enabled's
+  // own comment. Same before-cpu.reset() ordering requirement as the two
+  // extRam fields.
+  bool ce163Enabled = false;
 };
 
 // A missing file at `path` is not an error -- returns true with *out left

@@ -46,6 +46,7 @@ void testRoundTrip() {
   config.showStatusPanel = true;
   config.extRam4800Bytes = 0x2000;
   config.extRam0000Bytes = 0x4000;
+  config.ce163Enabled = true;
 
   std::string path = tempPath("pc1500emu_app_config_test.json");
   std::string err;
@@ -66,6 +67,7 @@ void testRoundTrip() {
   CHECK(loaded.showStatusPanel == true);
   CHECK(loaded.extRam4800Bytes == 0x2000);
   CHECK(loaded.extRam0000Bytes == 0x4000);
+  CHECK(loaded.ce163Enabled == true);
 
   std::remove(path.c_str());
 }
@@ -87,6 +89,7 @@ void testEmptyConfigRoundTrip() {
   CHECK(loaded.showStatusPanel == false);
   CHECK(loaded.extRam4800Bytes == 0);
   CHECK(loaded.extRam0000Bytes == 0);
+  CHECK(loaded.ce163Enabled == false);
 
   std::remove(path.c_str());
 }
@@ -123,6 +126,7 @@ void testOldConfigMissingNewFieldUsesDefault() {
   CHECK(loaded.showStatusPanel == false);        // absent -- AppConfig{}'s default
   CHECK(loaded.extRam4800Bytes == 0);            // absent -- AppConfig{}'s default
   CHECK(loaded.extRam0000Bytes == 0);            // absent -- AppConfig{}'s default
+  CHECK(loaded.ce163Enabled == false);           // absent -- AppConfig{}'s default
   std::remove(path.c_str());
 }
 
