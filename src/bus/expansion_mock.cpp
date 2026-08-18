@@ -70,42 +70,44 @@ std::string ExpansionMock::convertTildeToPlus(const std::string& name) {
 }
 
 // `name` is untrusted, straight off the wire from whatever's running on
-// the LH5801 -- reject anything that isn't a bare filename before ever
-// touching the filesystem. This is a local dev tool, not network-exposed,
-// but a ROM bug (or a fuzz test) writing/deleting files outside the
-// intended sandbox directory would be a bad surprise worth deliberately
-// preventing. Rejecting any path separator outright (rather than trying
-// to canonicalize ".." components away) is the simple, robust rule; the
-// weakly_canonical containment check below is defense in depth for
-// anything that slips past it (e.g. symlinks).
+// the LH5801 -- resolve it and confirm it stays inside rootDir_ before
+// ever touching the filesystem. This is a local dev tool, not
+// network-exposed, but a ROM bug (or a fuzz test) writing/deleting files
+// outside the intended sandbox directory would be a bad surprise worth
+// deliberately preventing.
+//
+// `name` may be a plain filename (resolved against currentDir_, SDCD's
+// own state), a relative path with '.'/'..'/multiple components (e.g.
+// "SUB/DIR", "../OTHER"), or an absolute one starting with '/' (resolved
+// against rootDir_ instead -- a bare "/" means the SD root itself). This
+// used to be two near-duplicate functions (resolvePath, plain filenames
+// only; resolveDirPath, relative paths for SDCD/MKDIR/RMDIR but no
+// absolute support) -- merged once SDLOAD/SDSAVE/SDRM/SDCP/SDMV all
+// needed the same relative+absolute support resolveDirPath already had
+// for directories, matching rom.asm's SD_PARSE_QUOTED_NAME, which already
+// validates 8.3 shape per '/'-segment for every one of these commands
+// uniformly regardless of what the destination command actually does
+// with the result.
+//
+// The weakly_canonical containment check below is the *primary* defense
+// against escaping the sandbox (not just defense in depth) -- it
+// correctly handles arbitrarily nested "up and down" traversal via
+// fs::path's own lexically_normal() first.
 fs::path ExpansionMock::resolvePath(const std::string& name) const {
   if (rootDir_.empty() || name.empty()) return {};
-  if (name.find('/') != std::string::npos || name.find('\\') != std::string::npos) return {};
-  if (name == "." || name == "..") return {};
-  if (name.find(':') != std::string::npos) return {};  // e.g. a Windows drive letter
+  std::string translated = convertPlusToTilde(name);
+  if (translated.find('\\') != std::string::npos) return {};  // no raw Windows separators
+  if (translated.find(':') != std::string::npos) return {};   // e.g. a drive letter
 
-  fs::path candidate = currentDir_ / convertPlusToTilde(name);  // relative to SDCD's own state, not always rootDir_
-  std::error_code ec;
-  fs::path canonicalRoot = fs::weakly_canonical(rootDir_, ec);
-  if (ec) return {};
-  fs::path canonicalCandidate = fs::weakly_canonical(candidate, ec);
-  if (ec) return {};
-
-  const auto& rootStr = canonicalRoot.native();
-  const auto& candStr = canonicalCandidate.native();
-  if (candStr.size() < rootStr.size() || candStr.compare(0, rootStr.size(), rootStr) != 0) {
-    return {};
+  fs::path base;
+  std::string rest = translated;
+  if (rest.front() == '/') {
+    base = rootDir_;
+    rest = rest.substr(1);
+  } else {
+    base = currentDir_;
   }
-  return candidate;
-}
-
-fs::path ExpansionMock::resolveDirPath(const std::string& name) const {
-  if (rootDir_.empty() || name.empty()) return {};
-  if (name.find('\\') != std::string::npos) return {};  // no raw Windows separators
-  if (name.find(':') != std::string::npos) return {};   // e.g. a drive letter
-  if (name.front() == '/') return {};                    // no absolute paths
-
-  fs::path candidate = (currentDir_ / convertPlusToTilde(name)).lexically_normal();
+  fs::path candidate = rest.empty() ? base : (base / rest).lexically_normal();
   std::error_code ec;
   fs::path canonicalRoot = fs::weakly_canonical(rootDir_, ec);
   if (ec) return {};
@@ -118,6 +120,21 @@ fs::path ExpansionMock::resolveDirPath(const std::string& name) const {
     return {};  // would escape the sandbox root (e.g. ".." from the root itself)
   }
   return candidate;
+}
+
+// For SDCP/SDMV's destination argument: resolves destArg via resolvePath,
+// then -- if that resolves to an *existing directory* -- returns (that
+// directory)/srcBasename instead, matching Unix cp/mv's own "copy/move
+// INTO a directory" behavior.
+fs::path ExpansionMock::resolveCopyOrMoveDestination(const std::string& srcBasename,
+                                                      const std::string& destArg) const {
+  fs::path resolved = resolvePath(destArg);
+  if (resolved.empty()) return {};
+  std::error_code ec;
+  if (fs::is_directory(resolved, ec) && !ec) {
+    return resolved / srcBasename;
+  }
+  return resolved;
 }
 
 uint8_t ExpansionMock::processCommand(uint8_t cmd, std::vector<uint8_t>& window) {
@@ -158,6 +175,14 @@ uint8_t ExpansionMock::processCommand(uint8_t cmd, std::vector<uint8_t>& window)
       return removeSdDir(window);
     case kCommandGetSdCwd:
       return getSdCwd(window);
+    case kCommandCopySdFile:
+      return copySdFile(window);
+    case kCommandMoveSdFile:
+      return moveSdFile(window);
+    case kCommandGetSdDfText:
+      return getSdDfText(window);
+    case kCommandCheckSdCopyMoveDestExists:
+      return checkSdCopyMoveDestExists(window);
     case kCommandClearStatus:
       return kStatusReady;
     default:
@@ -392,6 +417,10 @@ uint8_t ExpansionMock::removeSdFile(std::vector<uint8_t>& window) {
   fs::path path = resolvePath(name);
   if (path.empty()) return kStatusError;
   std::error_code ec;
+  // SDRM (rom.asm) must only ever delete a file, never a directory --
+  // SDRMDIR is the only sanctioned way to remove one. Without this,
+  // fs::remove below would happily remove an *empty* directory too.
+  if (!fs::is_regular_file(path, ec) || ec) return kStatusError;
   bool removed = fs::remove(path, ec);
   return (removed && !ec) ? kStatusSuccess : kStatusError;
 }
@@ -429,7 +458,7 @@ uint8_t ExpansionMock::formatSdCard(std::vector<uint8_t>& window) {
 uint8_t ExpansionMock::changeSdDir(std::vector<uint8_t>& window) {
   std::string name = readLengthPrefixedString(window);
   if (name.empty()) return kStatusError;
-  fs::path target = resolveDirPath(name);
+  fs::path target = resolvePath(name);
   if (target.empty()) return kStatusError;
   std::error_code ec;
   if (!fs::is_directory(target, ec) || ec) return kStatusError;
@@ -440,7 +469,7 @@ uint8_t ExpansionMock::changeSdDir(std::vector<uint8_t>& window) {
 uint8_t ExpansionMock::makeSdDir(std::vector<uint8_t>& window) {
   std::string name = readLengthPrefixedString(window);
   if (name.empty()) return kStatusError;
-  fs::path target = resolveDirPath(name);
+  fs::path target = resolvePath(name);
   if (target.empty()) return kStatusError;
   std::error_code ec;
   bool created = fs::create_directory(target, ec);
@@ -450,7 +479,7 @@ uint8_t ExpansionMock::makeSdDir(std::vector<uint8_t>& window) {
 uint8_t ExpansionMock::removeSdDir(std::vector<uint8_t>& window) {
   std::string name = readLengthPrefixedString(window);
   if (name.empty()) return kStatusError;
-  fs::path target = resolveDirPath(name);
+  fs::path target = resolvePath(name);
   if (target.empty()) return kStatusError;
   std::error_code ec;
   // fs::remove only removes an empty directory (or a single file) -- never
@@ -478,6 +507,86 @@ uint8_t ExpansionMock::getSdCwd(std::vector<uint8_t>& window) {
   if (ec) return kStatusError;
   std::string cwd = convertTildeToPlus("/" + (rel == "." ? std::string() : rel.generic_string()));
   writeLengthPrefixedString(cwd, window, kScratchOffset);
+  return kStatusSuccess;
+}
+
+// Ported from main.c's EXP_COMMAND_COPY_SD_FILE case: two fixed
+// kTwoNameSlotLen-byte slots back-to-back at window offset 0 (source, then
+// destination) -- see expansion_mock.h's own comment on kTwoNameSlotLen
+// for why fixed-width. Both source and destination are full paths now
+// (resolvePath); if the destination resolves to an existing directory,
+// the real target is that directory plus the source's own basename
+// (resolveCopyOrMoveDestination), matching Unix cp's own "copy INTO a
+// directory" behavior. Overwriting an existing destination is confirmed
+// first by the ROM (EXP_COMMAND_CHECK_SD_COPY_MOVE_DEST_EXISTS, below)
+// unless -Y was given -- this command itself always overwrites
+// unconditionally, same as fs::copy_options::overwrite_existing always
+// has; the confirmation gate lives entirely on the ROM side.
+uint8_t ExpansionMock::copySdFile(std::vector<uint8_t>& window) {
+  std::string srcArg = readLengthPrefixedString(window, 0);
+  std::string destArg = readLengthPrefixedString(window, kTwoNameSlotLen);
+  if (srcArg.empty() || destArg.empty()) return kStatusError;
+  fs::path srcPath = resolvePath(srcArg);
+  if (srcPath.empty()) return kStatusError;
+  std::error_code ec;
+  if (!fs::is_regular_file(srcPath, ec) || ec) return kStatusError;
+  fs::path destPath = resolveCopyOrMoveDestination(srcPath.filename().string(), destArg);
+  if (destPath.empty()) return kStatusError;
+  bool copied = fs::copy_file(srcPath, destPath, fs::copy_options::overwrite_existing, ec);
+  return (copied && !ec) ? kStatusSuccess : kStatusError;
+}
+
+// Ported from main.c's EXP_COMMAND_MOVE_SD_FILE case -- same wire layout
+// and destination resolution as copySdFile above. fs::rename mirrors
+// POSIX rename() semantics (silently replaces an existing destination).
+uint8_t ExpansionMock::moveSdFile(std::vector<uint8_t>& window) {
+  std::string srcArg = readLengthPrefixedString(window, 0);
+  std::string destArg = readLengthPrefixedString(window, kTwoNameSlotLen);
+  if (srcArg.empty() || destArg.empty()) return kStatusError;
+  fs::path srcPath = resolvePath(srcArg);
+  if (srcPath.empty()) return kStatusError;
+  std::error_code ec;
+  if (!fs::is_regular_file(srcPath, ec) || ec) return kStatusError;
+  fs::path destPath = resolveCopyOrMoveDestination(srcPath.filename().string(), destArg);
+  if (destPath.empty()) return kStatusError;
+  fs::rename(srcPath, destPath, ec);
+  return ec ? kStatusError : kStatusSuccess;
+}
+
+// Ported from main.c's EXP_COMMAND_CHECK_SD_COPY_MOVE_DEST_EXISTS case:
+// same wire layout and destination resolution as copySdFile/moveSdFile
+// above (shared, since the resolution logic -- including directory-target
+// basename-join -- is identical for both) -- SUCCESS means the real
+// (resolved) target already exists, so SDCP_ROUTINE/SDMV_ROUTINE (rom.asm)
+// know to show the overwrite-confirmation prompt unless -Y was given.
+uint8_t ExpansionMock::checkSdCopyMoveDestExists(std::vector<uint8_t>& window) {
+  std::string srcArg = readLengthPrefixedString(window, 0);
+  std::string destArg = readLengthPrefixedString(window, kTwoNameSlotLen);
+  if (srcArg.empty() || destArg.empty()) return kStatusError;
+  fs::path srcPath = resolvePath(srcArg);
+  if (srcPath.empty()) return kStatusError;
+  fs::path destPath = resolveCopyOrMoveDestination(srcPath.filename().string(), destArg);
+  if (destPath.empty()) return kStatusError;
+  std::error_code ec;
+  return (fs::exists(destPath, ec) && !ec) ? kStatusSuccess : kStatusError;
+}
+
+// Ported from main.c's EXP_COMMAND_GET_SD_DF_TEXT case: pre-rendered
+// "<free>F / <total>T" text, matching listSdDir's own summary-line "B"/"F"
+// suffix convention -- the ROM has no decimal-to-ASCII conversion of its
+// own, so this arrives pre-formatted rather than as the raw 4-byte values
+// getSdFreeSpace/getSdVolumeSize return. Kept in sync by hand with
+// main.c's own EXP_COMMAND_GET_SD_DF_TEXT case, same caveat as
+// listSdDir's own summary line.
+uint8_t ExpansionMock::getSdDfText(std::vector<uint8_t>& window) {
+  if (rootDir_.empty()) return kStatusError;
+  std::error_code ec;
+  fs::space_info info = fs::space(rootDir_, ec);
+  if (ec) return kStatusError;
+  uint32_t freeBytes = static_cast<uint32_t>(info.available);
+  uint32_t totalBytes = static_cast<uint32_t>(info.capacity);
+  std::string text = std::to_string(freeBytes) + "F / " + std::to_string(totalBytes) + "T";
+  writeLengthPrefixedString(text, window, kScratchOffset);
   return kStatusSuccess;
 }
 

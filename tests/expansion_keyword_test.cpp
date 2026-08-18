@@ -1773,6 +1773,725 @@ void testSdPlusTildeTranslation() {
   CHECK(!fs::exists(sdDir / "NEW+2.BAS"));
 }
 
+// SDRM "<name>" confirms first ("DELETE FILE? Y/N") -- pressing Y deletes
+// the file.
+void testSdrmDeletesWithConfirmation() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdrmDeletesWithConfirmation -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdrm_confirm");
+  fs::path targetPath = sdDir / "TEST.BAS";
+  { std::ofstream f(targetPath, std::ios::binary); f << "10 END\n"; }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDRM \"TEST.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));  // blocked on the confirmation prompt's own KEYSCAN_WAIT
+  CHECK(fs::exists(targetPath));  // not deleted yet -- still just prompting
+
+  tapKey(*m, pc1500::Key::Y);
+  CHECK(waitForIdle(*m));
+  CHECK(!fs::exists(targetPath));
+}
+
+// Same setup, but anything other than Y (here CL) aborts -- matches
+// SDSAVE's own overwrite-prompt N-abort test.
+void testSdrmNAbortsDeletion() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdrmNAbortsDeletion -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdrm_abort");
+  fs::path targetPath = sdDir / "TEST.BAS";
+  { std::ofstream f(targetPath, std::ios::binary); f << "10 END\n"; }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDRM \"TEST.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);  // anything but Y -- must abort
+  CHECK(waitForIdle(*m));
+  CHECK(fs::exists(targetPath));
+}
+
+// SDRM "<name>",-Y deletes immediately, no confirmation prompt.
+void testSdrmDashYSkipsPrompt() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdrmDashYSkipsPrompt -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdrm_dashy");
+  fs::path targetPath = sdDir / "TEST.BAS";
+  { std::ofstream f(targetPath, std::ios::binary); f << "10 END\n"; }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDRM \"TEST.BAS\",-Y");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));  // no follow-up keypress -- must reach idle on its own
+  CHECK(!fs::exists(targetPath));
+}
+
+// SDRM with no argument raises ERROR 1, matching SDMKDIR/SDCD/SDRMDIR's own
+// convention.
+void testSdrmMissingFilenameRaisesError1() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdrmMissingFilenameRaisesError1 -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdrm_noarg");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDRM");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.readME0(kErlAbs) == 1);
+}
+
+// SDRM must never delete a directory -- SDRMDIR is the only sanctioned way.
+// Pointed at a real (empty) directory, it must raise ERROR 40 (same
+// "operation on this name failed" code SDCP/SDMV also use) and leave the
+// directory untouched.
+void testSdrmCannotRemoveDirectory() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdrmCannotRemoveDirectory -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdrm_dir");
+  fs::create_directory(sdDir / "ADIR");
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDRM \"ADIR\",-Y");  // -Y so it doesn't block on a prompt first
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.readME0(kErlAbs) == 40);
+  CHECK(fs::exists(sdDir / "ADIR"));
+}
+
+// SDCP "<src>","<dest>" copies a file, leaving the source untouched.
+void testSdcpCopiesFile() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdcpCopiesFile -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdcp");
+  const std::vector<uint8_t> kFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  {
+    std::ofstream f(sdDir / "SRC.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kFixture.data()), static_cast<std::streamsize>(kFixture.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  m->bus.writeME0(kErlAbs, 0xEE);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCP \"SRC.BAS\",\"DEST.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(m->bus.readME0(kErlAbs) != 40);
+  CHECK(readFile((sdDir / "SRC.BAS").string()) == kFixture);   // source untouched
+  CHECK(readFile((sdDir / "DEST.BAS").string()) == kFixture);  // destination has the copy
+}
+
+// SDCP with a nonexistent source raises ERROR 40.
+void testSdcpMissingSourceRaisesError40() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdcpMissingSourceRaisesError40 -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdcp_notfound");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCP \"NOPE.BAS\",\"DEST.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.readME0(kErlAbs) == 40);
+  CHECK(!fs::exists(sdDir / "DEST.BAS"));
+}
+
+// SDMV "<src>","<dest>" moves a file -- the source no longer exists
+// afterward, unlike SDCP.
+void testSdmvMovesFile() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdmvMovesFile -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdmv");
+  const std::vector<uint8_t> kFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  {
+    std::ofstream f(sdDir / "SRC.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kFixture.data()), static_cast<std::streamsize>(kFixture.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDMV \"SRC.BAS\",\"DEST.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(!fs::exists(sdDir / "SRC.BAS"));
+  CHECK(readFile((sdDir / "DEST.BAS").string()) == kFixture);
+}
+
+// SDDF stages a "<free>F / <total>T" response at EXP_SCRATCH_ABS -- checked
+// by reading that staged response directly, same approach
+// testSdpwdStagesCurrentDirectoryResponse uses for GET_SD_CWD.
+void testSddfDisplaysFreeAndTotalSpace() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSddfDisplaysFreeAndTotalSpace -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sddf");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDDF");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  constexpr uint16_t kExpScratchAbs = 0x8100;
+  uint8_t len = m->bus.readME0(kExpScratchAbs);
+  CHECK(len > 0 && len <= 26);
+  std::string text;
+  for (uint8_t i = 0; i < len; i++) {
+    text += static_cast<char>(m->bus.readME0(static_cast<uint16_t>(kExpScratchAbs + 1 + i)));
+  }
+  // "<free>F / <total>T" -- don't assert exact numbers (host-dependent
+  // free/total space), just the shape.
+  CHECK(text.find('F') != std::string::npos);
+  CHECK(text.find('T') != std::string::npos);
+  CHECK(text.find(" / ") != std::string::npos);
+  if (text.find('F') == std::string::npos || text.find('T') == std::string::npos) {
+    std::printf("  SDDF response text: \"%s\"\n", text.c_str());
+  }
+}
+
+// SDMV "<src>","<dest>" where <dest> is an existing directory: the file
+// lands inside it under its own original basename, matching Unix mv's
+// own "move INTO a directory" behavior.
+void testSdmvIntoExistingDirectory() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdmvIntoExistingDirectory -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdmv_into_dir");
+  fs::create_directory(sdDir / "ARCHIVE");
+  const std::vector<uint8_t> kFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  {
+    std::ofstream f(sdDir / "SRC.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kFixture.data()), static_cast<std::streamsize>(kFixture.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDMV \"SRC.BAS\",\"ARCHIVE\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(!fs::exists(sdDir / "SRC.BAS"));
+  CHECK(readFile((sdDir / "ARCHIVE" / "SRC.BAS").string()) == kFixture);
+}
+
+// SDCP "<src>","<dest>" where <dest> is an existing directory -- same
+// directory-target behavior as SDMV above, but the source stays put.
+void testSdcpIntoExistingDirectory() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdcpIntoExistingDirectory -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdcp_into_dir");
+  fs::create_directory(sdDir / "ARCHIVE");
+  const std::vector<uint8_t> kFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  {
+    std::ofstream f(sdDir / "SRC.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kFixture.data()), static_cast<std::streamsize>(kFixture.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCP \"SRC.BAS\",\"ARCHIVE\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(readFile((sdDir / "SRC.BAS").string()) == kFixture);            // source untouched
+  CHECK(readFile((sdDir / "ARCHIVE" / "SRC.BAS").string()) == kFixture);  // copy landed inside
+}
+
+// SDMV's source may itself be a relative path with "..": from inside
+// SUBDIR, "../SRC.BAS" refers to the root's own copy.
+void testSdmvWithDotDotRelativeSource() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdmvWithDotDotRelativeSource -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdmv_dotdot");
+  fs::create_directory(sdDir / "SUBDIR");
+  const std::vector<uint8_t> kFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  {
+    std::ofstream f(sdDir / "SRC.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kFixture.data()), static_cast<std::streamsize>(kFixture.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCD \"SUBDIR\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDMV \"../SRC.BAS\",\"MOVED.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(!fs::exists(sdDir / "SRC.BAS"));
+  CHECK(readFile((sdDir / "SUBDIR" / "MOVED.BAS").string()) == kFixture);
+}
+
+// SDCP's destination may be an absolute path from the SD root ("/...")
+// even while the current directory is somewhere else entirely.
+void testSdcpWithAbsoluteDestinationPath() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdcpWithAbsoluteDestinationPath -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdcp_absolute");
+  fs::create_directory(sdDir / "SUBDIR");
+  const std::vector<uint8_t> kFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  {
+    std::ofstream f(sdDir / "SUBDIR" / "SRC.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kFixture.data()), static_cast<std::streamsize>(kFixture.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCD \"SUBDIR\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCP \"SRC.BAS\",\"/ROOT.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(readFile((sdDir / "ROOT.BAS").string()) == kFixture);
+}
+
+// SDCP onto an existing destination confirms first ("FILE EXISTS.
+// OVERWRITE Y/N"); pressing anything but Y aborts, leaving the existing
+// destination untouched -- same shape as SDSAVE's own overwrite prompt.
+void testSdcpOverwritePromptNAborts() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdcpOverwritePromptNAborts -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdcp_overwrite_abort");
+  const std::vector<uint8_t> kSrcFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  const std::vector<uint8_t> kDestOriginal = {0xAA, 0xBB, 0xCC, 0xFF};
+  {
+    std::ofstream f(sdDir / "SRC.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kSrcFixture.data()), static_cast<std::streamsize>(kSrcFixture.size()));
+  }
+  fs::path destPath = sdDir / "DEST.BAS";
+  {
+    std::ofstream f(destPath, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kDestOriginal.data()), static_cast<std::streamsize>(kDestOriginal.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCP \"SRC.BAS\",\"DEST.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));  // blocked on the confirmation prompt's own KEYSCAN_WAIT
+
+  tapKey(*m, pc1500::Key::Cl);  // anything but Y -- must abort
+  CHECK(waitForIdle(*m));
+
+  CHECK(readFile(destPath.string()) == kDestOriginal);
+}
+
+// Same setup, but pressing Y confirms the overwrite.
+void testSdcpOverwritePromptYOverwrites() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdcpOverwritePromptYOverwrites -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdcp_overwrite_confirm");
+  const std::vector<uint8_t> kSrcFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  const std::vector<uint8_t> kDestOriginal = {0xAA, 0xBB, 0xCC, 0xFF};
+  {
+    std::ofstream f(sdDir / "SRC.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kSrcFixture.data()), static_cast<std::streamsize>(kSrcFixture.size()));
+  }
+  fs::path destPath = sdDir / "DEST.BAS";
+  {
+    std::ofstream f(destPath, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kDestOriginal.data()), static_cast<std::streamsize>(kDestOriginal.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCP \"SRC.BAS\",\"DEST.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Y);
+  CHECK(waitForIdle(*m));
+
+  CHECK(readFile(destPath.string()) == kSrcFixture);
+  CHECK(readFile((sdDir / "SRC.BAS").string()) == kSrcFixture);  // SDCP -- source untouched
+}
+
+// SDCP "<src>","<dest>",-Y onto an existing destination: overwrites
+// immediately, no confirmation prompt.
+void testSdcpDashYSkipsPrompt() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdcpDashYSkipsPrompt -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdcp_dashy");
+  const std::vector<uint8_t> kSrcFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  const std::vector<uint8_t> kDestOriginal = {0xAA, 0xBB, 0xCC, 0xFF};
+  {
+    std::ofstream f(sdDir / "SRC.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kSrcFixture.data()), static_cast<std::streamsize>(kSrcFixture.size()));
+  }
+  fs::path destPath = sdDir / "DEST.BAS";
+  {
+    std::ofstream f(destPath, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kDestOriginal.data()), static_cast<std::streamsize>(kDestOriginal.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCP \"SRC.BAS\",\"DEST.BAS\",-Y");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));  // no follow-up keypress -- must reach idle on its own
+
+  CHECK(readFile(destPath.string()) == kSrcFixture);
+}
+
+// SDMV onto an existing destination also confirms first, same as SDCP.
+void testSdmvOverwritePromptNAborts() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdmvOverwritePromptNAborts -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdmv_overwrite_abort");
+  const std::vector<uint8_t> kSrcFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  const std::vector<uint8_t> kDestOriginal = {0xAA, 0xBB, 0xCC, 0xFF};
+  fs::path srcPath = sdDir / "SRC.BAS";
+  {
+    std::ofstream f(srcPath, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kSrcFixture.data()), static_cast<std::streamsize>(kSrcFixture.size()));
+  }
+  fs::path destPath = sdDir / "DEST.BAS";
+  {
+    std::ofstream f(destPath, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kDestOriginal.data()), static_cast<std::streamsize>(kDestOriginal.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDMV \"SRC.BAS\",\"DEST.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);  // anything but Y -- must abort
+  CHECK(waitForIdle(*m));
+
+  CHECK(readFile(destPath.string()) == kDestOriginal);
+  CHECK(fs::exists(srcPath));  // SDMV aborted -- source must still be there too
+}
+
+// SDLOAD accepts an absolute path from the SD root even while the
+// current directory is somewhere else -- the single-name commands
+// (SDLOAD/SDSAVE/SDRM/SDCD/SDMKDIR/SDRMDIR) all gained this for free once
+// ExpansionMock::resolvePath itself was unified to support it.
+void testSdloadFromAbsolutePath() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdloadFromAbsolutePath -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdload_absolute");
+  fs::create_directory(sdDir / "SUBDIR");
+  const std::vector<uint8_t> kFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  {
+    std::ofstream f(sdDir / "TEST.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kFixture.data()), static_cast<std::streamsize>(kFixture.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCD \"SUBDIR\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDLOAD \"/TEST.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  std::string readError;
+  std::vector<uint8_t> loadedProgram = pc1500::basic::readBasicProgramBytes(m->bus, &readError);
+  CHECK(loadedProgram == kFixture);
+}
+
 }  // namespace
 
 int main() {
@@ -1807,6 +2526,24 @@ int main() {
   testSdcdDotAndDotDotStillWork();
   testSdcdMultiSegmentPathValidatesEachSegment();
   testSdPlusTildeTranslation();
+  testSdrmDeletesWithConfirmation();
+  testSdrmNAbortsDeletion();
+  testSdrmDashYSkipsPrompt();
+  testSdrmMissingFilenameRaisesError1();
+  testSdrmCannotRemoveDirectory();
+  testSdcpCopiesFile();
+  testSdcpMissingSourceRaisesError40();
+  testSdmvMovesFile();
+  testSddfDisplaysFreeAndTotalSpace();
+  testSdmvIntoExistingDirectory();
+  testSdcpIntoExistingDirectory();
+  testSdmvWithDotDotRelativeSource();
+  testSdcpWithAbsoluteDestinationPath();
+  testSdcpOverwritePromptNAborts();
+  testSdcpOverwritePromptYOverwrites();
+  testSdcpDashYSkipsPrompt();
+  testSdmvOverwritePromptNAborts();
+  testSdloadFromAbsolutePath();
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

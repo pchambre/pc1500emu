@@ -83,7 +83,25 @@ class ExpansionMock {
   static constexpr uint8_t kCommandMakeSdDir = 17;
   static constexpr uint8_t kCommandRemoveSdDir = 18;
   static constexpr uint8_t kCommandGetSdCwd = 19;
+  static constexpr uint8_t kCommandCopySdFile = 20;
+  static constexpr uint8_t kCommandMoveSdFile = 21;
+  static constexpr uint8_t kCommandGetSdDfText = 22;
+  static constexpr uint8_t kCommandCheckSdCopyMoveDestExists = 23;
   static constexpr uint8_t kCommandClearStatus = 0xFF;
+
+  // Max length of a single quoted path/name argument -- see PC_EXP.h's own
+  // comment. Deliberately separate from kDirNameLen (the SDLS display
+  // column width, unrelated). Every SD command accepts a full path now: a
+  // plain filename, a relative path ("SUB/FILE.BAS", "../FILE.BAS"), or
+  // an absolute one from the SD root ("/SUB/FILE.BAS") -- see
+  // resolvePath's own comment.
+  static constexpr int kPathArgLen = 40;
+
+  // SDCP/SDMV's wire layout: two fixed kTwoNameSlotLen-byte slots
+  // back-to-back at window offset 0 (source, then destination), each
+  // shaped like any other quoted-name argument (2-byte BE length + up to
+  // kPathArgLen bytes) -- see PC_EXP.h's own comment for why fixed-width.
+  static constexpr int kTwoNameSlotLen = 2 + kPathArgLen;
 
   static constexpr uint8_t kFileStatusClosed = 0;
   static constexpr uint8_t kFileStatusOpenWrite = 1;
@@ -121,29 +139,40 @@ class ExpansionMock {
   // directions, unlike '-' (a legal FAT 8.3 character that could collide
   // with a real hyphenated name). convertPlusToTilde is applied to any name
   // arriving from the wire before it touches the real filesystem (inside
-  // resolvePath/resolveDirPath); convertTildeToPlus is applied to any real
-  // on-disk name before it's staged back onto the wire (listSdDir, getSdCwd).
+  // resolvePath); convertTildeToPlus is applied to any real on-disk name
+  // before it's staged back onto the wire (listSdDir, getSdCwd).
   static std::string convertPlusToTilde(const std::string& name);
   static std::string convertTildeToPlus(const std::string& name);
 
-  // Validates `name` (untrusted, straight off the wire) and joins it with
-  // rootDir_, or returns an empty path if `name` is unsafe (contains a
-  // path separator, is "." or "..", or would resolve outside rootDir_) or
-  // no rootDir_ is configured. See expansion_mock.cpp for the full
-  // rationale -- this is a local dev tool, not network-exposed, but a ROM
-  // bug writing/deleting files outside the intended sandbox directory
-  // would be a bad surprise worth deliberately preventing.
+  // Validates `name` (untrusted, straight off the wire) and resolves it to
+  // a real path, or returns an empty path if `name` is unsafe (raw Windows
+  // separators/drive letters, or would resolve outside rootDir_) or no
+  // rootDir_ is configured. `name` may be a plain filename (resolved
+  // against currentDir_), a relative path with '.'/'..'/multiple
+  // components (e.g. "SUB/DIR", "../OTHER"), or an absolute one starting
+  // with '/' (resolved against rootDir_ -- "/" itself means the SD root).
+  // Every SD command goes through this now (SDLOAD/SDSAVE/SDRM/SDCD/
+  // SDMKDIR/SDRMDIR/SDCP/SDMV's own source and, via
+  // resolveCopyOrMoveDestination below, destination too) -- previously
+  // plain-filename commands (resolvePath) and directory commands
+  // (resolveDirPath) had separate, near-duplicate implementations; merged
+  // once both needed the same relative+absolute path support. The
+  // weakly_canonical containment check below is the primary defense
+  // against escaping the sandbox (not just defense in depth) -- this is a
+  // local dev tool, not network-exposed, but a ROM bug writing/deleting
+  // files outside the intended sandbox directory would be a bad surprise
+  // worth deliberately preventing.
   std::filesystem::path resolvePath(const std::string& name) const;
 
-  // Like resolvePath, but for a CHANGE_SD_DIR-style directory argument:
-  // unlike a plain filename, "." / ".." and multi-component relative paths
-  // (e.g. "SUB/DIR", "../OTHER") are legitimate navigation here, so this
-  // doesn't pre-reject them the way resolvePath does -- instead, the
-  // weakly_canonical containment check is the *primary* defense (not just
-  // defense in depth), correctly handling arbitrarily nested "up and down"
-  // traversal via fs::path's own lexically_normal() before that check.
-  // Still rejects raw Windows separators/drive letters and absolute paths.
-  std::filesystem::path resolveDirPath(const std::string& name) const;
+  // For SDCP/SDMV's destination argument: resolves `destArg` via
+  // resolvePath, then -- if that resolves to an *existing directory* --
+  // returns (that directory)/srcBasename instead, matching Unix cp/mv's
+  // own "copy/move INTO a directory" behavior. `srcBasename` is the
+  // source's own filename component (SDCP/SDMV's source is itself a full
+  // path now, so this is its resolved path's .filename(), not the raw
+  // argument). Returns an empty path if destArg doesn't resolve.
+  std::filesystem::path resolveCopyOrMoveDestination(const std::string& srcBasename,
+                                                       const std::string& destArg) const;
 
   uint8_t listSdDir(std::vector<uint8_t>& window);
   uint8_t getSdFreeSpace(std::vector<uint8_t>& window);
@@ -163,12 +192,15 @@ class ExpansionMock {
   uint8_t makeSdDir(std::vector<uint8_t>& window);
   uint8_t removeSdDir(std::vector<uint8_t>& window);
   uint8_t getSdCwd(std::vector<uint8_t>& window);
+  uint8_t copySdFile(std::vector<uint8_t>& window);
+  uint8_t moveSdFile(std::vector<uint8_t>& window);
+  uint8_t getSdDfText(std::vector<uint8_t>& window);
+  uint8_t checkSdCopyMoveDestExists(std::vector<uint8_t>& window);
 
   std::filesystem::path rootDir_;
   // Defaults to rootDir_ whenever that's (re)set -- see setRootDir's own
   // comment. Always an absolute path under rootDir_, never a bare relative
-  // fragment, so resolvePath/resolveDirPath can just join a name onto it
-  // directly.
+  // fragment, so resolvePath can just join a name onto it directly.
   std::filesystem::path currentDir_;
   uint32_t freeSpaceBytes_ = 2122343;
 
