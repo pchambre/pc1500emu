@@ -70,6 +70,10 @@ constexpr int kCyclesPerTimerTick = 8;
 // blocked waiting for its own next keypress".
 constexpr uint16_t kIdleAddr = 0xE2AA;
 
+// ERL -- BASIC's own "error number when occurred" system variable, per
+// known_symbols.cpp. Shared by every ERROR-raising test below.
+constexpr uint16_t kErlAbs = 0x789B;
+
 std::vector<uint8_t> readFile(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) return {};
@@ -313,6 +317,385 @@ void testSdlsHidesBlinkingCursorDuringBrowse() {
 
   CHECK(m->bus.readME0(0x787E) == 0x74);
   CHECK(m->bus.readME0(0x787F) == 0x00);
+}
+
+// SDMKDIR "<name>" creates a real subdirectory under the SD root.
+void testSdmkdirCreatesDirectory() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdmkdirCreatesDirectory -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdmkdir");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDMKDIR \"NEWDIR\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(fs::is_directory(sdDir / "NEWDIR"));
+}
+
+// SDRMDIR "<name>" removes an empty subdirectory.
+void testSdrmdirRemovesEmptyDirectory() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdrmdirRemovesEmptyDirectory -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdrmdir");
+  fs::create_directory(sdDir / "EMPTYDIR");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDRMDIR \"EMPTYDIR\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(!fs::exists(sdDir / "EMPTYDIR"));
+}
+
+// Two edge cases tested directly against ExpansionMock's own
+// processCommand, bypassing the full ROM dispatch: SDCD_ROUTINE/
+// SDMKDIR_ROUTINE/SDRMDIR_ROUTINE don't distinguish EXP_STATUS_SUCCESS
+// from EXP_STATUS_ERROR at all (silent abort either way -- see their own
+// block comment in rom.asm), so the actual behavior under test here --
+// does the mock's own status byte come back right -- isn't observable
+// through a full keystroke-driven test. No ROM/boot needed at all since
+// processCommand is called directly.
+
+// SDMKDIR on a name that already exists as a directory must fail, not
+// silently no-op as success -- std::filesystem::create_directory itself
+// returns false (not newly created) without setting an error_code in
+// this exact case, so this specifically confirms
+// ExpansionMock::makeSdDir's own `created && !ec` check correctly turns
+// that "false, no error" combination into EXP_STATUS_ERROR rather than
+// treating the lack of an error_code as success.
+void testSdmkdirFailsIfDirectoryAlreadyExists() {
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdmkdir_exists");
+  fs::create_directory(sdDir / "EXISTING");
+
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  bus.expansionMock().setRootDir(sdDir);
+
+  std::vector<uint8_t> window(4096, 0xFF);
+  const std::string name = "EXISTING";
+  window[0] = 0;
+  window[1] = static_cast<uint8_t>(name.size());
+  for (size_t i = 0; i < name.size(); i++) window[2 + i] = static_cast<uint8_t>(name[i]);
+
+  uint8_t status = bus.expansionMock().processCommand(pc1500::ExpansionMock::kCommandMakeSdDir, window);
+  CHECK(status == pc1500::ExpansionMock::kStatusError);
+}
+
+// SDRMDIR on a non-empty directory must fail and leave it (and its
+// contents) completely untouched -- matches real emFile's own FS_RmDir
+// semantics (fails outright, never recurses).
+void testSdrmdirFailsOnNonEmptyDirectory() {
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdrmdir_nonempty");
+  fs::create_directory(sdDir / "NONEMPTY");
+  {
+    std::ofstream f(sdDir / "NONEMPTY" / "FILE.TXT", std::ios::binary);
+    f << "x";
+  }
+
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  bus.expansionMock().setRootDir(sdDir);
+
+  std::vector<uint8_t> window(4096, 0xFF);
+  const std::string name = "NONEMPTY";
+  window[0] = 0;
+  window[1] = static_cast<uint8_t>(name.size());
+  for (size_t i = 0; i < name.size(); i++) window[2 + i] = static_cast<uint8_t>(name[i]);
+
+  uint8_t status = bus.expansionMock().processCommand(pc1500::ExpansionMock::kCommandRemoveSdDir, window);
+  CHECK(status == pc1500::ExpansionMock::kStatusError);
+  CHECK(fs::exists(sdDir / "NONEMPTY"));
+  CHECK(fs::exists(sdDir / "NONEMPTY" / "FILE.TXT"));
+}
+
+// SDCD "<name>" changes the directory subsequent SD commands (SDLOAD here)
+// resolve names against -- the actual end-to-end point of having a
+// current-directory concept at all, not just that ExpansionMock's own
+// currentDir_ field changes. A same-named file sits both at the root and
+// inside the subdirectory, with different contents, so loading it after
+// SDCD proves the *subdirectory's* copy was the one actually read.
+void testSdcdAffectsSubsequentFileCommands() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdcdAffectsSubsequentFileCommands -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdcd");
+  fs::create_directory(sdDir / "SUBDIR");
+  // "10 PRINT 1" / "20 END", tokenized -- the same fixture bytes used
+  // elsewhere this session, sitting at the SD root.
+  const std::vector<uint8_t> kRootFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D,
+                                              0x00, 0x14, 0x03, 0xF1, 0x8E, 0x0D, 0xFF};
+  // "10 END" tokenized -- deliberately different content, same filename,
+  // inside SUBDIR.
+  const std::vector<uint8_t> kSubdirFixture = {0x00, 0x0A, 0x03, 0xF1, 0x8E, 0x0D, 0xFF};
+  {
+    std::ofstream f(sdDir / "TEST.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kRootFixture.data()),
+            static_cast<std::streamsize>(kRootFixture.size()));
+  }
+  {
+    std::ofstream f(sdDir / "SUBDIR" / "TEST.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kSubdirFixture.data()),
+            static_cast<std::streamsize>(kSubdirFixture.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCD \"SUBDIR\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.expansionMock().currentDir() == sdDir / "SUBDIR");
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDLOAD \"TEST.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  std::string readError;
+  std::vector<uint8_t> loadedProgram = pc1500::basic::readBasicProgramBytes(m->bus, &readError);
+  CHECK(loadedProgram == kSubdirFixture);  // SUBDIR's own copy, not the root's
+  if (loadedProgram != kSubdirFixture) {
+    std::printf("  loadedProgram.size()=%zu (expected SUBDIR's %zu-byte fixture)\n",
+                loadedProgram.size(), kSubdirFixture.size());
+  }
+}
+
+// SDPWD triggers GET_SD_CWD and stages its length-prefixed response at
+// EXP_SCRATCH_ABS (787EH.. wait -- 8100H, see rom_defs.inc's own
+// EXP_SCRATCH_ABS) for SD_LIST_DISPLAY's shared DISP_N_CHARS0 blit to draw.
+// Checked by reading that staged response directly rather than decoding
+// rendered VRAM pixels -- the actual new logic under test is "did SDPWD
+// trigger the right command and stage the right bytes", not DISP_N_CHARS0's
+// own already-proven rendering.
+void testSdpwdStagesCurrentDirectoryResponse() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf(
+        "SKIP: testSdpwdStagesCurrentDirectoryResponse -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdpwd");
+  fs::create_directory(sdDir / "SUBDIR");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  // Before any SDCD at all, SDPWD must report exactly "/" -- the SD root,
+  // not emFile's own root representation (which may not even be "/").
+  constexpr uint16_t kExpScratchAbsRoot = 0x8100;
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDPWD");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  {
+    uint8_t rootLen = m->bus.readME0(kExpScratchAbsRoot);
+    std::string rootCwd;
+    for (uint8_t i = 0; i < rootLen; i++) {
+      rootCwd += static_cast<char>(m->bus.readME0(kExpScratchAbsRoot + 1 + i));
+    }
+    CHECK(rootCwd == "/");
+    if (rootCwd != "/") std::printf("  SDPWD at root staged \"%s\" (want \"/\")\n", rootCwd.c_str());
+  }
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCD \"SUBDIR\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDPWD");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  constexpr uint16_t kExpScratchAbs = 0x8100;
+  uint8_t len = m->bus.readME0(kExpScratchAbs);
+  std::string cwd;
+  for (uint8_t i = 0; i < len; i++) cwd += static_cast<char>(m->bus.readME0(kExpScratchAbs + 1 + i));
+  CHECK(cwd == "/SUBDIR");
+  if (cwd != "/SUBDIR") {
+    std::printf("  SDPWD staged \"%s\" (want \"/SUBDIR\")\n", cwd.c_str());
+  }
+}
+
+// SDLS's listing must include subdirectories alongside files, with
+// "<DIR>" (right-justified, same column real sizes occupy) instead of a
+// size -- checked by reading the raw EXP_COMMAND_LIST_SD_DIR wire format
+// directly (EXP_BUFFER_START_ABS=0x8000: 2-byte BE count, then
+// kDirRecordSize=30-byte records: 16 bytes name, 10 bytes size text, 4
+// bytes binary size) rather than decoding rendered VRAM -- SD_LIST_DISPLAY
+// itself is already well-tested elsewhere (SDLS/SDLOAD browsing), so the
+// new thing actually under test here is main.c's/ExpansionMock's own
+// listing content, not the ROM's shared blit primitive. Also confirms
+// SDLS respects a prior SDCD (a real gap found and fixed alongside this
+// same change -- ExpansionMock::listSdDir used to always list the root).
+void testSdlsListsDirectoriesWithDirMarker() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdlsListsDirectoriesWithDirMarker -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdls_dirs");
+  fs::create_directory(sdDir / "ADIR");
+  {
+    std::ofstream f(sdDir / "AFILE.BAS", std::ios::binary);
+    f << "10 END\n";
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDLS");
+  tapKey(*m, pc1500::Key::Ent);  // dispatch -- triggers LIST_SD_DIR, draws the first entry
+  CHECK(waitForIdle(*m));
+
+  constexpr uint16_t kBufAbs = 0x8000;
+  constexpr int kNameLen = 16;
+  constexpr int kSizeTextLen = 10;
+  constexpr int kRecordSize = 30;
+  uint16_t count = (static_cast<uint16_t>(m->bus.readME0(kBufAbs)) << 8) | m->bus.readME0(kBufAbs + 1);
+  CHECK(count == 2);  // ADIR + AFILE.BAS
+
+  bool foundDir = false, foundFile = false;
+  for (uint16_t i = 0; i < count; i++) {
+    uint16_t entryOff = kBufAbs + 2 + i * kRecordSize;
+    std::string name, sizeText;
+    for (int j = 0; j < kNameLen; j++) name += static_cast<char>(m->bus.readME0(entryOff + j));
+    for (int j = 0; j < kSizeTextLen; j++) {
+      sizeText += static_cast<char>(m->bus.readME0(entryOff + kNameLen + j));
+    }
+    // Trim trailing spaces off the space-padded name field for a clean comparison.
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+    if (name == "ADIR") {
+      foundDir = true;
+      CHECK(sizeText == "     <DIR>");  // right-justified in the 10-byte field
+      if (sizeText != "     <DIR>") std::printf("  ADIR size text: \"%s\"\n", sizeText.c_str());
+    } else if (name == "AFILE.BAS") {
+      foundFile = true;
+      CHECK(sizeText.find("<DIR>") == std::string::npos);  // a real file, not marked as a directory
+    }
+  }
+  CHECK(foundDir);
+  CHECK(foundFile);
+}
+
+// SDCD/SDMKDIR/SDRMDIR all require a "<name>" argument -- missing it must
+// raise a genuine BASIC ERROR 1, matching SDSAVE's own established
+// convention for a deliberate operation with a malformed/missing argument
+// (as opposed to SDLOAD's own silent-abort-on-malformed-argument, a
+// passive browsing command).
+void testSdDirectoryCommandsRaiseError1WithoutArgument() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf(
+        "SKIP: testSdDirectoryCommandsRaiseError1WithoutArgument -- ROM1.BIN and/or "
+        "rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sddir_error1");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  for (const char* cmd : {"SDCD", "SDMKDIR", "SDRMDIR"}) {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "NEW0");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+
+    // Reset ERL to a sentinel neither 0 nor 1 before each attempt -- NEW0
+    // doesn't touch it, so without this a stale ERL==1 from a *previous*
+    // iteration would make a genuinely-broken later command falsely pass.
+    m->bus.writeME0(kErlAbs, 0xEE);
+
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, cmd);  // no argument at all
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+
+    CHECK(m->bus.readME0(kErlAbs) == 1);
+    if (m->bus.readME0(kErlAbs) != 1) {
+      std::printf("  %s with no argument: ERL=%u (want 1)\n", cmd, m->bus.readME0(kErlAbs));
+    }
+  }
 }
 
 // Separate, previously-documented bug (see the KNOWN SEPARATE BUG comment
@@ -702,8 +1085,6 @@ void testSdloadMExplicitAddressHex() {
   CHECK(payloadMatches(m->bus, kTargetAddr, kPayload));
   CHECK(!payloadMatches(m->bus, kHeaderAddr, kPayload));
 }
-
-constexpr uint16_t kErlAbs = 0x789B;
 
 // SDSAVE "<filename>" (BASIC mode, new file, no existing file to prompt
 // about): saves the current program, then a fresh SDLOAD "<filename>"
@@ -1127,6 +1508,271 @@ void testSdloadUsesLiveProgramStartPointer() {
   CHECK(payloadMatches(m->bus, kExpectedStart, kFixture));
 }
 
+// SD_PARSE_QUOTED_NAME now uppercases lowercase input -- SDLOAD "test.bas"
+// typed with the PC-1500's own Sml (lowercase) keyboard mode toggled on
+// must still find the on-disk TEST.BAS. Sml is toggled only around the
+// lowercase portion; charToTapActions maps the same physical key
+// regardless of case (case is a keyboard-mode flag, not a separate
+// keystroke), so this is the only way to get genuine lowercase ASCII into
+// DISP_BUFFER and actually exercise the ROM's own fold-to-uppercase step.
+void testSdloadUppercasesLowercaseFilename() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdloadUppercasesLowercaseFilename -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdload_lowercase");
+  // "10 PRINT 1", tokenized -- same fixture shape used elsewhere in this file.
+  const std::vector<uint8_t> kFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  {
+    std::ofstream f(sdDir / "TEST.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kFixture.data()), static_cast<std::streamsize>(kFixture.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  m->bus.writeME0(kErlAbs, 0xEE);  // sentinel -- neither 0 nor 40, see testSdDirectoryCommandsRaiseError1WithoutArgument
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDLOAD \"");
+  tapKey(*m, pc1500::Key::Sml);
+  typeText(*m, "test.bas");
+  tapKey(*m, pc1500::Key::Sml);
+  typeText(*m, "\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(m->bus.readME0(kErlAbs) != 40);  // must have found TEST.BAS, not raised ERROR 40
+  std::string readError;
+  std::vector<uint8_t> loadedProgram = pc1500::basic::readBasicProgramBytes(m->bus, &readError);
+  CHECK(loadedProgram == kFixture);
+}
+
+// A quoted name violating the 8.3 shape (>8 name characters, >3 extension
+// characters, or a second '.') raises ERROR 1 via SD_PARSE_QUOTED_NAME's
+// own shape check -- the same Carry-SET path an unterminated/overlong name
+// already used before this change. Uses SDMKDIR rather than SDLOAD: SDLOAD
+// deliberately silently aborts on *any* malformed quoted name (a passive
+// browsing command, see testSdDirectoryCommandsRaiseError1WithoutArgument's
+// own comment on this established asymmetry), while SDMKDIR/SDCD/SDRMDIR/
+// SDSAVE all raise a real ERROR 1, matching SD_RAISE_ERROR_1's own existing
+// "malformed name" convention (an unterminated or overlong name already
+// raised ERROR 1 there before this change too).
+void testSdmkdirRejectsNon83ShapedNames() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdmkdirRejectsNon83ShapedNames -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdmkdir_non83");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  const char* kBadNames[] = {
+      "\"TOOLONGNAME\"",   // 11-char name part, >8
+      "\"TEST.TOOLONG\"",  // 7-char extension, >3
+      "\"TEST.BA.S\"",     // second '.'
+  };
+  for (const char* arg : kBadNames) {
+    m->bus.writeME0(kErlAbs, 0xEE);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, std::string("SDMKDIR ") + arg);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    CHECK(m->bus.readME0(kErlAbs) == 1);
+    if (m->bus.readME0(kErlAbs) != 1) {
+      std::printf("  arg=%s ERL=%d (want 1)\n", arg, m->bus.readME0(kErlAbs));
+    }
+  }
+}
+
+// "." and ".." must still work as SDCD's relative-path tokens after adding
+// 8.3 shape validation -- they're segments that are exempt from the shape
+// check entirely (see SD_PARSE_QUOTED_NAME's SD_DOT_ONLY_ABS handling).
+void testSdcdDotAndDotDotStillWork() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdcdDotAndDotDotStillWork -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdcd_dotdot");
+  fs::create_directory(sdDir / "SUBDIR");
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCD \"SUBDIR\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.expansionMock().currentDir() == sdDir / "SUBDIR");
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCD \".\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  // fs::equivalent, not == -- lexically_normal() can leave a trailing
+  // separator behind when collapsing a trailing "." (e.g. "SUBDIR/" rather
+  // than "SUBDIR"), which resolves to the same real directory but doesn't
+  // compare equal as a bare fs::path.
+  CHECK(fs::equivalent(m->bus.expansionMock().currentDir(), sdDir / "SUBDIR"));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCD \"..\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(fs::equivalent(m->bus.expansionMock().currentDir(), sdDir));
+}
+
+// SDCD's own multi-component '/'-paths still work with 8.3 shape
+// validation added -- each '/'-separated segment is checked independently
+// (counters reset on '/'), and a shape violation in *any* one segment
+// still raises ERROR 1, matching a single-segment violation.
+void testSdcdMultiSegmentPathValidatesEachSegment() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdcdMultiSegmentPathValidatesEachSegment -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdcd_multisegment");
+  fs::create_directories(sdDir / "SUB1" / "SUB2");
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  m->bus.writeME0(kErlAbs, 0xEE);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCD \"SUB1/SUB2\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.expansionMock().currentDir() == sdDir / "SUB1" / "SUB2");
+  CHECK(m->bus.readME0(kErlAbs) != 1);
+
+  // Second segment ("A") is fine, but the first ("LONGNAME1", 9 characters)
+  // exceeds the 8-character name-part budget -- must raise ERROR 1 despite
+  // the second segment being perfectly valid on its own.
+  m->bus.writeME0(kErlAbs, 0xEE);
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCD \"LONGNAME1/A\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.readME0(kErlAbs) == 1);
+}
+
+// '+' is this project's typable stand-in for a real FAT short name's '~'
+// (see rom.asm's SD_PARSE_QUOTED_NAME comment and expansion_mock.h's
+// convertPlusToTilde/convertTildeToPlus). A file with a literal '~' in its
+// real on-disk name (as a normal-PC-prepared card's auto-generated FAT
+// short name would have) must list with '+' in SDLS, be loadable by typing
+// '+' in its place, and SDSAVE of a '+'-containing name must create a real
+// file with a literal '~'.
+void testSdPlusTildeTranslation() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdPlusTildeTranslation -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_plus_tilde");
+  // "10 PRINT 1", tokenized -- same fixture shape used elsewhere in this file.
+  const std::vector<uint8_t> kFixture = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D, 0xFF};
+  {
+    std::ofstream f(sdDir / "APPL~1.BAS", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(kFixture.data()), static_cast<std::streamsize>(kFixture.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  // SDLS must show "+" where the real name has "~".
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDLS");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  constexpr uint16_t kBufAbs = 0x8000;  // EXP_BUFFER_START_ABS, see rom_defs.inc
+  constexpr int kDirNameLen = 16;
+  std::string listedName;
+  for (int i = 0; i < kDirNameLen; i++) {
+    listedName += static_cast<char>(m->bus.readME0(static_cast<uint16_t>(kBufAbs + 2 + i)));
+  }
+  while (!listedName.empty() && listedName.back() == ' ') listedName.pop_back();
+  CHECK(listedName == "APPL+1.BAS");
+
+  tapKey(*m, pc1500::Key::Ent);  // exit the browse listing
+  CHECK(waitForIdle(*m));
+
+  // SDLOAD with '+' in place of the real '~' must find the file.
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDLOAD \"APPL+1.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  std::string readError;
+  std::vector<uint8_t> loadedProgram = pc1500::basic::readBasicProgramBytes(m->bus, &readError);
+  CHECK(loadedProgram == kFixture);
+
+  // SDSAVE of a '+'-containing name creates a real file with a literal '~'.
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDSAVE \"NEW+2.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(fs::exists(sdDir / "NEW~2.BAS"));
+  CHECK(!fs::exists(sdDir / "NEW+2.BAS"));
+}
+
 }  // namespace
 
 int main() {
@@ -1148,6 +1794,19 @@ int main() {
   testSdsaveMCallAddressRoundTrip();
   testSdloadFileNotFoundRaisesError40();
   testSdloadUsesLiveProgramStartPointer();
+  testSdmkdirCreatesDirectory();
+  testSdmkdirFailsIfDirectoryAlreadyExists();
+  testSdrmdirRemovesEmptyDirectory();
+  testSdrmdirFailsOnNonEmptyDirectory();
+  testSdcdAffectsSubsequentFileCommands();
+  testSdlsListsDirectoriesWithDirMarker();
+  testSdpwdStagesCurrentDirectoryResponse();
+  testSdDirectoryCommandsRaiseError1WithoutArgument();
+  testSdloadUppercasesLowercaseFilename();
+  testSdmkdirRejectsNon83ShapedNames();
+  testSdcdDotAndDotDotStillWork();
+  testSdcdMultiSegmentPathValidatesEachSegment();
+  testSdPlusTildeTranslation();
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

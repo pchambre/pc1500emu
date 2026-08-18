@@ -53,6 +53,22 @@ void ExpansionMock::writeLengthPrefixedString(const std::string& text, std::vect
   }
 }
 
+std::string ExpansionMock::convertPlusToTilde(const std::string& name) {
+  std::string result = name;
+  for (char& c : result) {
+    if (c == '+') c = '~';
+  }
+  return result;
+}
+
+std::string ExpansionMock::convertTildeToPlus(const std::string& name) {
+  std::string result = name;
+  for (char& c : result) {
+    if (c == '~') c = '+';
+  }
+  return result;
+}
+
 // `name` is untrusted, straight off the wire from whatever's running on
 // the LH5801 -- reject anything that isn't a bare filename before ever
 // touching the filesystem. This is a local dev tool, not network-exposed,
@@ -68,7 +84,7 @@ fs::path ExpansionMock::resolvePath(const std::string& name) const {
   if (name == "." || name == "..") return {};
   if (name.find(':') != std::string::npos) return {};  // e.g. a Windows drive letter
 
-  fs::path candidate = rootDir_ / name;
+  fs::path candidate = currentDir_ / convertPlusToTilde(name);  // relative to SDCD's own state, not always rootDir_
   std::error_code ec;
   fs::path canonicalRoot = fs::weakly_canonical(rootDir_, ec);
   if (ec) return {};
@@ -79,6 +95,27 @@ fs::path ExpansionMock::resolvePath(const std::string& name) const {
   const auto& candStr = canonicalCandidate.native();
   if (candStr.size() < rootStr.size() || candStr.compare(0, rootStr.size(), rootStr) != 0) {
     return {};
+  }
+  return candidate;
+}
+
+fs::path ExpansionMock::resolveDirPath(const std::string& name) const {
+  if (rootDir_.empty() || name.empty()) return {};
+  if (name.find('\\') != std::string::npos) return {};  // no raw Windows separators
+  if (name.find(':') != std::string::npos) return {};   // e.g. a drive letter
+  if (name.front() == '/') return {};                    // no absolute paths
+
+  fs::path candidate = (currentDir_ / convertPlusToTilde(name)).lexically_normal();
+  std::error_code ec;
+  fs::path canonicalRoot = fs::weakly_canonical(rootDir_, ec);
+  if (ec) return {};
+  fs::path canonicalCandidate = fs::weakly_canonical(candidate, ec);
+  if (ec) return {};
+
+  const auto& rootStr = canonicalRoot.native();
+  const auto& candStr = canonicalCandidate.native();
+  if (candStr.size() < rootStr.size() || candStr.compare(0, rootStr.size(), rootStr) != 0) {
+    return {};  // would escape the sandbox root (e.g. ".." from the root itself)
   }
   return candidate;
 }
@@ -113,6 +150,14 @@ uint8_t ExpansionMock::processCommand(uint8_t cmd, std::vector<uint8_t>& window)
       return readSdVolumeLabel(window);
     case kCommandFormatSdCard:
       return formatSdCard(window);
+    case kCommandChangeSdDir:
+      return changeSdDir(window);
+    case kCommandMakeSdDir:
+      return makeSdDir(window);
+    case kCommandRemoveSdDir:
+      return removeSdDir(window);
+    case kCommandGetSdCwd:
+      return getSdCwd(window);
     case kCommandClearStatus:
       return kStatusReady;
     default:
@@ -138,27 +183,52 @@ uint8_t ExpansionMock::listSdDir(std::vector<uint8_t>& window) {
   uint64_t totalBytes = 0;
   if (!rootDir_.empty()) {
     std::error_code ec;
-    for (const auto& entry : fs::directory_iterator(rootDir_, ec)) {
+    // currentDir_, not always rootDir_ -- SDLS must reflect SDCD's own
+    // state, same as every other command resolvePath already honors (see
+    // that function's own comment). This mock previously always listed
+    // the root regardless of any prior SDCD; found and fixed alongside
+    // this same directory-listing change.
+    for (const auto& entry : fs::directory_iterator(currentDir_, ec)) {
       if (count >= kDirMaxEntries) break;
-      if (!entry.is_regular_file()) continue;
+      bool isDir = entry.is_directory();
+      if (!isDir && !entry.is_regular_file()) continue;  // skip anything else (dangling symlinks, ...)
       size_t entryOffset = 2 + static_cast<size_t>(count) * kDirRecordSize;
       if (entryOffset + kDirRecordSize > window.size()) break;
-      std::string name = entry.path().filename().string();
-      uint64_t size = entry.file_size(ec);
-      if (ec) continue;
+      std::string name = convertTildeToPlus(entry.path().filename().string());
+      uint64_t size = 0;
+      if (!isDir) {
+        size = entry.file_size(ec);
+        if (ec) continue;
+      }
       for (int i = 0; i < kDirNameLen; i++) {
         window[entryOffset + i] = (i < static_cast<int>(name.size()))
                                        ? static_cast<uint8_t>(name[i])
                                        : static_cast<uint8_t>(' ');
       }
-      formatSizeText(static_cast<uint32_t>(size), window, entryOffset + kDirNameLen,
-                      kDirSizeTextLen);
+      if (isDir) {
+        // Right-justified "<DIR>" in the size-text field, same column
+        // numeric sizes occupy -- matches main.c's own convention exactly
+        // (kept in sync by hand, same caveat as everywhere else in this
+        // file).
+        static constexpr char kDirText[] = "<DIR>";
+        constexpr int kDirTextLen = sizeof(kDirText) - 1;
+        for (int i = 0; i < kDirSizeTextLen; i++) {
+          window[entryOffset + kDirNameLen + i] = static_cast<uint8_t>(' ');
+        }
+        for (int i = 0; i < kDirTextLen; i++) {
+          window[entryOffset + kDirNameLen + kDirSizeTextLen - kDirTextLen + i] =
+              static_cast<uint8_t>(kDirText[i]);
+        }
+      } else {
+        formatSizeText(static_cast<uint32_t>(size), window, entryOffset + kDirNameLen,
+                        kDirSizeTextLen);
+      }
       size_t binOffset = entryOffset + kDirNameLen + kDirSizeTextLen;
       window[binOffset + 0] = static_cast<uint8_t>(size >> 24);
       window[binOffset + 1] = static_cast<uint8_t>(size >> 16);
       window[binOffset + 2] = static_cast<uint8_t>(size >> 8);
       window[binOffset + 3] = static_cast<uint8_t>(size);
-      totalBytes += size;
+      if (!isDir) totalBytes += size;
       count++;
     }
   }
@@ -354,6 +424,61 @@ uint8_t ExpansionMock::formatSdCard(std::vector<uint8_t>& window) {
     }
   }
   return ec ? kStatusError : kStatusSuccess;
+}
+
+uint8_t ExpansionMock::changeSdDir(std::vector<uint8_t>& window) {
+  std::string name = readLengthPrefixedString(window);
+  if (name.empty()) return kStatusError;
+  fs::path target = resolveDirPath(name);
+  if (target.empty()) return kStatusError;
+  std::error_code ec;
+  if (!fs::is_directory(target, ec) || ec) return kStatusError;
+  currentDir_ = target;
+  return kStatusSuccess;
+}
+
+uint8_t ExpansionMock::makeSdDir(std::vector<uint8_t>& window) {
+  std::string name = readLengthPrefixedString(window);
+  if (name.empty()) return kStatusError;
+  fs::path target = resolveDirPath(name);
+  if (target.empty()) return kStatusError;
+  std::error_code ec;
+  bool created = fs::create_directory(target, ec);
+  return (created && !ec) ? kStatusSuccess : kStatusError;
+}
+
+uint8_t ExpansionMock::removeSdDir(std::vector<uint8_t>& window) {
+  std::string name = readLengthPrefixedString(window);
+  if (name.empty()) return kStatusError;
+  fs::path target = resolveDirPath(name);
+  if (target.empty()) return kStatusError;
+  std::error_code ec;
+  // fs::remove only removes an empty directory (or a single file) -- never
+  // recurses -- matching real emFile's own FS_RmDir semantics exactly
+  // (fails outright on a non-empty directory rather than deleting its
+  // contents).
+  bool removed = fs::remove(target, ec);
+  return (removed && !ec) ? kStatusSuccess : kStatusError;
+}
+
+uint8_t ExpansionMock::getSdCwd(std::vector<uint8_t>& window) {
+  if (rootDir_.empty()) return kStatusError;
+  // Mirrors main.c's own GET_SD_CWD response format (length-prefixed into
+  // EXP_SCRATCH_PAGE) -- reports the path *relative to the SD root*
+  // (e.g. "/" at the root, "/SUBDIR" after changeSdDir("SUBDIR")), not a
+  // real host filesystem path, since that's what's actually meaningful to
+  // a PC-1500 user; the host rootDir_ location is a pc1500emu/testing
+  // implementation detail. This is a mock convention, not verified
+  // against what the real emFile FS_GetCWD returns on real hardware
+  // (likely includes its own volume-name prefix) -- fine here since
+  // SDPWD_ROUTINE just blits back whatever text comes over the wire,
+  // with no parsing on the ROM side either way.
+  std::error_code ec;
+  fs::path rel = fs::relative(currentDir_, rootDir_, ec);
+  if (ec) return kStatusError;
+  std::string cwd = convertTildeToPlus("/" + (rel == "." ? std::string() : rel.generic_string()));
+  writeLengthPrefixedString(cwd, window, kScratchOffset);
+  return kStatusSuccess;
 }
 
 }  // namespace pc1500

@@ -26,9 +26,21 @@ class ExpansionMock {
   // Root directory standing in for the SD card. Empty (the default) means
   // "no card inserted" -- every SD command below reports EXP_STATUS_ERROR,
   // which is itself a useful state to be able to test. `dir` is used as-is
-  // (not created); the caller is responsible for it existing.
-  void setRootDir(std::filesystem::path dir) { rootDir_ = std::move(dir); }
+  // (not created); the caller is responsible for it existing. Resets the
+  // current directory (see changeSdDir) back to the root, matching a fresh
+  // card insert -- any prior SDCD navigation doesn't carry over.
+  void setRootDir(std::filesystem::path dir) {
+    rootDir_ = std::move(dir);
+    currentDir_ = rootDir_;
+  }
   const std::filesystem::path& rootDir() const { return rootDir_; }
+
+  // Current directory, as last set by CHANGE_SD_DIR (or rootDir_ itself if
+  // never called) -- every other SD command that takes a bare filename
+  // (createSdFile, openSdFileRead, listSdDir, ...) resolves relative to
+  // this, matching real emFile's single global FS_ChDir concept (see
+  // PC_EXP.h's own comment).
+  const std::filesystem::path& currentDir() const { return currentDir_; }
 
   // Mock "bytes free" fallback for listSdDir's summary line when no real
   // rootDir_ is configured (matches earlier, pre-filesystem behavior);
@@ -67,6 +79,10 @@ class ExpansionMock {
   static constexpr uint8_t kCommandListSdDir = 12;
   static constexpr uint8_t kCommandRemoveSdFile = 14;
   static constexpr uint8_t kCommandGetSdVolumeSize = 15;
+  static constexpr uint8_t kCommandChangeSdDir = 16;
+  static constexpr uint8_t kCommandMakeSdDir = 17;
+  static constexpr uint8_t kCommandRemoveSdDir = 18;
+  static constexpr uint8_t kCommandGetSdCwd = 19;
   static constexpr uint8_t kCommandClearStatus = 0xFF;
 
   static constexpr uint8_t kFileStatusClosed = 0;
@@ -97,6 +113,19 @@ class ExpansionMock {
   static void writeLengthPrefixedString(const std::string& text, std::vector<uint8_t>& window,
                                          size_t offset);
 
+  // '+' is this project's typable stand-in for a real FAT short name's '~'
+  // (the PC-1500 keyboard has no '~' key) -- see rom.asm's SD_PARSE_QUOTED_
+  // NAME comment. Every SD command now enforces uppercase 8.3 shape on its
+  // own argument, so '+' can never legitimately appear in a name for any
+  // other reason: the swap is unconditional and unambiguous in both
+  // directions, unlike '-' (a legal FAT 8.3 character that could collide
+  // with a real hyphenated name). convertPlusToTilde is applied to any name
+  // arriving from the wire before it touches the real filesystem (inside
+  // resolvePath/resolveDirPath); convertTildeToPlus is applied to any real
+  // on-disk name before it's staged back onto the wire (listSdDir, getSdCwd).
+  static std::string convertPlusToTilde(const std::string& name);
+  static std::string convertTildeToPlus(const std::string& name);
+
   // Validates `name` (untrusted, straight off the wire) and joins it with
   // rootDir_, or returns an empty path if `name` is unsafe (contains a
   // path separator, is "." or "..", or would resolve outside rootDir_) or
@@ -105,6 +134,16 @@ class ExpansionMock {
   // bug writing/deleting files outside the intended sandbox directory
   // would be a bad surprise worth deliberately preventing.
   std::filesystem::path resolvePath(const std::string& name) const;
+
+  // Like resolvePath, but for a CHANGE_SD_DIR-style directory argument:
+  // unlike a plain filename, "." / ".." and multi-component relative paths
+  // (e.g. "SUB/DIR", "../OTHER") are legitimate navigation here, so this
+  // doesn't pre-reject them the way resolvePath does -- instead, the
+  // weakly_canonical containment check is the *primary* defense (not just
+  // defense in depth), correctly handling arbitrarily nested "up and down"
+  // traversal via fs::path's own lexically_normal() before that check.
+  // Still rejects raw Windows separators/drive letters and absolute paths.
+  std::filesystem::path resolveDirPath(const std::string& name) const;
 
   uint8_t listSdDir(std::vector<uint8_t>& window);
   uint8_t getSdFreeSpace(std::vector<uint8_t>& window);
@@ -120,8 +159,17 @@ class ExpansionMock {
   uint8_t removeSdFile(std::vector<uint8_t>& window);
   uint8_t readSdVolumeLabel(std::vector<uint8_t>& window);
   uint8_t formatSdCard(std::vector<uint8_t>& window);
+  uint8_t changeSdDir(std::vector<uint8_t>& window);
+  uint8_t makeSdDir(std::vector<uint8_t>& window);
+  uint8_t removeSdDir(std::vector<uint8_t>& window);
+  uint8_t getSdCwd(std::vector<uint8_t>& window);
 
   std::filesystem::path rootDir_;
+  // Defaults to rootDir_ whenever that's (re)set -- see setRootDir's own
+  // comment. Always an absolute path under rootDir_, never a bare relative
+  // fragment, so resolvePath/resolveDirPath can just join a name onto it
+  // directly.
+  std::filesystem::path currentDir_;
   uint32_t freeSpaceBytes_ = 2122343;
 
   // Single open-file state -- matches main.c's own globals exactly (one
