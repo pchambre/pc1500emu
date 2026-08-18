@@ -2,7 +2,7 @@
 // Version 2.0 -- see LICENSE.
 //
 // In-process regression coverage for the PC1500-PSOC5 expansion ROM's
-// custom-keyword dispatch (rom.asm, built externally into rom_9000.bin),
+// custom-keyword dispatch (rom.asm, built externally into rom_8800.bin),
 // specifically the shared KEYWORD_RETURN tail every keyword (SDLS/SFMT/etc.)
 // ends with. Exists because diagnosing KEYWORD_RETURN's return-to-idle
 // behavior by hand -- driving a live, visible pc1500emu.exe over the FIFO
@@ -154,14 +154,17 @@ std::unique_ptr<BootedMachine> bootAndSettle(const std::vector<uint8_t>& rom, si
   return m;
 }
 
-// Loads the built expansion ROM at the same address/window layout used
-// throughout this project's live testing and bus_test.cpp's own
-// makeExpansionBus() (base=9000, data window 8000-8FFF, instruction byte
-// at 8FFF), then points its ExpansionMock at a real host directory.
+// Loads the built expansion ROM at the same address/window layout the real
+// firmware uses (base=8800, 2K data window 8000-87FF, instruction byte at
+// 87FF -- moved from base=9000/4K data window 2026-08-18 to grow the ROM
+// region to 6K; unrelated to bus_test.cpp's own makeExpansionBus(), which
+// tests the generic loadExpansionModule mechanism against a synthetic
+// hand-built ROM at a still-arbitrary 0x9000, not this real one), then
+// points its ExpansionMock at a real host directory.
 void loadExpansionRom(BootedMachine& m, const std::vector<uint8_t>& expRom, const fs::path& sdDir) {
-  m.bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x9000, /*requirePv=*/false,
+  m.bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x8800, /*requirePv=*/false,
                              /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
-                             /*dataWindowSize=*/0x1000, /*instructionAddr=*/0x8FFF);
+                             /*dataWindowSize=*/0x800, /*instructionAddr=*/0x87FF);
   m.bus.expansionMock().setRootDir(sdDir);
 }
 
@@ -220,13 +223,13 @@ void testSlsExitThenTypingDoesNotConcatenate() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
     std::printf(
         "SKIP: testSlsExitThenTypingDoesNotConcatenate -- ROM1.BIN and/or "
-        "rom_9000.bin not found.\n");
+        "rom_8800.bin not found.\n");
     return;
   }
 
@@ -276,13 +279,13 @@ void testSdlsHidesBlinkingCursorDuringBrowse() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
     std::printf(
         "SKIP: testSdlsHidesBlinkingCursorDuringBrowse -- ROM1.BIN and/or "
-        "rom_9000.bin not found.\n");
+        "rom_8800.bin not found.\n");
     return;
   }
 
@@ -324,11 +327,11 @@ void testSdmkdirCreatesDirectory() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdmkdirCreatesDirectory -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdmkdirCreatesDirectory -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -354,11 +357,11 @@ void testSdrmdirRemovesEmptyDirectory() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdrmdirRemovesEmptyDirectory -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdrmdirRemovesEmptyDirectory -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -451,11 +454,11 @@ void testSdcdAffectsSubsequentFileCommands() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdcdAffectsSubsequentFileCommands -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdcdAffectsSubsequentFileCommands -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -518,12 +521,12 @@ void testSdpwdStagesCurrentDirectoryResponse() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
     std::printf(
-        "SKIP: testSdpwdStagesCurrentDirectoryResponse -- ROM1.BIN and/or rom_9000.bin not found.\n");
+        "SKIP: testSdpwdStagesCurrentDirectoryResponse -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -589,11 +592,11 @@ void testSdlsListsDirectoriesWithDirMarker() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdlsListsDirectoriesWithDirMarker -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdlsListsDirectoriesWithDirMarker -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -656,13 +659,13 @@ void testSdDirectoryCommandsRaiseError1WithoutArgument() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
     std::printf(
         "SKIP: testSdDirectoryCommandsRaiseError1WithoutArgument -- ROM1.BIN and/or "
-        "rom_9000.bin not found.\n");
+        "rom_8800.bin not found.\n");
     return;
   }
 
@@ -711,13 +714,13 @@ void testStrayEnterAfterSlsExitDoesNotRedispatch() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
     std::printf(
         "SKIP: testStrayEnterAfterSlsExitDoesNotRedispatch -- ROM1.BIN and/or "
-        "rom_9000.bin not found.\n");
+        "rom_8800.bin not found.\n");
     return;
   }
 
@@ -771,12 +774,12 @@ void testSdloadSelectsAndLoadsFile() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
     std::printf(
-        "SKIP: testSdloadSelectsAndLoadsFile -- ROM1.BIN and/or rom_9000.bin not found.\n");
+        "SKIP: testSdloadSelectsAndLoadsFile -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -867,11 +870,11 @@ void testSdloadDirectFilenameLoad() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdloadDirectFilenameLoad -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdloadDirectFilenameLoad -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -943,11 +946,11 @@ void testSdloadMHeaderBrowseSelectsFile() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdloadMHeaderBrowseSelectsFile -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdloadMHeaderBrowseSelectsFile -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -981,11 +984,11 @@ void testSdloadMDirectHeaderAddress() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdloadMDirectHeaderAddress -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdloadMDirectHeaderAddress -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1018,11 +1021,11 @@ void testSdloadMExplicitAddressDecimal() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdloadMExplicitAddressDecimal -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdloadMExplicitAddressDecimal -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1055,11 +1058,11 @@ void testSdloadMExplicitAddressHex() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdloadMExplicitAddressHex -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdloadMExplicitAddressHex -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1095,11 +1098,11 @@ void testSdsaveBasicRoundTrip() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdsaveBasicRoundTrip -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdsaveBasicRoundTrip -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1153,11 +1156,11 @@ void testSdsaveOverwritePromptNAborts() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdsaveOverwritePromptNAborts -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdsaveOverwritePromptNAborts -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1195,11 +1198,11 @@ void testSdsaveOverwritePromptYOverwrites() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdsaveOverwritePromptYOverwrites -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdsaveOverwritePromptYOverwrites -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1246,11 +1249,11 @@ void testSdsaveDashYSkipsPrompt() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdsaveDashYSkipsPrompt -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdsaveDashYSkipsPrompt -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1293,11 +1296,11 @@ void testSdsaveNoArgsRaisesError1() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdsaveNoArgsRaisesError1 -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdsaveNoArgsRaisesError1 -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1324,11 +1327,11 @@ void testSdsaveMMissingArgsRaisesError1() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdsaveMMissingArgsRaisesError1 -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdsaveMMissingArgsRaisesError1 -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1361,11 +1364,11 @@ void testSdsaveMCallAddressRoundTrip() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdsaveMCallAddressRoundTrip -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdsaveMCallAddressRoundTrip -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1428,11 +1431,11 @@ void testSdloadFileNotFoundRaisesError40() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdloadFileNotFoundRaisesError40 -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdloadFileNotFoundRaisesError40 -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1471,11 +1474,11 @@ void testSdloadUsesLiveProgramStartPointer() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdloadUsesLiveProgramStartPointer -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdloadUsesLiveProgramStartPointer -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1519,11 +1522,11 @@ void testSdloadUppercasesLowercaseFilename() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdloadUppercasesLowercaseFilename -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdloadUppercasesLowercaseFilename -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1573,11 +1576,11 @@ void testSdmkdirRejectsNon83ShapedNames() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdmkdirRejectsNon83ShapedNames -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdmkdirRejectsNon83ShapedNames -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1615,11 +1618,11 @@ void testSdcdDotAndDotDotStillWork() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdcdDotAndDotDotStillWork -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdcdDotAndDotDotStillWork -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1665,11 +1668,11 @@ void testSdcdMultiSegmentPathValidatesEachSegment() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdcdMultiSegmentPathValidatesEachSegment -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdcdMultiSegmentPathValidatesEachSegment -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1714,11 +1717,11 @@ void testSdPlusTildeTranslation() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdPlusTildeTranslation -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdPlusTildeTranslation -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1779,11 +1782,11 @@ void testSdrmDeletesWithConfirmation() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdrmDeletesWithConfirmation -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdrmDeletesWithConfirmation -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1816,11 +1819,11 @@ void testSdrmNAbortsDeletion() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdrmNAbortsDeletion -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdrmNAbortsDeletion -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1851,11 +1854,11 @@ void testSdrmDashYSkipsPrompt() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdrmDashYSkipsPrompt -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdrmDashYSkipsPrompt -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1884,11 +1887,11 @@ void testSdrmMissingFilenameRaisesError1() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdrmMissingFilenameRaisesError1 -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdrmMissingFilenameRaisesError1 -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1916,11 +1919,11 @@ void testSdrmCannotRemoveDirectory() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdrmCannotRemoveDirectory -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdrmCannotRemoveDirectory -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1948,11 +1951,11 @@ void testSdcpCopiesFile() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdcpCopiesFile -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdcpCopiesFile -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -1987,11 +1990,11 @@ void testSdcpMissingSourceRaisesError40() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdcpMissingSourceRaisesError40 -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdcpMissingSourceRaisesError40 -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2018,11 +2021,11 @@ void testSdmvMovesFile() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdmvMovesFile -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdmvMovesFile -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2057,11 +2060,11 @@ void testSddfDisplaysFreeAndTotalSpace() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSddfDisplaysFreeAndTotalSpace -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSddfDisplaysFreeAndTotalSpace -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2103,11 +2106,11 @@ void testSdmvIntoExistingDirectory() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdmvIntoExistingDirectory -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdmvIntoExistingDirectory -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2142,11 +2145,11 @@ void testSdcpIntoExistingDirectory() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdcpIntoExistingDirectory -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdcpIntoExistingDirectory -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2181,11 +2184,11 @@ void testSdmvWithDotDotRelativeSource() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdmvWithDotDotRelativeSource -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdmvWithDotDotRelativeSource -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2225,11 +2228,11 @@ void testSdcpWithAbsoluteDestinationPath() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdcpWithAbsoluteDestinationPath -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdcpWithAbsoluteDestinationPath -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2269,11 +2272,11 @@ void testSdcpOverwritePromptNAborts() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdcpOverwritePromptNAborts -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdcpOverwritePromptNAborts -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2314,11 +2317,11 @@ void testSdcpOverwritePromptYOverwrites() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdcpOverwritePromptYOverwrites -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdcpOverwritePromptYOverwrites -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2361,11 +2364,11 @@ void testSdcpDashYSkipsPrompt() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdcpDashYSkipsPrompt -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdcpDashYSkipsPrompt -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2403,11 +2406,11 @@ void testSdmvOverwritePromptNAborts() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdmvOverwritePromptNAborts -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdmvOverwritePromptNAborts -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2453,11 +2456,11 @@ void testSdloadFromAbsolutePath() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdloadFromAbsolutePath -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdloadFromAbsolutePath -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2511,11 +2514,11 @@ void testSdopenCreatesFileAndListsChannel() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdopenCreatesFileAndListsChannel -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdopenCreatesFileAndListsChannel -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2563,11 +2566,11 @@ void testSdopenReusingChannelClosesPrevious() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdopenReusingChannelClosesPrevious -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdopenReusingChannelClosesPrevious -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2613,11 +2616,11 @@ void testSdcloseClosesOneAndAll() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdcloseClosesOneAndAll -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdcloseClosesOneAndAll -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2679,11 +2682,11 @@ void testSdprintSdinputNumericRoundTrip() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdprintSdinputNumericRoundTrip -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdprintSdinputNumericRoundTrip -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2740,11 +2743,11 @@ void testSdprintSdinputStringRoundTrip() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdprintSdinputStringRoundTrip -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdprintSdinputStringRoundTrip -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2799,11 +2802,11 @@ void testSdinputEofFillsZeroAndBlank() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdinputEofFillsZeroAndBlank -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdinputEofFillsZeroAndBlank -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2851,11 +2854,11 @@ void testSdskipAdvancesAndRaisesError40PastEnd() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdskipAdvancesAndRaisesError40PastEnd -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdskipAdvancesAndRaisesError40PastEnd -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 
@@ -2942,13 +2945,13 @@ void testSdChannelCommandsRaiseError1OnMalformedArgument() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
     std::printf(
         "SKIP: testSdChannelCommandsRaiseError1OnMalformedArgument -- ROM1.BIN and/or "
-        "rom_9000.bin not found.\n");
+        "rom_8800.bin not found.\n");
     return;
   }
 
@@ -2989,11 +2992,11 @@ void testSdinputOverlongStringRaisesError42() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
-    std::printf("SKIP: testSdinputOverlongStringRaisesError42 -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    std::printf("SKIP: testSdinputOverlongStringRaisesError42 -- ROM1.BIN and/or rom_8800.bin not found.\n");
     return;
   }
 

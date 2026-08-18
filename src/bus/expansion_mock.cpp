@@ -195,6 +195,8 @@ uint8_t ExpansionMock::processCommand(uint8_t cmd, std::vector<uint8_t>& window)
       return readSdValue(window);
     case kCommandSdSkipValues:
       return skipSdValues(window);
+    case kCommandValidateSdName:
+      return validateAndFoldSdName(window);
     case kCommandClearStatus:
       return kStatusReady;
     default:
@@ -794,6 +796,47 @@ uint8_t ExpansionMock::skipSdValues(std::vector<uint8_t>& window) {
     }
   }
   ch.readPos = pos;
+  return kStatusSuccess;
+}
+
+// Ported from main.c's EXP_COMMAND_VALIDATE_SD_NAME case (and, before that,
+// from the LH5801 state machine that used to live in rom.asm's
+// SD_PARSE_QUOTED_NAME) -- see this method's own header comment for the
+// exact per-'/'-segment 8.3 shape rule. window[0..1]=length (2-byte BE),
+// window[2..]=the raw characters, folded/validated in place on success.
+uint8_t ExpansionMock::validateAndFoldSdName(std::vector<uint8_t>& window) {
+  if (window.size() < 2) return kStatusError;
+  size_t nameLen = (static_cast<size_t>(window[0]) << 8) | window[1];
+  if (nameLen == 0 || window.size() < 2 + nameLen) return kStatusError;
+
+  uint8_t nameCount = 0, extCount = 0;
+  bool dotSeen = false, dotOnly = true;
+  for (size_t i = 0; i < nameLen; i++) {
+    uint8_t c = window[2 + i];
+    if (c >= 'a' && c <= 'z') c = static_cast<uint8_t>(c - 'a' + 'A');
+    if (c == '/') {
+      nameCount = 0;
+      extCount = 0;
+      dotSeen = false;
+      dotOnly = true;
+    } else if (c == '.') {
+      if (dotOnly) {
+        // "." or ".." so far -- allow, don't touch counters
+      } else if (dotSeen) {
+        return kStatusError;  // second '.' in a real name
+      } else {
+        dotSeen = true;
+      }
+    } else {
+      dotOnly = false;
+      if (!dotSeen) {
+        if (++nameCount > 8) return kStatusError;
+      } else {
+        if (++extCount > 3) return kStatusError;
+      }
+    }
+    window[2 + i] = c;
+  }
   return kStatusSuccess;
 }
 

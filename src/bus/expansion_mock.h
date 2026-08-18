@@ -95,6 +95,14 @@ class ExpansionMock {
   static constexpr uint8_t kCommandSdWriteValue = 27;
   static constexpr uint8_t kCommandSdReadValue = 28;
   static constexpr uint8_t kCommandSdSkipValues = 29;
+  // Validates+uppercase-folds, in place, the length-prefixed raw name
+  // SD_PARSE_QUOTED_NAME (rom.asm) has already staged at window offset 0
+  // -- ported from the LH5801 state machine that used to live there (see
+  // validateAndFoldSdName's own comment for the full rule). Moved
+  // 2026-08-19: pure character classification, much more naturally
+  // expressed in C++, and this side already receives the full name for
+  // every command that uses one.
+  static constexpr uint8_t kCommandValidateSdName = 30;
   static constexpr uint8_t kCommandClearStatus = 0xFF;
 
   // SDOPEN/SDCLOSE/SDINPUT#/SDPRINT#/SDSKIP# -- up to kMaxSdChannels files
@@ -133,10 +141,12 @@ class ExpansionMock {
   // listSdDir's own comment. 26 matches SLS_LINE_WIDTH (rom.asm) -- the
   // real PC-1500 LCD's own max single-line width (156 dots / 6 per char).
   static constexpr int kSummaryLineLen = 26;
-  // (4096 - 1 - 2 - kSummaryLineLen) / kDirRecordSize = 135 -- leaves room
-  // for entries *and* the summary line inside the 4K window, clear of the
-  // instruction byte at its last address. Matches PC_EXP.h's own mirror.
-  static constexpr int kDirMaxEntries = 135;
+  // (2048 - 1 - 2 - kSummaryLineLen) / kDirRecordSize = 67 -- leaves room
+  // for entries *and* the summary line inside the 2K data window (shrunk
+  // from 4K when ROM_BASE moved 0x9000->0x8800 to grow the ROM region to
+  // 6K, 2026-08-18 session), clear of the instruction byte at its last
+  // address. Matches PC_EXP.h's own mirror.
+  static constexpr int kDirMaxEntries = 67;
 
  private:
   static void formatSizeText(uint32_t value, std::vector<uint8_t>& window, size_t offset,
@@ -149,8 +159,8 @@ class ExpansionMock {
                                          size_t offset);
 
   // '+' is this project's typable stand-in for a real FAT short name's '~'
-  // (the PC-1500 keyboard has no '~' key) -- see rom.asm's SD_PARSE_QUOTED_
-  // NAME comment. Every SD command now enforces uppercase 8.3 shape on its
+  // (the PC-1500 keyboard has no '~' key) -- see validateAndFoldSdName's
+  // own comment. Every SD command now enforces uppercase 8.3 shape on its
   // own argument, so '+' can never legitimately appear in a name for any
   // other reason: the swap is unconditional and unambiguous in both
   // directions, unlike '-' (a legal FAT 8.3 character that could collide
@@ -222,6 +232,20 @@ class ExpansionMock {
   // Closes channels_[index] if open -- shared by closeSdChannel (one or
   // "all") and openSdChannel (reusing an already-open number).
   void closeSdChannelAt(int index);
+  // Validates+uppercase-folds, in place, the length-prefixed raw name at
+  // window offset 0 -- every SD command's name argument is a full path (a
+  // plain filename, a relative path with '/'/'.'/'..' components, or an
+  // absolute one starting with '/' from the SD root), so each
+  // '/'-separated segment must independently be <=8 characters,
+  // optionally followed by '.' and <=3 more, with at most one '.' --
+  // except a segment that is exactly "." or "..", always allowed through
+  // untouched. '+' needs no special handling here -- it's an ordinary
+  // character for shape-counting purposes; the actual '+'<->'~'
+  // translation happens later, in resolvePath/resolveDirPath. Returns
+  // kStatusSuccess (window already updated in place) or kStatusError
+  // (shape violation -- rom.asm's SD_PARSE_QUOTED_NAME maps this onto the
+  // same "malformed" Carry-set exit it always had).
+  uint8_t validateAndFoldSdName(std::vector<uint8_t>& window);
 
   std::filesystem::path rootDir_;
   // Defaults to rootDir_ whenever that's (re)set -- see setRootDir's own
