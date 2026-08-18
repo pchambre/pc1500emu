@@ -233,6 +233,12 @@ Commands:
 - `type <text>` — queues each character as a keypress (letters, digits,
   space, and a handful of symbols needing a PC-1500 Shift-tap: `" : < >`).
   Unmapped characters are skipped with a stderr warning — use `key` instead.
+  Automatically taps `SML` around lowercase letters as needed so `text`'s
+  own case is preserved exactly (the PC-1500 has one physical key per
+  letter — case is a persistent ROM-side mode, not a separate keystroke),
+  seeded from the machine's actual live SML state each time rather than a
+  separately-tracked flag, so it stays correct even if `key sml` was sent
+  directly between two `type` calls.
 - `key <name>` — a named key with no natural printable form: `enter`, `cl`,
   `mode`, `def`, `sml`, `rcl`, `shift`, `off`, `up`/`down`/`left`/`right`,
   `f1`-`f6`, `space`. Prefix with `shift+` (e.g. `key shift+mode`) to send

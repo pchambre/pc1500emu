@@ -2,6 +2,7 @@
 // Version 2.0 -- see LICENSE.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -62,6 +63,7 @@ class ExpansionMock {
   static constexpr uint8_t kStatusReady = 0;
   static constexpr uint8_t kStatusBusy = 1;
   static constexpr uint8_t kStatusSuccess = 2;
+  static constexpr uint8_t kStatusEof = 3;  // kCommandSdReadValue only -- see PC_EXP.h's own comment
   static constexpr uint8_t kStatusNotImplemented = 64;
   static constexpr uint8_t kStatusError = 128;
 
@@ -87,7 +89,22 @@ class ExpansionMock {
   static constexpr uint8_t kCommandMoveSdFile = 21;
   static constexpr uint8_t kCommandGetSdDfText = 22;
   static constexpr uint8_t kCommandCheckSdCopyMoveDestExists = 23;
+  static constexpr uint8_t kCommandSdOpenChannel = 24;
+  static constexpr uint8_t kCommandSdCloseChannel = 25;
+  static constexpr uint8_t kCommandSdListChannels = 26;
+  static constexpr uint8_t kCommandSdWriteValue = 27;
+  static constexpr uint8_t kCommandSdReadValue = 28;
+  static constexpr uint8_t kCommandSdSkipValues = 29;
   static constexpr uint8_t kCommandClearStatus = 0xFF;
+
+  // SDOPEN/SDCLOSE/SDINPUT#/SDPRINT#/SDSKIP# -- up to kMaxSdChannels files
+  // open at once, numbered 1..kMaxSdChannels (0 is the "close all"
+  // sentinel). This mock never sees a BASIC variable name or value --
+  // rom.asm resolves those itself and sends/receives opaque "chunk" bytes
+  // (['N']+8 raw bytes for numeric, ['S']+1-byte length+that many raw
+  // ASCII bytes for string) -- see PC_EXP.h's own comment for the full
+  // writeup and the reasoning behind the format.
+  static constexpr int kMaxSdChannels = 16;
 
   // Max length of a single quoted path/name argument -- see PC_EXP.h's own
   // comment. Deliberately separate from kDirNameLen (the SDLS display
@@ -196,6 +213,15 @@ class ExpansionMock {
   uint8_t moveSdFile(std::vector<uint8_t>& window);
   uint8_t getSdDfText(std::vector<uint8_t>& window);
   uint8_t checkSdCopyMoveDestExists(std::vector<uint8_t>& window);
+  uint8_t openSdChannel(std::vector<uint8_t>& window);
+  uint8_t closeSdChannel(std::vector<uint8_t>& window);
+  uint8_t listSdChannels(std::vector<uint8_t>& window);
+  uint8_t writeSdValue(std::vector<uint8_t>& window);
+  uint8_t readSdValue(std::vector<uint8_t>& window);
+  uint8_t skipSdValues(std::vector<uint8_t>& window);
+  // Closes channels_[index] if open -- shared by closeSdChannel (one or
+  // "all") and openSdChannel (reusing an already-open number).
+  void closeSdChannelAt(int index);
 
   std::filesystem::path rootDir_;
   // Defaults to rootDir_ whenever that's (re)set -- see setRootDir's own
@@ -205,12 +231,27 @@ class ExpansionMock {
   uint32_t freeSpaceBytes_ = 2122343;
 
   // Single open-file state -- matches main.c's own globals exactly (one
-  // file open at a time, not a handle table), since that's what the real
-  // ROM protocol assumes.
+  // file open at a time, not a handle table), since that's what
+  // SDLOAD/SDSAVE's own established ROM protocol assumes. Entirely
+  // separate from channels_ below (SDOPEN/etc.'s own real handle table) --
+  // the two mechanisms don't interact.
   std::fstream openFile_;
   std::string openFileName_;
   uint8_t fileStatus_ = kFileStatusClosed;
   uint32_t bytesWrittenTotal_ = 0;  // matches main.c's fileEnd
+
+  // SDOPEN/SDCLOSE/SDINPUT#/SDPRINT#/SDSKIP#'s own real multi-file state --
+  // index i holds channel (i+1). name_ is kept only for listSdChannels'
+  // own display; readPos_ is the persistent SDINPUT#/SDSKIP# cursor,
+  // deliberately independent of the file's own internal position (which
+  // writeSdValue moves to the end and back on every SDPRINT# call).
+  struct SdChannel {
+    std::fstream file;
+    std::string name;
+    bool isOpen = false;
+    uint32_t readPos = 0;
+  };
+  std::array<SdChannel, kMaxSdChannels> channels_;
 };
 
 }  // namespace pc1500

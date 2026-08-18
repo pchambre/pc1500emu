@@ -1685,7 +1685,25 @@ int main(int argc, char** argv) {
       std::getline(iss, text);
       size_t start = text.find_first_not_of(' ');
       if (start != std::string::npos) text = text.substr(start);
+      // charToTapActions folds 'a'-'z' to the same physical key as 'A'-'Z'
+      // by design (case is a persistent ROM-side SML mode, not a separate
+      // keystroke -- see its own doc comment) and is deliberately SML-
+      // unaware, so genuine lowercase output needs the caller to drive SML
+      // itself, same as typeBasicProgramText's own setSml closure already
+      // does for `loadbasictext`. Seeded from the *live* SML status bit
+      // (764EH bit 3 -- same one `status`'s own small= field reads) rather
+      // than a separately-tracked variable, so this self-corrects instead
+      // of drifting out of sync if SML was toggled by an interleaved `key
+      // sml` command or a real keypress since the last `type` call.
+      bool smlActive = (bus.readME0(0x764E) & 0x08) != 0;
+      auto setSml = [&](bool active) {
+        if (active == smlActive) return;
+        symbolActionQueue.push_back({pc1500::Key::Sml, true, kTapFrames});
+        symbolActionQueue.push_back({pc1500::Key::Sml, false, kIdleFrames});
+        smlActive = active;
+      };
       for (char c : text) {
+        setSml(c >= 'a' && c <= 'z');
         if (!charToTapActions(c, &symbolActionQueue)) {
           std::fprintf(stderr, "pc1500emu: 'type' has no mapping for char '%c' -- use 'key NAME'\n", c);
         }

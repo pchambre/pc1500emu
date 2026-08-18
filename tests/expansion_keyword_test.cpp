@@ -2492,6 +2492,542 @@ void testSdloadFromAbsolutePath() {
   CHECK(loadedProgram == kFixture);
 }
 
+// ---------------------------------------------------------------------
+// SDOPEN/SDCLOSE/SDINPUT#/SDPRINT#/SDSKIP# -- the D461H-based variable
+// channel commands. Numeric round trips use the fixed variable "A"
+// (confirmed live this session at 0x7900-0x7907, 8 raw decimal-float
+// bytes); string round trips use "T$" (confirmed live at 0x7790, 16-byte
+// capacity, zero-padded inline ASCII with no separate length field) --
+// see this session's own memory notes. Reading a variable's value back is
+// done by peeking its own fixed storage directly rather than via PRINT,
+// since there's no existing VRAM-text-reading helper in this file.
+constexpr uint16_t kVarA = 0x7900;
+constexpr uint16_t kVarTDollar = 0x7790;
+
+// SDOPEN "<name>" AS <n> creates the file and reports success (no ERROR);
+// a bare SDOPEN afterward lists it as "<n>:<name>" via the same
+// LIST_SD_DIR-shaped wire format SDLS itself uses.
+void testSdopenCreatesFileAndListsChannel() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdopenCreatesFileAndListsChannel -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdopen_create_list");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  m->bus.writeME0(kErlAbs, 0xEE);
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"CHAN1.SDF\" AS 1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.readME0(kErlAbs) != 1);
+  CHECK(fs::exists(sdDir / "CHAN1.SDF"));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN");
+  tapKey(*m, pc1500::Key::Ent);  // dispatch -- lists open channels
+  CHECK(waitForIdle(*m));
+
+  constexpr uint16_t kBufAbs = 0x8000;
+  constexpr int kNameLen = 16;
+  constexpr int kRecordSize = 30;
+  uint16_t count = (static_cast<uint16_t>(m->bus.readME0(kBufAbs)) << 8) | m->bus.readME0(kBufAbs + 1);
+  CHECK(count == 1);
+  std::string name;
+  for (int j = 0; j < kNameLen; j++) name += static_cast<char>(m->bus.readME0(kBufAbs + 2 + j));
+  while (!name.empty() && name.back() == ' ') name.pop_back();
+  CHECK(name == "1:CHAN1.SDF");
+  if (name != "1:CHAN1.SDF") std::printf("  channel listing name: \"%s\"\n", name.c_str());
+  (void)kRecordSize;
+
+  tapKey(*m, pc1500::Key::Ent);  // exit the browse
+  CHECK(waitForIdle(*m));
+}
+
+// Reusing an already-open channel number closes the previous file first
+// -- the listing must show only the new file under that channel.
+void testSdopenReusingChannelClosesPrevious() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdopenReusingChannelClosesPrevious -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdopen_reuse");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"FIRST.SDF\" AS 1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"SECOND.SDF\" AS 1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  constexpr uint16_t kBufAbs = 0x8000;
+  constexpr int kNameLen = 16;
+  uint16_t count = (static_cast<uint16_t>(m->bus.readME0(kBufAbs)) << 8) | m->bus.readME0(kBufAbs + 1);
+  CHECK(count == 1);
+  std::string name;
+  for (int j = 0; j < kNameLen; j++) name += static_cast<char>(m->bus.readME0(kBufAbs + 2 + j));
+  while (!name.empty() && name.back() == ' ') name.pop_back();
+  CHECK(name == "1:SECOND.SDF");
+
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+}
+
+// SDCLOSE <n> closes a single channel; SDCLOSE ALL closes every open one.
+void testSdcloseClosesOneAndAll() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdcloseClosesOneAndAll -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdclose");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"A.SDF\" AS 1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"B.SDF\" AS 2");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCLOSE 1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  constexpr uint16_t kBufAbs = 0x8000;
+  {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "SDOPEN");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    uint16_t count = (static_cast<uint16_t>(m->bus.readME0(kBufAbs)) << 8) | m->bus.readME0(kBufAbs + 1);
+    CHECK(count == 1);  // only B.SDF (channel 2) left open
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+  }
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDCLOSE ALL");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "SDOPEN");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    uint16_t count = (static_cast<uint16_t>(m->bus.readME0(kBufAbs)) << 8) | m->bus.readME0(kBufAbs + 1);
+    CHECK(count == 0);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+  }
+}
+
+// SDPRINT#/SDINPUT# round trip a numeric variable's real value through an
+// SD file, byte for byte.
+void testSdprintSdinputNumericRoundTrip() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdprintSdinputNumericRoundTrip -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdprint_numeric");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "A=1500");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  std::vector<uint8_t> original;
+  for (int i = 0; i < 8; i++) original.push_back(m->bus.readME0(static_cast<uint16_t>(kVarA + i)));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"NUMS.SDF\" AS 1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDPRINT#1,A");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "A=0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  for (int i = 0; i < 8; i++) CHECK(m->bus.readME0(static_cast<uint16_t>(kVarA + i)) == 0);
+
+  // Reopening channel 1 resets its own read cursor back to the start.
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"NUMS.SDF\" AS 1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDINPUT#1,A");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  for (int i = 0; i < 8; i++) CHECK(m->bus.readME0(static_cast<uint16_t>(kVarA + i)) == original[i]);
+}
+
+// Same round trip for a string variable (T$) -- exercises the zero-padded
+// inline-ASCII storage format and the length-scan in SD_BUILD_VALUE_CHUNK.
+void testSdprintSdinputStringRoundTrip() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdprintSdinputStringRoundTrip -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdprint_string");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "T$=\"HI\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"STR.SDF\" AS 3");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDPRINT#3,T$");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "T$=\"ZZ\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"STR.SDF\" AS 3");  // reopen -- resets the read cursor
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDINPUT#3,T$");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(m->bus.readME0(kVarTDollar + 0) == 'H');
+  CHECK(m->bus.readME0(kVarTDollar + 1) == 'I');
+  CHECK(m->bus.readME0(kVarTDollar + 2) == 0x00);
+}
+
+// Reading more values than a channel has stored must zero-fill numeric
+// variables and blank string variables, not raise an error -- the user's
+// own explicit spec.
+void testSdinputEofFillsZeroAndBlank() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdinputEofFillsZeroAndBlank -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdinput_eof");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "A=999");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "T$=\"ZZ\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"EMPTY.SDF\" AS 1");  // freshly created -- no stored values
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  m->bus.writeME0(kErlAbs, 0xEE);
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDINPUT#1,A,T$");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(m->bus.readME0(kErlAbs) != 1);
+  CHECK(m->bus.readME0(kErlAbs) != 40);
+  for (int i = 0; i < 8; i++) CHECK(m->bus.readME0(static_cast<uint16_t>(kVarA + i)) == 0);
+  CHECK(m->bus.readME0(kVarTDollar + 0) == 0x00);
+}
+
+// SDSKIP# advances past whole values without transferring them; skipping
+// past the end of the file must raise a genuine ERROR 40 and leave the
+// read position untouched (confirmed indirectly here by checking the
+// value after the failed skip is still the first stored one).
+void testSdskipAdvancesAndRaisesError40PastEnd() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdskipAdvancesAndRaisesError40PastEnd -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdskip");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"SKIP.SDF\" AS 1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  // Snapshot each value's own real 8-byte in-memory encoding right after
+  // assignment -- comparing against these (rather than a guessed BCD byte
+  // pattern) is what actually confirms SDSKIP#/SDINPUT# read back the
+  // right *stored* value, independent of exactly how BASIC encodes a
+  // given integer internally.
+  std::vector<std::vector<uint8_t>> snapshots;
+  for (int v : {1, 2, 3}) {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "A=" + std::to_string(v));
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    std::vector<uint8_t> snap;
+    for (int i = 0; i < 8; i++) snap.push_back(m->bus.readME0(static_cast<uint16_t>(kVarA + i)));
+    snapshots.push_back(snap);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "SDPRINT#1,A");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+  }
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"SKIP.SDF\" AS 1");  // reopen -- reset read cursor to the start
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDSKIP#1,2");  // skip the first two stored values (1 and 2) -- comma
+                                // separator required, see SDSKIP_ROUTINE's own comment
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDINPUT#1,A");  // should read the third value (3)
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  for (int i = 0; i < 8; i++) CHECK(m->bus.readME0(static_cast<uint16_t>(kVarA + i)) == snapshots[2][i]);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"SKIP.SDF\" AS 1");  // reopen again -- reset to the start
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  m->bus.writeME0(kErlAbs, 0xEE);
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDSKIP#1,5");  // only 3 values exist -- must fail all-or-nothing
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.readME0(kErlAbs) == 40);
+
+  // The failed skip must have left the read position untouched -- the very
+  // next SDINPUT# should still read the *first* stored value (1).
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "A=999");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDINPUT#1,A");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  for (int i = 0; i < 8; i++) CHECK(m->bus.readME0(static_cast<uint16_t>(kVarA + i)) == snapshots[0][i]);
+}
+
+// Malformed/missing arguments to SDOPEN/SDCLOSE/SDINPUT#/SDPRINT#/SDSKIP#
+// must raise a genuine BASIC ERROR 1, matching every other SD command's
+// own established convention for a deliberate operation given bad input.
+void testSdChannelCommandsRaiseError1OnMalformedArgument() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf(
+        "SKIP: testSdChannelCommandsRaiseError1OnMalformedArgument -- ROM1.BIN and/or "
+        "rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdchannel_error1");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  // SDINPUT#1/SDPRINT#1/SDSKIP#1 (channel number but no variable list/count
+  // at all) are used here rather than e.g. "SDINPUT#1,A" -- the latter is
+  // syntactically well-formed (it just references a channel that isn't
+  // open, which raises ERROR 40, not ERROR 1 -- see SDINPUT_ROUTINE's own
+  // comment on that distinction).
+  for (const char* cmd : {"SDCLOSE", "SDCLOSE 0", "SDCLOSE 17", "SDINPUT#1", "SDPRINT#1", "SDSKIP#1",
+                           "SDOPEN \"X.SDF\""}) {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "NEW0");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+
+    m->bus.writeME0(kErlAbs, 0xEE);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, cmd);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+
+    CHECK(m->bus.readME0(kErlAbs) == 1);
+    if (m->bus.readME0(kErlAbs) != 1) {
+      std::printf("  \"%s\": ERL=%u (want 1)\n", cmd, m->bus.readME0(kErlAbs));
+    }
+  }
+}
+
+// A hand-crafted SD file whose stored string chunk is longer than the
+// target variable's own real capacity must raise a genuine BASIC ERROR
+// 42, not silently truncate or crash -- the user's own explicit spec for
+// this (deliberately corrupted-file-only) case.
+void testSdinputOverlongStringRaisesError42() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_9000.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdinputOverlongStringRaisesError42 -- ROM1.BIN and/or rom_9000.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdinput_error42");
+  {
+    // 'S' tag, length=17 (one over T$'s own 16-byte capacity), 17 bytes of 'X'.
+    std::vector<uint8_t> chunk = {'S', 17};
+    chunk.insert(chunk.end(), 17, 'X');
+    std::ofstream f(sdDir / "BAD.SDF", std::ios::binary);
+    f.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDOPEN \"BAD.SDF\" AS 1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  m->bus.writeME0(kErlAbs, 0xEE);
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDINPUT#1,T$");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(m->bus.readME0(kErlAbs) == 42);
+}
+
 }  // namespace
 
 int main() {
@@ -2544,6 +3080,15 @@ int main() {
   testSdcpDashYSkipsPrompt();
   testSdmvOverwritePromptNAborts();
   testSdloadFromAbsolutePath();
+  testSdopenCreatesFileAndListsChannel();
+  testSdopenReusingChannelClosesPrevious();
+  testSdcloseClosesOneAndAll();
+  testSdprintSdinputNumericRoundTrip();
+  testSdprintSdinputStringRoundTrip();
+  testSdinputEofFillsZeroAndBlank();
+  testSdskipAdvancesAndRaisesError40PastEnd();
+  testSdChannelCommandsRaiseError1OnMalformedArgument();
+  testSdinputOverlongStringRaisesError42();
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

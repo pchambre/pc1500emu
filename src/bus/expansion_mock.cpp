@@ -183,6 +183,18 @@ uint8_t ExpansionMock::processCommand(uint8_t cmd, std::vector<uint8_t>& window)
       return getSdDfText(window);
     case kCommandCheckSdCopyMoveDestExists:
       return checkSdCopyMoveDestExists(window);
+    case kCommandSdOpenChannel:
+      return openSdChannel(window);
+    case kCommandSdCloseChannel:
+      return closeSdChannel(window);
+    case kCommandSdListChannels:
+      return listSdChannels(window);
+    case kCommandSdWriteValue:
+      return writeSdValue(window);
+    case kCommandSdReadValue:
+      return readSdValue(window);
+    case kCommandSdSkipValues:
+      return skipSdValues(window);
     case kCommandClearStatus:
       return kStatusReady;
     default:
@@ -569,6 +581,220 @@ uint8_t ExpansionMock::checkSdCopyMoveDestExists(std::vector<uint8_t>& window) {
   if (destPath.empty()) return kStatusError;
   std::error_code ec;
   return (fs::exists(destPath, ec) && !ec) ? kStatusSuccess : kStatusError;
+}
+
+void ExpansionMock::closeSdChannelAt(int index) {
+  SdChannel& ch = channels_[index];
+  if (ch.isOpen) {
+    ch.file.close();
+    ch.file.clear();
+  }
+  ch.isOpen = false;
+  ch.name.clear();
+  ch.readPos = 0;
+}
+
+// Ported from main.c's EXP_COMMAND_SD_OPEN_CHANNEL case: window[0]=channel
+// (1-kMaxSdChannels), then a length-prefixed filename at window[1]. Opens
+// for combined read+append (creating the file if it doesn't exist, never
+// truncating one that does) -- SDPRINT#/SDINPUT#/SDSKIP# all operate on
+// whatever's already there. Reusing an already-open channel number closes
+// it first, matching SDOPEN's own documented behavior.
+uint8_t ExpansionMock::openSdChannel(std::vector<uint8_t>& window) {
+  if (window.empty()) return kStatusError;
+  uint8_t channel = window[0];
+  if (channel < 1 || channel > kMaxSdChannels) return kStatusError;
+  std::string name = readLengthPrefixedString(window, 1);
+  if (name.empty()) return kStatusError;
+  fs::path path = resolvePath(name);
+  if (path.empty()) return kStatusError;
+
+  int index = channel - 1;
+  closeSdChannelAt(index);
+
+  SdChannel& ch = channels_[index];
+  ch.file.open(path, std::ios::binary | std::ios::in | std::ios::out);
+  if (!ch.file.is_open()) {
+    // Doesn't exist yet -- plain in|out can't create a file on most
+    // implementations, so create it out-only first, then reopen in|out.
+    ch.file.clear();
+    ch.file.open(path, std::ios::binary | std::ios::out);
+    ch.file.close();
+    ch.file.clear();
+    ch.file.open(path, std::ios::binary | std::ios::in | std::ios::out);
+  }
+  if (!ch.file.is_open()) return kStatusError;
+  ch.isOpen = true;
+  ch.name = name;
+  ch.readPos = 0;
+  return kStatusSuccess;
+}
+
+// Ported from main.c's EXP_COMMAND_SD_CLOSE_CHANNEL case: window[0]=channel,
+// or 0 to close every open channel.
+uint8_t ExpansionMock::closeSdChannel(std::vector<uint8_t>& window) {
+  if (window.empty()) return kStatusError;
+  uint8_t channel = window[0];
+  if (channel == 0) {
+    for (int i = 0; i < kMaxSdChannels; i++) closeSdChannelAt(i);
+    return kStatusSuccess;
+  }
+  if (channel > kMaxSdChannels) return kStatusError;
+  closeSdChannelAt(channel - 1);
+  return kStatusSuccess;
+}
+
+// Ported from main.c's EXP_COMMAND_SD_LIST_CHANNELS case: reuses
+// EXP_COMMAND_LIST_SD_DIR's own wire format exactly (see listSdDir's own
+// comment) so rom.asm's existing SD_LIST_INIT/SD_LIST_DISPLAY browse
+// machinery can draw it unmodified -- one record per open channel, name
+// field showing "<n>:<filename>".
+uint8_t ExpansionMock::listSdChannels(std::vector<uint8_t>& window) {
+  uint16_t count = 0;
+  for (int i = 0; i < kMaxSdChannels && count < kDirMaxEntries; i++) {
+    if (!channels_[i].isOpen) continue;
+    size_t entryOffset = 2 + static_cast<size_t>(count) * kDirRecordSize;
+    if (entryOffset + kDirRecordSize > window.size()) break;
+    std::string label = std::to_string(i + 1) + ":" + channels_[i].name;
+    for (int j = 0; j < kDirNameLen; j++) {
+      window[entryOffset + j] = (j < static_cast<int>(label.size()))
+                                     ? static_cast<uint8_t>(label[j])
+                                     : static_cast<uint8_t>(' ');
+    }
+    // Size-text field left blank -- an open channel doesn't have a
+    // meaningful "size" the way a directory entry does.
+    for (int j = 0; j < kDirSizeTextLen; j++) {
+      window[entryOffset + kDirNameLen + j] = static_cast<uint8_t>(' ');
+    }
+    size_t binOffset = entryOffset + kDirNameLen + kDirSizeTextLen;
+    for (int j = 0; j < 4; j++) window[binOffset + j] = 0;
+    count++;
+  }
+  if (window.size() >= 2) {
+    window[0] = static_cast<uint8_t>(count >> 8);
+    window[1] = static_cast<uint8_t>(count & 0xFF);
+  }
+  size_t summaryOffset = 2 + static_cast<size_t>(count) * kDirRecordSize;
+  if (summaryOffset + kSummaryLineLen <= window.size()) {
+    std::string summary = std::to_string(count) + " OPEN";
+    writeText(summary, window, summaryOffset, kSummaryLineLen);
+  }
+  return kStatusSuccess;
+}
+
+// Ported from main.c's EXP_COMMAND_SD_WRITE_VALUE case: window[0]=channel,
+// window[1..]=one chunk (['N']+8 bytes, or ['S']+1-byte length+that many
+// bytes -- see PC_EXP.h's own comment) built by rom.asm from a looked-up
+// variable's own storage. This mock never interprets the payload, just
+// appends the whole chunk's bytes to the end of the channel's file,
+// regardless of the channel's own read position.
+uint8_t ExpansionMock::writeSdValue(std::vector<uint8_t>& window) {
+  if (window.empty()) return kStatusError;
+  uint8_t channel = window[0];
+  if (channel < 1 || channel > kMaxSdChannels) return kStatusError;
+  SdChannel& ch = channels_[channel - 1];
+  if (!ch.isOpen) return kStatusError;
+  if (window.size() < 2) return kStatusError;
+  uint8_t tag = window[1];
+  size_t chunkLen;
+  if (tag == 'N') {
+    chunkLen = 1 + 8;
+  } else if (tag == 'S') {
+    if (window.size() < 3) return kStatusError;
+    chunkLen = 1 + 1 + window[2];
+  } else {
+    return kStatusError;
+  }
+  if (window.size() < 1 + chunkLen) return kStatusError;
+  ch.file.clear();
+  ch.file.seekp(0, std::ios::end);
+  ch.file.write(reinterpret_cast<const char*>(window.data() + 1), static_cast<std::streamsize>(chunkLen));
+  if (!ch.file.good()) return kStatusError;
+  ch.file.flush();
+  return kStatusSuccess;
+}
+
+// Ported from main.c's EXP_COMMAND_SD_READ_VALUE case: window[0]=channel
+// (request); response overwrites window[0..] with the next chunk read
+// from the channel's own persistent read position (advanced past it on
+// return, independent of writeSdValue's own always-append behavior), or
+// kStatusEof if the channel has no more stored values.
+uint8_t ExpansionMock::readSdValue(std::vector<uint8_t>& window) {
+  if (window.empty()) return kStatusError;
+  uint8_t channel = window[0];
+  if (channel < 1 || channel > kMaxSdChannels) return kStatusError;
+  SdChannel& ch = channels_[channel - 1];
+  if (!ch.isOpen) return kStatusError;
+  ch.file.clear();
+  ch.file.seekg(static_cast<std::streamoff>(ch.readPos), std::ios::beg);
+  char tag = 0;
+  ch.file.read(&tag, 1);
+  if (ch.file.gcount() != 1) return kStatusEof;
+  size_t payloadLen;
+  if (tag == 'N') {
+    payloadLen = 8;
+  } else if (tag == 'S') {
+    char lenByte = 0;
+    ch.file.read(&lenByte, 1);
+    if (ch.file.gcount() != 1) return kStatusEof;  // truncated chunk -- treat as EOF
+    payloadLen = static_cast<uint8_t>(lenByte);
+  } else {
+    return kStatusError;  // corrupt file
+  }
+  std::vector<char> payload(payloadLen);
+  if (payloadLen > 0) {
+    ch.file.read(payload.data(), static_cast<std::streamsize>(payloadLen));
+    if (static_cast<size_t>(ch.file.gcount()) != payloadLen) return kStatusEof;
+  }
+  size_t pos = 0;
+  window[pos++] = static_cast<uint8_t>(tag);
+  if (tag == 'S') {
+    if (window.size() < pos + 1) return kStatusError;
+    window[pos++] = static_cast<uint8_t>(payloadLen);
+  }
+  for (size_t i = 0; i < payloadLen && pos < window.size(); i++) {
+    window[pos++] = static_cast<uint8_t>(payload[i]);
+  }
+  ch.readPos = static_cast<uint32_t>(ch.file.tellg());
+  return kStatusSuccess;
+}
+
+// Ported from main.c's EXP_COMMAND_SD_SKIP_VALUES case: window[0]=channel,
+// window[1..2]=count (2-byte BE). Advances the channel's read position
+// past that many whole chunks without transferring their content --
+// reads each chunk's own tag/length bytes only, using them to compute how
+// far to seek. If the channel runs out before finishing the count, the
+// read position is left completely unchanged (all-or-nothing) and
+// kStatusError is returned -- SDSKIP# (rom.asm) raises a real ERROR 40
+// for that.
+uint8_t ExpansionMock::skipSdValues(std::vector<uint8_t>& window) {
+  if (window.size() < 3) return kStatusError;
+  uint8_t channel = window[0];
+  if (channel < 1 || channel > kMaxSdChannels) return kStatusError;
+  SdChannel& ch = channels_[channel - 1];
+  if (!ch.isOpen) return kStatusError;
+  uint16_t count = (static_cast<uint16_t>(window[1]) << 8) | window[2];
+
+  uint32_t pos = ch.readPos;
+  for (uint16_t i = 0; i < count; i++) {
+    ch.file.clear();
+    ch.file.seekg(static_cast<std::streamoff>(pos), std::ios::beg);
+    char tag = 0;
+    ch.file.read(&tag, 1);
+    if (ch.file.gcount() != 1) return kStatusError;  // ran out -- readPos left unchanged
+    if (tag == 'N') {
+      pos += 1 + 8;
+    } else if (tag == 'S') {
+      char lenByte = 0;
+      ch.file.read(&lenByte, 1);
+      if (ch.file.gcount() != 1) return kStatusError;
+      pos += 1 + 1 + static_cast<uint8_t>(lenByte);
+    } else {
+      return kStatusError;  // corrupt file
+    }
+  }
+  ch.readPos = pos;
+  return kStatusSuccess;
 }
 
 // Ported from main.c's EXP_COMMAND_GET_SD_DF_TEXT case: pre-rendered
