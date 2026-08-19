@@ -300,8 +300,10 @@ void testExtensionRam4800WindowSizesGateMappedRange() {
   pc1500::Keyboard kb;
   pc1500::Bus bus(kb);
   // Off by default -- matches the no-module behavior every other test
-  // above already assumes.
-  CHECK(bus.extRam4800Size() == 0);
+  // above already assumes. Default machine variant is PC1500, so the
+  // expansion window's base is 4800H and its full span is 10K -- see
+  // testExtensionWindowFollowsMachineVariant below for the PC-1500A case.
+  CHECK(bus.extRamExtSize() == 0);
   CHECK(bus.readME0(0x4800) == 0xFF);
   bus.writeME0(0x4800, 0x42);
   CHECK(bus.readME0(0x4800) == 0xFF);  // write ignored while disabled
@@ -309,7 +311,7 @@ void testExtensionRam4800WindowSizesGateMappedRange() {
   // A partial (4K) module only maps the start of the window -- the rest
   // stays unmapped, matching a physically smaller module not filling its
   // whole socket.
-  bus.setExtRam4800Size(0x1000);
+  bus.setExtRamExtSize(0x1000);
   bus.writeME0(0x4800, 0x42);
   CHECK(bus.readME0(0x4800) == 0x42);
   bus.writeME0(0x57FF, 0x11);  // last byte of the 4K module (4800H + 1000H - 1)
@@ -320,16 +322,16 @@ void testExtensionRam4800WindowSizesGateMappedRange() {
 
   // Growing to the full 10K window maps the rest too, without disturbing
   // what was already there.
-  bus.setExtRam4800Size(pc1500::Bus::kExtRam4800WindowSize);
+  bus.setExtRamExtSize(bus.extRamExtWindowMaxSize());
   CHECK(bus.readME0(0x4800) == 0x42);  // preserved from the 4K-module write above
   bus.writeME0(0x6FFF, 0x99);          // last byte of the full 10K window
   CHECK(bus.readME0(0x6FFF) == 0x99);
   CHECK(bus.readME0(0x7000) == 0xFF);  // one past the window -- untouched, still its own default
 
   // Shrinking back to disabled doesn't clear the underlying bytes.
-  bus.setExtRam4800Size(0);
+  bus.setExtRamExtSize(0);
   CHECK(bus.readME0(0x4800) == 0xFF);  // reads as unmapped again
-  bus.setExtRam4800Size(pc1500::Bus::kExtRam4800WindowSize);
+  bus.setExtRamExtSize(bus.extRamExtWindowMaxSize());
   CHECK(bus.readME0(0x4800) == 0x42);  // but the byte was preserved underneath
 }
 
@@ -416,16 +418,187 @@ void testCe163IsMutuallyExclusiveWithOtherExtensionRam() {
   CHECK(bus.ce163Enabled() == true);
   CHECK(bus.extRam0000Size() == 0);  // cleared by enabling CE-163
 
-  bus.setExtRam4800Size(pc1500::Bus::kExtRam4800WindowSize);
-  CHECK(bus.extRam4800Size() == pc1500::Bus::kExtRam4800WindowSize);
-  CHECK(bus.ce163Enabled() == false);  // cleared by setting a nonzero 4800H size
+  bus.setExtRamExtSize(bus.extRamExtWindowMaxSize());
+  CHECK(bus.extRamExtSize() == bus.extRamExtWindowMaxSize());
+  CHECK(bus.ce163Enabled() == false);  // cleared by setting a nonzero expansion-window size
 
   bus.setCe163Enabled(true);
   CHECK(bus.ce163Enabled() == true);
-  CHECK(bus.extRam4800Size() == 0);  // cleared by enabling CE-163 again
+  CHECK(bus.extRamExtSize() == 0);  // cleared by enabling CE-163 again
 
   bus.setExtRam0000Size(pc1500::Bus::kExtRam0000WindowSize);
   CHECK(bus.ce163Enabled() == false);  // cleared by setting a nonzero 0000H size
+}
+
+// Regression test for a real bug: selecting "None" (bytes == 0) in the
+// Extension RAM (0000H) submenu is itself one of the four mutually-
+// exclusive alternatives in that same submenu, so it must clear
+// CE-163/CE-155 too -- not just nonzero sizes. Before this fix,
+// setExtRam0000Size only cleared the other two on bytes != 0, so
+// setExtRam0000Size(0) while CE-163 was enabled left CE-163 (and its
+// gating of the 0000H window via isUnmapped()'s !ce163Enabled_ check)
+// silently in effect -- confirmed live: the "None" menu item appeared to
+// do nothing while CE-163 was active.
+void testExtRam0000SizeZeroClearsCe163AndCe155() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+
+  bus.setCe163Enabled(true);
+  CHECK(bus.ce163Enabled() == true);
+  bus.setExtRam0000Size(0);
+  CHECK(bus.ce163Enabled() == false);  // "None" must turn CE-163 back off
+  CHECK(bus.extRam0000Size() == 0);
+
+  bus.setCe155Enabled(true);
+  CHECK(bus.ce155Enabled() == true);
+  bus.setExtRam0000Size(0);
+  CHECK(bus.ce155Enabled() == false);  // same for CE-155
+  CHECK(bus.extRam0000Size() == 0);
+}
+
+// Same as above, but for the fourth mutually-exclusive option, CE-155 --
+// and confirming CE-163/CE-155 clear *each other* too (not just the two
+// plain-size windows), completing the four-way exclusion web.
+void testCe155IsMutuallyExclusiveWithOtherExtensionRam() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+
+  bus.setExtRam0000Size(pc1500::Bus::kExtRam0000WindowSize);
+  bus.setCe155Enabled(true);
+  CHECK(bus.ce155Enabled() == true);
+  CHECK(bus.extRam0000Size() == 0);  // cleared by enabling CE-155
+
+  bus.setExtRamExtSize(bus.extRamExtWindowMaxSize());
+  CHECK(bus.ce155Enabled() == false);  // cleared by setting a nonzero expansion-window size
+
+  bus.setCe155Enabled(true);
+  CHECK(bus.extRamExtSize() == 0);  // cleared by enabling CE-155 again
+
+  bus.setCe163Enabled(true);
+  CHECK(bus.ce163Enabled() == true);
+  CHECK(bus.ce155Enabled() == false);  // cleared by enabling CE-163
+
+  bus.setCe155Enabled(true);
+  CHECK(bus.ce155Enabled() == true);
+  CHECK(bus.ce163Enabled() == false);  // cleared by enabling CE-155 again
+}
+
+// PC-1500A: built-in RAM grows from 2K to 6K (absorbing what would
+// otherwise be the expansion window's own first 4K), and the expansion
+// window itself shrinks from 10K to 6K, based at 5800H instead of 4800H
+// -- see Bus::extRamExtBase()'s own comment for the full derivation.
+void testExtensionWindowFollowsMachineVariant() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  bus.setMachineVariant(pc1500::Bus::MachineVariant::PC1500A);
+  CHECK(bus.extRamExtBase() == 0x5800);
+  CHECK(bus.extRamExtWindowMaxSize() == 0x1800);  // 6K
+
+  // 4800H-57FFH is now built-in RAM (the PC-1500A's extra 4K), always
+  // mapped regardless of extRamExtSize_ -- unlike on a stock PC-1500,
+  // where this same range is gated by the expansion window's own size
+  // (see testExtensionRam4800WindowSizesGateMappedRange above).
+  CHECK(bus.readME0(0x4800) == 0xFF);  // mapped, just at its 0xFF power-up default
+  bus.writeME0(0x4800, 0x42);
+  CHECK(bus.readME0(0x4800) == 0x42);
+  bus.writeME0(0x57FF, 0x11);  // last byte of the built-in 6K
+  CHECK(bus.readME0(0x57FF) == 0x11);
+
+  // 5800H is the expansion window's own base now -- gated by
+  // extRamExtSize_, same as 4800H would be on a stock PC-1500.
+  CHECK(bus.readME0(0x5800) == 0xFF);  // unmapped (0 bytes configured)
+  bus.writeME0(0x5800, 0x99);
+  CHECK(bus.readME0(0x5800) == 0xFF);  // write ignored while disabled
+
+  bus.setExtRamExtSize(bus.extRamExtWindowMaxSize());  // 6K, the full window
+  bus.writeME0(0x5800, 0x99);
+  CHECK(bus.readME0(0x5800) == 0x99);
+  bus.writeME0(0x6FFF, 0x77);  // last byte of the 6K window
+  CHECK(bus.readME0(0x6FFF) == 0x77);
+  CHECK(bus.readME0(0x7000) == 0xFF);  // one past the window -- untouched (fixed peripheral region)
+}
+
+// A real regression risk: the CE-163 trigger range must move with the
+// machine variant, and the PC-1500's own range must stop firing once a
+// PC-1500A is selected (not just "also respond to the new range").
+void testCe163TriggerRangeFollowsMachineVariant() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  bus.setMachineVariant(pc1500::Bus::MachineVariant::PC1500A);
+  bus.setCe163Enabled(true);
+  CHECK(bus.ce163Bank() == 0);
+
+  // The PC-1500's own trigger range (5800H-5FFFH) must NOT fire once the
+  // variant is PC-1500A.
+  bus.writeME0(0x5801, 0x00);  // odd address -- would select bank 1 on a PC-1500
+  CHECK(bus.ce163Bank() == 0);  // unchanged
+
+  // The PC-1500A's own trigger range (6800H-6FFFH) does fire.
+  bus.writeME0(0x6801, 0x00);  // odd address -- selects bank 1
+  CHECK(bus.ce163Bank() == 1);
+  bus.writeME0(0x6800, 0x00);  // even address -- selects bank 0
+  CHECK(bus.ce163Bank() == 0);
+}
+
+// CE-155's real hardware topology isolates just the top 2K of the
+// 0000H-3FFFH window (3800H-3FFFH), unlike the generic 0000H-window
+// (always left-aligned from 0000H) -- confirmed for both machine
+// variants, since only the *expansion*-window half of CE-155 moves.
+void testCe155IsolatesOnlyTopOfLowerWindow() {
+  for (pc1500::Bus::MachineVariant variant :
+       {pc1500::Bus::MachineVariant::PC1500, pc1500::Bus::MachineVariant::PC1500A}) {
+    pc1500::Keyboard kb;
+    pc1500::Bus bus(kb);
+    bus.setMachineVariant(variant);
+    bus.setCe155Enabled(true);
+
+    CHECK(bus.readME0(0x0000) == 0xFF);
+    bus.writeME0(0x0000, 0x42);
+    CHECK(bus.readME0(0x0000) == 0xFF);  // write ignored -- not part of CE-155's real topology
+    CHECK(bus.readME0(0x37FF) == 0xFF);
+    bus.writeME0(0x37FF, 0x42);
+    CHECK(bus.readME0(0x37FF) == 0xFF);
+
+    bus.writeME0(0x3800, 0x11);
+    CHECK(bus.readME0(0x3800) == 0x11);
+    bus.writeME0(0x3FFF, 0x22);
+    CHECK(bus.readME0(0x3FFF) == 0x22);
+
+    // The expansion window is filled to exactly 6K, at whichever base
+    // this variant uses.
+    uint16_t base = bus.extRamExtBase();
+    bus.writeME0(base, 0x33);
+    CHECK(bus.readME0(base) == 0x33);
+    uint16_t lastByte = static_cast<uint16_t>(base + 0x1800 - 1);  // last byte of the 6K
+    bus.writeME0(lastByte, 0x44);
+    CHECK(bus.readME0(lastByte) == 0x44);
+    // One past CE-155's own 6K -- on a stock PC-1500 (10K window), this
+    // is still inside the window but beyond what CE-155 itself uses, so
+    // it stays unmapped; on a PC-1500A the window IS exactly 6K, so
+    // there's nothing further to check within it.
+    uint16_t onePast = static_cast<uint16_t>(base + 0x1800);
+    if (onePast <= 0x6FFF) {
+      CHECK(bus.readME0(onePast) == 0xFF);
+    }
+  }
+}
+
+// Switching variants can't silently leave an out-of-range expansion-
+// window size selected (e.g. 10K chosen on a PC-1500, then switching to
+// a PC-1500A's 6K-max window).
+void testMachineVariantClampsExtRamExtSize() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  bus.setExtRamExtSize(bus.extRamExtWindowMaxSize());  // 10K, full PC-1500 window
+  CHECK(bus.extRamExtSize() == 0x2800);
+
+  bus.setMachineVariant(pc1500::Bus::MachineVariant::PC1500A);
+  CHECK(bus.extRamExtSize() == 0x1800);  // clamped down to the new 6K max
+
+  // A size already within the new max is left untouched.
+  bus.setExtRamExtSize(0x1000);
+  bus.setMachineVariant(pc1500::Bus::MachineVariant::PC1500);
+  CHECK(bus.extRamExtSize() == 0x1000);
 }
 
 // Unlike a plain loadrommodule-style module (testRomIsReadOnly-equivalent
@@ -727,6 +900,12 @@ int main() {
   testExtensionRam0000WindowSizeGatesMappedRange();
   testCe163BankSwitchingKeepsBanksIndependent();
   testCe163IsMutuallyExclusiveWithOtherExtensionRam();
+  testExtRam0000SizeZeroClearsCe163AndCe155();
+  testCe155IsMutuallyExclusiveWithOtherExtensionRam();
+  testExtensionWindowFollowsMachineVariant();
+  testCe163TriggerRangeFollowsMachineVariant();
+  testCe155IsolatesOnlyTopOfLowerWindow();
+  testMachineVariantClampsExtRamExtSize();
   testExpansionModuleDataWindowIsReadWrite();
   testExpansionModuleListSdDirReflectsRealDirectory();
   testExpansionModuleWithNoRootDirReportsError();

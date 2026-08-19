@@ -165,23 +165,39 @@ native OS menu) sits above the display:
   Load has an optional "call after load" checkbox (sets the CPU's `P`
   register to the loaded address, like a hand-triggered `CALL`). Useful
   for loading `sdas`/SDCC-assembled output directly for testing.
-- **Settings > Extension RAM (4800H)** — None (default) / 4K / 8K / 10K of
-  emulated module RAM at `4800H`. 4K/8K were the real 1982-era hardware
-  options; 10K is the window's full physical span (`4800H`-`6FFFH`) --
-  not a real period-correct module, but easy to emulate. Mutually
-  exclusive with CE-163 below (a real PC-1500 has one expansion port, and
-  CE-163's own bank-select range physically overlaps this window) --
-  selecting a size here turns CE-163 off, and vice versa.
+- **Settings > Base Unit** — PC-1500 (default) or **PC-1500A**. The 'A'
+  variant has 6K of built-in user RAM at `4000H`-`57FFH` instead of 2K
+  (`4000H`-`47FFH`), because the 40-pin expansion port is wired
+  differently (S1/S2/S3 shift to S3/S4/S5), which also shifts every
+  expansion-RAM chip-select 1000H higher — see the two submenus below.
+  Only takes effect on the next reset/cold-start, same as the Extension
+  RAM options.
+- **Settings > Extension RAM (expansion window)** — None (default) / 4K
+  (**CE-151**) / 6K / 8K / 10K (full window) / **CE-155** (a real
+  1982-era 8K module, split across both windows: 6K filling this window
+  plus 2K isolated at exactly `3800H`-`3FFFH` in the 0000H window below —
+  listed here since most of its capacity lives in this window) of
+  emulated module RAM at the expansion window. The window is based at
+  `4800H` on a PC-1500 (max 10K, up to `6FFFH`) or `5800H` on a PC-1500A
+  (max 6K, same `6FFFH` upper bound — the menu only offers up to 6K
+  there). CE-151 (4K) was the real 1982-era hardware option; the other
+  plain sizes aren't real period-correct modules, but are easy to emulate
+  and physically possible with modern RAM. Mutually exclusive with
+  CE-163 below (a real PC-1500(A) has one expansion port, and CE-163's
+  own bank-select range physically overlaps this window) — selecting a
+  size (or CE-155) here turns CE-163 off, and vice versa.
 - **Settings > Extension RAM (0000H)** — None (default) / 16K (synthetic;
   not a real 1982-era option, just easy headroom) / **CE-163** (a real
   1982-era module: 32K of RAM, banked two 16K halves at a time into this
-  same `0000H`-`3FFFH` window). Bank selection on a real PC-1500 is a pure
-  write-triggered address-line latch at `5800H`-`5FFFH` — writing to an
-  *even* address there selects bank 0, an *odd* address selects bank 1;
-  the byte value written doesn't matter, and nothing is actually stored at
-  that address. (Wired to a different expansion-port pin/address range on
-  a PC-1500A — not emulated, since pc1500emu doesn't model a PC-1500A at
-  all yet.)
+  same `0000H`-`3FFFH` window). Bank selection for CE-163 on a real
+  PC-1500 is a pure write-triggered address-line latch at
+  `5800H`-`5FFFH` (`6800H`-`6FFFH` on a PC-1500A, per the expansion-port
+  rewiring above) — writing to an *even* address there selects bank 0, an
+  *odd* address selects bank 1; the byte value written doesn't matter, and
+  nothing is actually stored at that address. When CE-155 (above) is
+  active, this submenu shows a disabled note instead of a selectable
+  item, since CE-155's own toggle lives in the expansion-window submenu —
+  this window only hosts its remaining isolated 2K at `3800H`-`3FFFH`.
 - **Settings > Automation Mode** — when checked, real host keyboard input
   (typing, arrow keys, F-keys, etc.) is ignored entirely; only the
   scriptable command interface below can drive the emulator. An orange
@@ -247,15 +263,22 @@ Commands:
 - `peek <addr>` / `poke <addr> <val>` — addresses and values in hex.
 - `dump <start> <end>` — hex bytes, 16 per line, address-prefixed.
 - `reset` — same as Ctrl+F12; re-runs `CPU::reset()` without touching RAM.
-  Needed after `setextram`/`setce163` below, since the ROM only detects
-  installed extension RAM at reset/cold-start, not on the fly (see "When
-  'adding' RAM" above).
+  Needed after `setmachine`/`setextram`/`setce163`/`setce155` below, since
+  the ROM only detects the base unit's RAM shape and installed extension
+  RAM at reset/cold-start, not on the fly (see "When 'adding' RAM" above).
+- `setmachine <1500|1500a>` — FIFO equivalent of Settings > Base Unit.
+  Affects how `setextram ext`'s window is interpreted (see that section
+  above), so send this first if changing both.
 - `setextram <window> <bytes>` — FIFO equivalent of the Settings >
-  Extension RAM menu items. `<window>` is `4800` or `0000`; `<bytes>` is
-  decimal.
+  Extension RAM menu items. `<window>` is `ext` (the expansion window —
+  `4800H`-based on a PC-1500, `5800H`-based on a PC-1500A) or `0000`;
+  `<bytes>` is decimal.
 - `setce163 <0|1>` — FIFO equivalent of Settings > Extension RAM (0000H) >
-  CE-163 (see that section above). Mutually exclusive with `setextram` —
-  enabling one clears the other.
+  CE-163 (see that section above). Mutually exclusive with `setextram` and
+  `setce155` — enabling one clears the others.
+- `setce155 <0|1>` — FIFO equivalent of Settings > Extension RAM (0000H) >
+  CE-155 (see that section above). Mutually exclusive with `setextram` and
+  `setce163`, same as `setce163` above.
 - `status` — CPU registers/flags and the fixed-segment indicator bits.
 - `display` — the 156x7 dot matrix as ASCII art (`#`/`.`).
 - `displaytext` — the ROM's own LCD text buffer (`7BB0H`-`7BFFH`, per the
@@ -549,20 +572,22 @@ running (or debugged) program without leaving the editor:
   session the same way F5 would (see Debugger below) — you're asked
   whether to attach to a running instance or launch a fresh one.
   A *freshly-launched* instance (never one you're attaching to) also
-  picks up `lh5801.extRam4800Bytes`/`lh5801.extRam0000Bytes` (extension
-  RAM — many real programs, e.g. anything using `printf()`, need more
-  than the base 2KB) and `lh5801.preloadRomModules` (auxiliary ROM
-  modules, e.g. a CE-150/158, loaded before the main program). Non-zero
-  extension RAM forces that launch to boot cold (`--no-state`) — the
-  size is only detected by the ROM on a fresh boot, not a state restore.
+  picks up `lh5801.extRamExtBytes`/`lh5801.extRam0000Bytes`/
+  `lh5801.isPC1500A` (extension RAM and base unit — many real programs,
+  e.g. anything using `printf()`, need more than the base 2KB) and
+  `lh5801.preloadRomModules` (auxiliary ROM modules, e.g. a CE-150/158,
+  loaded before the main program). Any of the RAM/variant settings being
+  non-default forces that launch to boot cold (`--no-state`) — they're
+  only detected by the ROM on a fresh boot, not a state restore.
 
 Opening this repo in VS Code also picks up:
 - `.vscode/settings.json` — associates `*.asm`/`*.s` with the extension's
   grammar (scoped to this project only), and holds `lh5801.disasmCommand`,
   `lh5801.sdasCommand` (below), and the `lh5801.linkCommand`/
   `lh5801.makebinCommand`/`lh5801.buildCCommand`/`lh5801.emulatorPath`/
-  `lh5801.romPath`/`lh5801.extRam4800Bytes`/`lh5801.extRam0000Bytes`/
-  `lh5801.preloadRomModules` settings the commands above use.
+  `lh5801.romPath`/`lh5801.extRamExtBytes`/`lh5801.extRam0000Bytes`/
+  `lh5801.isPC1500A`/`lh5801.preloadRomModules` settings the commands
+  above use.
 - `.vscode/tasks.json` — a build task (`Ctrl+Shift+B`) that runs
   `sdaslh5801` on the active file and reports errors in the Problems panel.
   Fill in `lh5801.sdasCommand` in `settings.json` with your own built

@@ -624,6 +624,32 @@ class Bus : public lh5801::MemoryBus {
   void setPv(bool v) override { pv_ = v; }
   void setPu(bool v) override { pu_ = v; }
 
+  // PC-1500 vs PC-1500A base unit -- see docs/pc1500_hardware_reference.md's
+  // "PC-1500A" section for the full derivation. The PC-1500A has 6K of
+  // built-in user RAM at 4000H instead of 2K, and its 40-pin expansion
+  // port is rewired (S1/S2/S3 -> S3/S4/S5) so every expansion-RAM
+  // chip-select lands 1000H higher than the same physical module would on
+  // a stock PC-1500. Defaults to PC1500 (stock hardware). Changing this
+  // clamps extRamExtSize_ down to the new variant's own
+  // extRamExtWindowMaxSize() if it's currently too big for the new
+  // window (e.g. 10K selected, then switching to PC-1500A's 6K-max
+  // window) -- everything else (isUnmapped/writeME0's CE-163 trigger)
+  // reads the variant live via extRamExtBase(), so there's no other
+  // "recompute on change" step needed. Only takes effect at the next
+  // reset/cold-start, same as the extension-RAM sizes below -- the ROM's
+  // own boot-time scan is what actually discovers how much RAM is
+  // installed; this class does no detection of its own.
+  enum class MachineVariant { PC1500, PC1500A };
+  void setMachineVariant(MachineVariant v) {
+    machineVariant_ = v;
+    // Not std::min -- some translation units (state_roundtrip_test.cpp)
+    // include <windows.h> without NOMINMAX first, whose own min/max
+    // macros silently mangle std::min's own name at the call site.
+    size_t maxSize = extRamExtWindowMaxSize();
+    if (extRamExtSize_ > maxSize) extRamExtSize_ = maxSize;
+  }
+  MachineVariant machineVariant() const { return machineVariant_; }
+
   // Emulated module RAM, two independent regions/windows -- see
   // docs/pc1500_hardware_reference.md's memory map. Both off (size 0) by
   // default, matching stock hardware with no module installed. Size is in
@@ -633,57 +659,111 @@ class Bus : public lh5801::MemoryBus {
   // Changing the size doesn't clear underlying bytes, so shrinking and
   // growing back preserves whatever was there.
   //
-  // 4800H-6FFFH window (2K module RAM slot, up to 10K span): real 1982
-  // hardware options were 4K or 8K here; 10K (the window's full physical
-  // span) wasn't a real period-correct module but is easy to emulate and
-  // physically possible with denser modern RAM.
+  // Expansion window (2K module RAM slot): 4800H-6FFFH on a PC-1500 (up
+  // to 10K span; real 1982 hardware options were 4K or 8K here, CE-151
+  // and an unreleased 8K variant respectively -- 10K, the window's full
+  // physical span, wasn't a real period-correct module but is easy to
+  // emulate and physically possible with denser modern RAM), or
+  // 5800H-6FFFH on a PC-1500A (up to 6K span only -- the PC-1500A's extra
+  // 4K of built-in RAM already absorbs what would otherwise be the
+  // window's own first 4K, and its upper bound stays 6FFFH either way
+  // since 7000H+ is fixed onboard hardware the expansion-port rewiring
+  // doesn't touch). See extRamExtBase()/extRamExtWindowMaxSize().
   //
-  // Mutually exclusive with the CE-163 (see setCe163Enabled's own comment
-  // below) -- a real PC-1500 has one expansion port, and the CE-163's own
-  // bank-select range (5800H-5FFFH) physically overlaps this window.
-  static constexpr size_t kExtRam4800WindowSize = 0x2800;  // 10K
-  void setExtRam4800Size(size_t bytes) {
-    extRam4800Size_ = bytes;
-    if (bytes != 0) ce163Enabled_ = false;
+  // Mutually exclusive with CE-163 and CE-155 (see their own setters
+  // below) -- a real PC-1500(A) has one expansion port, so at most one of
+  // these can be physically installed at a time.
+  void setExtRamExtSize(size_t bytes) {
+    extRamExtSize_ = bytes;
+    if (bytes != 0) {
+      ce163Enabled_ = false;
+      ce155Enabled_ = false;
+    }
   }
-  size_t extRam4800Size() const { return extRam4800Size_; }
+  size_t extRamExtSize() const { return extRamExtSize_; }
+  // Base address of the expansion window for the current machine variant
+  // -- 4800H (PC-1500) or 5800H (PC-1500A). Public so callers (the
+  // Settings menu, tests) can label/verify addresses without duplicating
+  // the variant check.
+  uint16_t extRamExtBase() const {
+    return machineVariant_ == MachineVariant::PC1500A ? 0x5800 : 0x4800;
+  }
+  // Full physical span of the expansion window for the current variant --
+  // 10K (PC-1500) or 6K (PC-1500A). Not a static constexpr (unlike
+  // kExtRam0000WindowSize below) since it depends on machineVariant_.
+  size_t extRamExtWindowMaxSize() const { return 0x7000 - extRamExtBase(); }
 
   // 0000H-3FFFH window (option user memory slot, up to 16K span): not a
   // real 1982-era option at all (nothing plugged in there back then), but
-  // physically possible now and worth emulating for headroom.
+  // physically possible now and worth emulating for headroom. Unaffected
+  // by machine variant -- the PC-1500A's expansion-port rewiring only
+  // touches the S1/S2/S3 signals the *other* window's chip-selects are
+  // built from, not this one.
   //
-  // Mutually exclusive with the CE-163 (see setCe163Enabled's own comment
-  // below) -- both occupy this exact same window.
+  // Mutually exclusive with CE-163 and CE-155 (see their own setters
+  // below) -- all three occupy this exact same window.
   static constexpr size_t kExtRam0000WindowSize = 0x4000;  // 16K
   void setExtRam0000Size(size_t bytes) {
     extRam0000Size_ = bytes;
-    if (bytes != 0) ce163Enabled_ = false;
+    // Unconditional, unlike setExtRamExtSize's own clearing below: None,
+    // 16K, CE-163, and CE-155 are four mutually-exclusive alternatives
+    // *within this one window/submenu*, so selecting "None" (bytes == 0)
+    // must deactivate CE-163/CE-155 too, not just leave a nonzero size in
+    // place. Before this fix, bytes == 0 skipped the clear entirely, so
+    // selecting "None" while CE-163 was enabled did nothing -- the window
+    // stayed banked, since isUnmapped()'s 0000H-window check gates on
+    // !ce163Enabled_ regardless of extRam0000Size_.
+    ce163Enabled_ = false;
+    ce155Enabled_ = false;
   }
   size_t extRam0000Size() const { return extRam0000Size_; }
 
   // CE-163: a real 1982-era module, 32K of RAM banked into the 0000H-3FFFH
   // window two 16K banks at a time (only one bank visible at once). Bank
   // selection is a pure address-line trigger on real hardware: any WRITE
-  // to 5800H-5FFFH selects bank 0 (even address) or bank 1 (odd address)
+  // to a 2K range selects bank 0 (even address) or bank 1 (odd address)
   // -- the byte value written is irrelevant, and nothing is actually
-  // stored at 5800H-5FFFH itself (see Bus::writeME0). This is the
-  // PC-1500's own wiring (pin 18 = S3); a PC-1500A wires the same pin to
-  // S5 instead, which would need a different trigger range -- pc1500emu
-  // doesn't emulate a PC-1500A yet, so only the PC-1500 wiring is modeled.
+  // stored there (see Bus::writeME0). That trigger range is itself
+  // machine-variant-dependent, same underlying reason as the expansion
+  // window above: 5800H-5FFFH on a PC-1500 (pin 18 = S3), or
+  // 6800H-6FFFH on a PC-1500A (same physical pin, now wired to S5).
   //
-  // Mutually exclusive with both extension-RAM windows above (enabling
-  // this clears them; setting either of them back to nonzero disables
-  // this) -- real hardware has one expansion port, so at most one of these
-  // three can be physically installed at a time.
+  // Mutually exclusive with both extension-RAM windows above and CE-155
+  // below (enabling this clears all three; any of them going active
+  // disables this) -- real hardware has one expansion port, so at most
+  // one of these four can be physically installed at a time.
   void setCe163Enabled(bool enabled) {
     ce163Enabled_ = enabled;
     if (enabled) {
       extRam0000Size_ = 0;
-      extRam4800Size_ = 0;
+      extRamExtSize_ = 0;
+      ce155Enabled_ = false;
     }
   }
   bool ce163Enabled() const { return ce163Enabled_; }
   uint8_t ce163Bank() const { return ce163Bank_; }
+
+  // CE-155: a real 1982-era 8K module, split across both windows above --
+  // 2K at exactly 3800H-3FFFH (the *top* of the 0000H-3FFFH window, not
+  // its base -- real hardware isolates just this 2K, unlike the generic
+  // 0000H-window size above which is always left-aligned from 0000H) plus
+  // 6K filling the entire expansion window (4800H-5FFFH on a PC-1500,
+  // 5800H-6FFFH on a PC-1500A). Confirmed live this session: this genuine
+  // 3800H isolation is what lets BASIC's own boot-time RAM scan compute
+  // the real CE-155 program-start origin (38C5H) instead of the stock
+  // unit's 40C5H -- see docs/pc1500_hardware_reference.md.
+  //
+  // Mutually exclusive with both extension-RAM windows and CE-163 (see
+  // their own setters) -- same one-expansion-port reasoning.
+  void setCe155Enabled(bool enabled) {
+    ce155Enabled_ = enabled;
+    if (enabled) {
+      extRam0000Size_ = 0;
+      extRamExtSize_ = 0;
+      ce163Enabled_ = false;
+    }
+  }
+  bool ce155Enabled() const { return ce155Enabled_; }
 
   // Wraps Keyboard::setKeyState. The actual release is deferred by
   // kMinimumHoldCycles (see applyRelease) rather than applied immediately,
@@ -736,8 +816,9 @@ class Bus : public lh5801::MemoryBus {
 
   // Session state save/load -- narrow scope: RAM contents
   // (me0_[0x0000,0x8000) only -- covers both extension-RAM windows, the
-  // built-in 2K RAM, and the LCD buffer/system RAM/their mirrors, all
-  // backed by the same array), extension-RAM window sizes, and all four ROM
+  // built-in 2K-or-6K RAM, and the LCD buffer/system RAM/their mirrors,
+  // all backed by the same array), extension-RAM window sizes, the
+  // machine variant and CE-155 flag (version 5+), and all four ROM
   // module slots (raw bytes + base/requirePv/usePuBank -- module ROM isn't
   // stored in me0_ at all, see RomModule::tryRead). Deliberately excludes
   // 0x8000H-0xFFFFH (module-ROM range isn't backed by me0_; the base
@@ -766,12 +847,25 @@ class Bus : public lh5801::MemoryBus {
   // setCe163Enabled) -- the CE-163 has its own separate backing store
   // (ce163Ram_), read/written directly in readME0/writeME0, not gated by
   // this size check at all.
+  //
+  // ce155Enabled_ short-circuits both windows to CE-155's own fixed,
+  // real topology instead of the generic size-gated checks: the 0000H
+  // window is mapped ONLY at its top 2K (3800H-3FFFH, unlike the generic
+  // left-aligned-from-0000H check below), and the expansion window is
+  // mapped for exactly 6K from its (variant-dependent) base -- see
+  // setCe155Enabled's own comment.
   bool isUnmapped(uint16_t addr) const {
     bool in0000Window = addr <= 0x3FFF;
-    bool in4800Window = addr >= 0x4800 && addr <= 0x6FFF;
+    uint16_t extBase = extRamExtBase();
+    bool inExtWindow = addr >= extBase && addr <= 0x6FFF;
+    if (ce155Enabled_) {
+      if (in0000Window) return !(addr >= 0x3800 && addr <= 0x3FFF);
+      if (inExtWindow) return (addr - extBase) >= 0x1800;  // 6K
+      return addr >= 0x8000 && addr <= 0xBFFF;              // CE-150/153/158 (not connected)
+    }
     return (in0000Window && addr >= extRam0000Size_ && !ce163Enabled_) ||  // beyond configured
                                                                             // 0000H module RAM
-           (in4800Window && (addr - 0x4800) >= extRam4800Size_) ||  // beyond configured 4800H module RAM
+           (inExtWindow && (addr - extBase) >= extRamExtSize_) ||  // beyond configured expansion RAM
            (addr >= 0x8000 && addr <= 0xBFFF);                // CE-150/153/158 (not connected)
   }
   // 7C00H-7FFFH is a duplicate of 7800H-7BFFH (the 1K system RAM) -- a
@@ -799,9 +893,11 @@ class Bus : public lh5801::MemoryBus {
   IoPortController io_;
   Keyboard& keyboard_;
   MemorySpace lastAccessedSpace_ = MemorySpace::ME0;
-  size_t extRam4800Size_ = 0;
+  MachineVariant machineVariant_ = MachineVariant::PC1500;
+  size_t extRamExtSize_ = 0;
   size_t extRam0000Size_ = 0;
   bool ce163Enabled_ = false;
+  bool ce155Enabled_ = false;
   uint8_t ce163Bank_ = 0;
   std::array<uint8_t, 0x8000> ce163Ram_{};  // 32K, two independent 16K banks back-to-back
   std::array<RomModule, kNumRomModules> romModules_;

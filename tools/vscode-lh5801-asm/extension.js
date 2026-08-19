@@ -451,23 +451,23 @@ async function pickLoadMode() {
 }
 
 // Resolves lh5801.emulatorPath/romPath plus the extension-RAM settings
-// (lh5801.extRam4800Bytes/extRam0000Bytes) into { emulatorPath, args }
-// for spawn() (Run) or the debug launch config's emulatorArgs (Debug).
-// When both extRAM settings are 0 (the default), this is just
-// [romPath] -- unchanged from before these settings existed. When
-// either is non-zero, a temp conf JSON is written (AppConfig's own
-// extRam4800Bytes/extRam0000Bytes fields, see
+// (lh5801.extRamExtBytes/extRam0000Bytes/isPC1500A) into { emulatorPath,
+// args } for spawn() (Run) or the debug launch config's emulatorArgs
+// (Debug). When extRAM settings are 0 and isPC1500A is false (all
+// defaults), this is just [romPath] -- unchanged from before these
+// settings existed. Otherwise a temp conf JSON is written (AppConfig's
+// own extRamExtBytes/extRam0000Bytes/isPC1500A fields, see
 // src/hoststate/app_config.h) and spawned via --conf/--no-state
 // instead: --no-state is required because that conf is only applied
 // "before cpu.reset() on a fresh boot", not a state restore (confirmed
 // via app_config.h's own comment), so without it a resumed saved state
-// could silently keep the old RAM size. Returns null (after reporting
-// the error) if emulatorPath is missing/doesn't exist, or if romPath is
-// blank while extRAM settings need it to build the conf's own romPath
-// field (Run alone tolerates a blank romPath in the unchanged case,
-// relying on the emulator's own default-conf-file discovery -- but that
-// discovery is bypassed entirely once --conf is given explicitly, so
-// this specific path has no fallback).
+// could silently keep the old RAM size/variant. Returns null (after
+// reporting the error) if emulatorPath is missing/doesn't exist, or if
+// romPath is blank while these settings need it to build the conf's own
+// romPath field (Run alone tolerates a blank romPath in the unchanged
+// case, relying on the emulator's own default-conf-file discovery --
+// but that discovery is bypassed entirely once --conf is given
+// explicitly, so this specific path has no fallback).
 async function resolveEmulatorLaunch(anchorUri) {
   const emulatorPath = resolveCommandSetting('lh5801.emulatorPath', anchorUri);
   if (!emulatorPath) {
@@ -481,22 +481,23 @@ async function resolveEmulatorLaunch(anchorUri) {
 
   const romPath = resolveCommandSetting('lh5801.romPath', anchorUri);
   const config = vscode.workspace.getConfiguration('lh5801');
-  const extRam4800Bytes = config.get('extRam4800Bytes', 0) || 0;
+  const extRamExtBytes = config.get('extRamExtBytes', 0) || 0;
   const extRam0000Bytes = config.get('extRam0000Bytes', 0) || 0;
+  const isPC1500A = config.get('isPC1500A', false) || false;
 
-  if (!extRam4800Bytes && !extRam0000Bytes) {
+  if (!extRamExtBytes && !extRam0000Bytes && !isPC1500A) {
     return { emulatorPath, args: romPath ? [romPath] : [] };
   }
 
   if (!romPath) {
-    await complainMissingSetting('lh5801.romPath', 'required to generate a --conf for lh5801.extRam4800Bytes/extRam0000Bytes.');
+    await complainMissingSetting('lh5801.romPath', 'required to generate a --conf for lh5801.extRamExtBytes/extRam0000Bytes/isPC1500A.');
     return null;
   }
 
   const confPath = path.join(os.tmpdir(), `pc1500emu-lh5801-${process.pid}-${Date.now()}.json`);
   fs.writeFileSync(
     confPath,
-    JSON.stringify({ romPath, extRam4800Bytes, extRam0000Bytes, autoLoadOnStart: false, autoSaveOnExit: false }, null, 2)
+    JSON.stringify({ romPath, extRamExtBytes, extRam0000Bytes, isPC1500A, autoLoadOnStart: false, autoSaveOnExit: false }, null, 2)
   );
   return { emulatorPath, args: ['--conf', confPath, '--no-state'] };
 }

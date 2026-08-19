@@ -1461,15 +1461,20 @@ int main(int argc, char** argv) {
     }
   }
   if (!stateRestored) {
-    // Must happen before this cpu.reset() -- see AppConfig::extRam4800Bytes'
-    // own comment. A restored state file already carries its own extRam
-    // sizes (Bus::loadState), so this is skipped in that branch.
-    bus.setExtRam4800Size(appConfig.extRam4800Bytes);
+    // Must happen before this cpu.reset() -- see AppConfig::isPC1500A's
+    // own comment. A restored state file already carries its own variant/
+    // extRam sizes (Bus::loadState), so this is skipped in that branch.
+    // Variant first -- the RAM fields below are interpreted relative to
+    // whichever variant is current (Bus::extRamExtBase()).
+    bus.setMachineVariant(appConfig.isPC1500A ? pc1500::Bus::MachineVariant::PC1500A
+                                               : pc1500::Bus::MachineVariant::PC1500);
+    bus.setExtRamExtSize(appConfig.extRamExtBytes);
     bus.setExtRam0000Size(appConfig.extRam0000Bytes);
-    // Last, so it deterministically wins if a hand-edited conf file somehow
-    // has a contradictory combination -- setCe163Enabled(true) itself
-    // clears the two sizes above right back to 0 (see its own comment).
     bus.setCe163Enabled(appConfig.ce163Enabled);
+    // Last, so it deterministically wins if a hand-edited conf file somehow
+    // has a contradictory combination -- setCe155Enabled(true) itself
+    // clears the two sizes and CE-163 right back off (see its own comment).
+    bus.setCe155Enabled(appConfig.ce155Enabled);
     cpu.reset();
   }
 
@@ -1792,30 +1797,56 @@ int main(int argc, char** argv) {
       // RAM size at reset/cold-start (see README's "adding RAM" note), not
       // on the fly.
       cpu.reset();
+    } else if (cmd == "setmachine") {
+      // FIFO equivalent of the Settings > Base Unit menu items. <variant>
+      // is "1500" or "1500a". Needs `reset` after, same as setextram --
+      // the ROM only detects the installed RAM shape at cold-start.
+      // Affects how setextram's own "ext" window is interpreted (see
+      // Bus::extRamExtBase()), so send this first if changing both.
+      std::string variant;
+      iss >> variant;
+      if (variant == "1500") {
+        bus.setMachineVariant(pc1500::Bus::MachineVariant::PC1500);
+      } else if (variant == "1500a") {
+        bus.setMachineVariant(pc1500::Bus::MachineVariant::PC1500A);
+      } else {
+        std::fprintf(stderr, "pc1500emu: setmachine variant must be 1500 or 1500a\n");
+      }
     } else if (cmd == "setextram") {
       // FIFO equivalent of the Settings > Extension RAM menu items, for
-      // headless setups that need more than the bare 2K (e.g. running a
-      // real expansion-module binary like BASWORD). <window> is "4800" or
-      // "0000"; <bytes> is decimal.
+      // headless setups that need more than the bare built-in RAM (e.g.
+      // running a real expansion-module binary like BASWORD). <window> is
+      // "ext" (the expansion window -- 4800H-based on a PC-1500,
+      // 5800H-based on a PC-1500A, see Bus::extRamExtBase()) or "0000";
+      // <bytes> is decimal.
       std::string window;
       long bytes = 0;
       iss >> window >> std::dec >> bytes;
-      if (window == "4800") {
-        bus.setExtRam4800Size(static_cast<size_t>(bytes));
+      if (window == "ext") {
+        bus.setExtRamExtSize(static_cast<size_t>(bytes));
       } else if (window == "0000") {
         bus.setExtRam0000Size(static_cast<size_t>(bytes));
       } else {
-        std::fprintf(stderr, "pc1500emu: setextram window must be 4800 or 0000\n");
+        std::fprintf(stderr, "pc1500emu: setextram window must be ext or 0000\n");
       }
     } else if (cmd == "setce163") {
       // FIFO equivalent of the Settings > Extension RAM (0000H) > CE-163
       // menu item. <enabled> is 0 or 1. Mutually exclusive with both
-      // setextram windows -- Bus::setCe163Enabled(true) clears them both;
-      // setextram with a nonzero size clears this back off (see each's own
-      // comment in bus.h). Needs `reset` after, same as setextram.
+      // setextram windows and CE-155 -- Bus::setCe163Enabled(true) clears
+      // them all; any of them going active clears this back off (see
+      // each's own comment in bus.h). Needs `reset` after, same as
+      // setextram.
       long enabled = 0;
       iss >> std::dec >> enabled;
       bus.setCe163Enabled(enabled != 0);
+    } else if (cmd == "setce155") {
+      // FIFO equivalent of the Settings > Extension RAM (0000H) > CE-155
+      // menu item. <enabled> is 0 or 1. Mutually exclusive with both
+      // setextram windows and CE-163, same as setce163 above. Needs
+      // `reset` after.
+      long enabled = 0;
+      iss >> std::dec >> enabled;
+      bus.setCe155Enabled(enabled != 0);
     } else if (cmd == "dump") {
       long start = 0, end = 0;
       iss >> std::hex >> start >> end;
@@ -2953,33 +2984,105 @@ int main(int argc, char** argv) {
       }
       if (ImGui::BeginMenu("Settings")) {
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
-        if (ImGui::BeginMenu("Extension RAM (4800H)")) {
+        if (ImGui::BeginMenu("Base Unit")) {
           if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
-          size_t cur = bus.extRam4800Size();
-          // Persisted to the conf file (AppConfig::extRam4800Bytes) so it
+          bool isA = bus.machineVariant() == pc1500::Bus::MachineVariant::PC1500A;
+          // Persisted to the conf file (AppConfig::isPC1500A) so it
+          // survives a restart -- only takes effect on the *next*
+          // reset/cold-start (see that field's own comment). Changes how
+          // every item in the two Extension RAM submenus below is
+          // interpreted (Bus::extRamExtBase()/extRamExtWindowMaxSize()),
+          // so set this first if also changing those in the same session.
+          auto setVariant = [&](pc1500::Bus::MachineVariant v) {
+            bus.setMachineVariant(v);
+            appConfig.isPC1500A = (v == pc1500::Bus::MachineVariant::PC1500A);
+            appConfig.extRamExtBytes = bus.extRamExtSize();  // may have been clamped
+            persistActiveConf();
+          };
+          if (ImGui::MenuItem("PC-1500", nullptr, !isA)) {
+            setVariant(pc1500::Bus::MachineVariant::PC1500);
+          }
+          if (ImGui::MenuItem("PC-1500A", nullptr, isA)) {
+            setVariant(pc1500::Bus::MachineVariant::PC1500A);
+          }
+          ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Extension RAM (expansion window)")) {
+          if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
+          size_t cur = bus.extRamExtSize();
+          uint16_t base = bus.extRamExtBase();
+          size_t maxSize = bus.extRamExtWindowMaxSize();
+          bool ce163 = bus.ce163Enabled();
+          bool ce155 = bus.ce155Enabled();
+          // Persisted to the conf file (AppConfig::extRamExtBytes) so it
           // survives a restart -- it only takes effect on the *next*
           // reset/cold-start either way (see that field's own comment), so
           // there's no live-apply subtlety to worry about here, just
           // remembering the choice.
-          auto setExtRam4800 = [&](size_t bytes) {
-            bus.setExtRam4800Size(bytes);
-            appConfig.extRam4800Bytes = bytes;
-            // Mutually exclusive with the CE-163 (see Bus::setCe163Enabled's
-            // own comment) -- Bus already cleared its side when bytes != 0;
-            // keep appConfig in sync so the conf file doesn't persist a
-            // contradictory combination.
-            if (bytes != 0) appConfig.ce163Enabled = false;
+          auto setExtRamExt = [&](size_t bytes) {
+            bus.setExtRamExtSize(bytes);
+            appConfig.extRamExtBytes = bytes;
+            // Mutually exclusive with CE-163/CE-155 (see
+            // Bus::setExtRamExtSize's own comment). Unconditional, same
+            // reasoning as Bus::setExtRam0000Size's own fix: "None"
+            // (bytes == 0) is itself one of this submenu's mutually-
+            // exclusive alternatives now that CE-155 lives here too, so
+            // it must clear CE-163/CE-155 as well, not just nonzero sizes
+            // -- a real PC-1500(A) has one expansion port, so "None"
+            // here means nothing at all is plugged into it.
+            appConfig.ce163Enabled = false;
+            appConfig.ce155Enabled = false;
             persistActiveConf();
           };
-          // Real 1982 hardware options were 4K/8K; 10K (the window's full
-          // physical span) wasn't a real period-correct module, but is
-          // easy to emulate and physically possible with modern RAM.
-          if (ImGui::MenuItem("None", nullptr, cur == 0)) setExtRam4800(0);
-          if (ImGui::MenuItem("4K", nullptr, cur == 0x1000)) setExtRam4800(0x1000);
-          if (ImGui::MenuItem("8K", nullptr, cur == 0x2000)) setExtRam4800(0x2000);
-          if (ImGui::MenuItem("10K (full window)", nullptr,
-                               cur == pc1500::Bus::kExtRam4800WindowSize)) {
-            setExtRam4800(pc1500::Bus::kExtRam4800WindowSize);
+          char label[80];
+          auto item = [&](const char* text, size_t bytes) {
+            if (bytes == 0) {
+              std::snprintf(label, sizeof(label), "%s", text);
+            } else {
+              std::snprintf(label, sizeof(label), "%s (%04XH-%04XH)", text, base,
+                             static_cast<unsigned>(base + bytes - 1));
+            }
+            // "None" needs the extra !ce163/!ce155 guard since both of
+            // those also leave extRamExtSize_ at 0 -- without it, "None"
+            // would show as checked even while CE-163/CE-155 is what's
+            // actually active. The nonzero sizes don't need this: both
+            // setters always leave extRamExtSize_ at exactly 0.
+            bool selected = (bytes == 0) ? (cur == 0 && !ce163 && !ce155) : (cur == bytes);
+            if (ImGui::MenuItem(label, nullptr, selected)) setExtRamExt(bytes);
+          };
+          // Real 1982 hardware options were 4K (CE-151) and 8K here, on a
+          // PC-1500 -- the landing address shifts 1000H higher on a
+          // PC-1500A (see Bus::extRamExtBase()), and the window's own
+          // full physical span shrinks from 10K to 6K accordingly (see
+          // Bus::extRamExtWindowMaxSize()). None of the "full window"
+          // sizes were real period-correct modules, but are easy to
+          // emulate and physically possible with modern RAM.
+          item("None", 0);
+          item("4K (CE-151)", 0x1000);
+          if (maxSize == 0x1800) {
+            item("6K (full window)", 0x1800);
+          } else {
+            item("6K", 0x1800);
+            item("8K", 0x2000);
+            item("10K (full window)", maxSize);
+          }
+          // CE-155: a real 1982-era 8K module, split across both windows --
+          // 6K filling this window plus 2K isolated at exactly 3800H-3FFFH
+          // in the 0000H window (see that submenu's own note when this is
+          // active). Listed here, not in the 0000H submenu, since most of
+          // its capacity (6K of 8K) lives in this window. See
+          // Bus::setCe155Enabled's own comment.
+          {
+            char ce155Label[48];
+            std::snprintf(ce155Label, sizeof(ce155Label), "CE-155 (8K: %04XH-6FFFH + 3800H)", base);
+            if (ImGui::MenuItem(ce155Label, nullptr, ce155)) {
+              bus.setCe155Enabled(true);
+              appConfig.ce155Enabled = true;
+              appConfig.extRam0000Bytes = 0;
+              appConfig.extRamExtBytes = 0;
+              appConfig.ce163Enabled = false;
+              persistActiveConf();
+            }
           }
           ImGui::EndMenu();
         }
@@ -2987,31 +3090,56 @@ int main(int argc, char** argv) {
           if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
           size_t cur = bus.extRam0000Size();
           bool ce163 = bus.ce163Enabled();
+          bool ce155 = bus.ce155Enabled();
           auto setExtRam0000 = [&](size_t bytes) {
             bus.setExtRam0000Size(bytes);
             appConfig.extRam0000Bytes = bytes;
-            if (bytes != 0) appConfig.ce163Enabled = false;
+            // Unconditional, matching Bus::setExtRam0000Size's own fix --
+            // None/16K/CE-163 are mutually exclusive within this one
+            // submenu (CE-155's own toggle lives in the expansion-window
+            // submenu now, but selecting anything here still must clear
+            // it -- its isolated 2K at 3800H-3FFFH is part of this same
+            // window), so persisting "None" must clear both flags, or a
+            // later launch's setCe163Enabled/setCe155Enabled call (which
+            // runs after setExtRam0000Size in main()'s own pre-reset
+            // ordering) would silently re-enable whichever one was left
+            // set in the conf file.
+            appConfig.ce163Enabled = false;
+            appConfig.ce155Enabled = false;
             persistActiveConf();
           };
           // Not a real 1982-era option at all (nothing plugged in there
           // back then), but physically possible now.
-          if (ImGui::MenuItem("None", nullptr, cur == 0 && !ce163)) setExtRam0000(0);
+          if (ImGui::MenuItem("None", nullptr, cur == 0 && !ce163 && !ce155)) setExtRam0000(0);
           if (ImGui::MenuItem("16K (full window)", nullptr,
-                               cur == pc1500::Bus::kExtRam0000WindowSize && !ce163)) {
+                               cur == pc1500::Bus::kExtRam0000WindowSize && !ce163 && !ce155)) {
             setExtRam0000(pc1500::Bus::kExtRam0000WindowSize);
           }
           // CE-163: a real 1982-era module, 32K banked two 16K halves at a
           // time into this same window -- mutually exclusive with both the
-          // choices above and with Extension RAM (4800H), since its own
-          // bank-select range (5800H-5FFFH) physically overlaps that
-          // window and a real PC-1500 has only one expansion port. See
+          // choices above and with the expansion window, since its own
+          // bank-select range physically overlaps that window and a real
+          // PC-1500(A) has only one expansion port. See
           // Bus::setCe163Enabled's own comment.
           if (ImGui::MenuItem("CE-163 (32K, banked)", nullptr, ce163)) {
             bus.setCe163Enabled(true);
             appConfig.ce163Enabled = true;
             appConfig.extRam0000Bytes = 0;
-            appConfig.extRam4800Bytes = 0;
+            appConfig.extRamExtBytes = 0;
+            appConfig.ce155Enabled = false;
             persistActiveConf();
+          }
+          // CE-155's own toggle lives in the Extension RAM (expansion
+          // window) submenu instead -- most of its 8K (6K of it) lives
+          // there. This window only hosts its remaining isolated 2K at
+          // 3800H-3FFFH, so just note that here rather than duplicating
+          // the toggle (which would need careful handling to keep both
+          // copies' checked-state and click behavior identical).
+          if (ce155) {
+            ImGui::Separator();
+            ImGui::BeginDisabled();
+            ImGui::MenuItem("3800H-3FFFH in use by CE-155 (see expansion window)");
+            ImGui::EndDisabled();
           }
           ImGui::EndMenu();
         }
@@ -3108,10 +3236,15 @@ int main(int argc, char** argv) {
               ImGui::Text("M%d: (empty)", slot + 1);
             }
           }
-          if (bus.extRam4800Size() > 0) {
-            ImGui::Text("Ext RAM 4800H: %uK", static_cast<unsigned>(bus.extRam4800Size() / 1024));
+          ImGui::Text("Base unit: %s",
+                      bus.machineVariant() == pc1500::Bus::MachineVariant::PC1500A ? "PC-1500A" : "PC-1500");
+          if (bus.ce155Enabled()) {
+            ImGui::Text("Ext RAM: CE-155 (3800H + %04XH window)", bus.extRamExtBase());
+          } else if (bus.extRamExtSize() > 0) {
+            ImGui::Text("Ext RAM %04XH: %uK", bus.extRamExtBase(),
+                        static_cast<unsigned>(bus.extRamExtSize() / 1024));
           } else {
-            ImGui::TextUnformatted("Ext RAM 4800H: off");
+            ImGui::Text("Ext RAM %04XH: off", bus.extRamExtBase());
           }
           if (bus.ce163Enabled()) {
             ImGui::Text("Ext RAM 0000H: CE-163 (bank %u)", static_cast<unsigned>(bus.ce163Bank()));

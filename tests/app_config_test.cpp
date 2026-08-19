@@ -44,9 +44,11 @@ void testRoundTrip() {
   config.autoLoadOnStart = false;
   config.autoSaveOnExit = true;
   config.showStatusPanel = true;
-  config.extRam4800Bytes = 0x2000;
+  config.isPC1500A = true;
+  config.extRamExtBytes = 0x2000;
   config.extRam0000Bytes = 0x4000;
   config.ce163Enabled = true;
+  config.ce155Enabled = false;  // deliberately left off -- mutually exclusive with ce163Enabled above
 
   std::string path = tempPath("pc1500emu_app_config_test.json");
   std::string err;
@@ -65,9 +67,11 @@ void testRoundTrip() {
   CHECK(loaded.autoLoadOnStart == false);
   CHECK(loaded.autoSaveOnExit == true);
   CHECK(loaded.showStatusPanel == true);
-  CHECK(loaded.extRam4800Bytes == 0x2000);
+  CHECK(loaded.isPC1500A == true);
+  CHECK(loaded.extRamExtBytes == 0x2000);
   CHECK(loaded.extRam0000Bytes == 0x4000);
   CHECK(loaded.ce163Enabled == true);
+  CHECK(loaded.ce155Enabled == false);
 
   std::remove(path.c_str());
 }
@@ -87,9 +91,11 @@ void testEmptyConfigRoundTrip() {
   CHECK(loaded.autoLoadOnStart == true);   // AppConfig{}'s own default
   CHECK(loaded.autoSaveOnExit == false);
   CHECK(loaded.showStatusPanel == false);
-  CHECK(loaded.extRam4800Bytes == 0);
+  CHECK(loaded.isPC1500A == false);
+  CHECK(loaded.extRamExtBytes == 0);
   CHECK(loaded.extRam0000Bytes == 0);
   CHECK(loaded.ce163Enabled == false);
+  CHECK(loaded.ce155Enabled == false);
 
   std::remove(path.c_str());
 }
@@ -124,9 +130,11 @@ void testOldConfigMissingNewFieldUsesDefault() {
   CHECK(loaded.autoLoadOnStart == false);        // present in the old file
   CHECK(loaded.autoSaveOnExit == false);         // absent -- AppConfig{}'s default
   CHECK(loaded.showStatusPanel == false);        // absent -- AppConfig{}'s default
-  CHECK(loaded.extRam4800Bytes == 0);            // absent -- AppConfig{}'s default
+  CHECK(loaded.isPC1500A == false);              // absent -- AppConfig{}'s default
+  CHECK(loaded.extRamExtBytes == 0);             // absent -- AppConfig{}'s default
   CHECK(loaded.extRam0000Bytes == 0);            // absent -- AppConfig{}'s default
   CHECK(loaded.ce163Enabled == false);           // absent -- AppConfig{}'s default
+  CHECK(loaded.ce155Enabled == false);           // absent -- AppConfig{}'s default
   std::remove(path.c_str());
 }
 

@@ -70,6 +70,38 @@ these are transcribed directly from that table, not independently confirmed
 against a real disassembly, so treat a name here as "what the manual calls
 it" rather than something separately traced live.
 
+## PC-1500A base-unit variant
+
+The PC-1500A is a hardware variant of the PC-1500, described on the last
+few pages of the Technical Reference Manual. Confirmed by deriving from
+the manual's own facts (cross-checked against the max-RAM figure the
+manual states for a fully-expanded PC-1500A) -- see `pc1500emu`'s
+`Bus::MachineVariant`/`Bus::extRamExtBase()` for the implementation:
+
+- Built-in user RAM grows from 2K (`4000H`-`47FFH`) to 6K
+  (`4000H`-`57FFH`).
+- The 40-pin expansion port is rewired: the module-select pins that are
+  S1/S2/S3 on a PC-1500 become S3/S4/S5 on a PC-1500A. Each shifted pin's
+  own chip-select address range moves up by `1000H` accordingly. Net
+  effect: the "option user memory" window that starts at `4800H` on a
+  PC-1500 (see the ME0 memory map above) starts at `5800H` on a
+  PC-1500A instead, and its max span shrinks from 10K to 6K (its upper
+  bound stays `6FFFH` either way, since `7000H`+ is fixed onboard
+  hardware untouched by the port rewiring).
+- CE-163 (32K banked RAM)'s bank-select write-trigger range shifts the
+  same way: `5800H`-`5FFFH` on a PC-1500 becomes `6800H`-`6FFFH` on a
+  PC-1500A.
+- CE-155 (8K module: 2K isolated at exactly `3800H`-`3FFFH`, 6K filling
+  the expansion window) follows the expansion window's own shift: its 6K
+  portion lands at `4800H`-`5FFFH` on a PC-1500, `5800H`-`6FFFH` on a
+  PC-1500A.
+- Max practical PC-1500A configuration: 16K at `0000H` (CE-159/generic) +
+  6K built-in + 6K expansion window = 28K total.
+
+**Manual correction**: page A-8 of the Technical Reference Manual states
+that expansion-port Pin 5 selects the `0000H`-`3FFFH` address range --
+this is wrong. The real range Pin 5 selects is `6000H`-`67FFH`.
+
 **Gotcha, learned the hard way**: `4000H`-`47FFH` being "standard user RAM"
 at the chip-select level does *not* mean all of it is free scratch space.
 On a bare PC-1500 (no CE-151/CE-155/CE-159 module), the BASIC ROM firmware

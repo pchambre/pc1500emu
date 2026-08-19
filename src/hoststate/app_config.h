@@ -23,20 +23,35 @@ struct AppConfig {
   bool autoLoadOnStart = true;
   bool autoSaveOnExit = false;
   bool showStatusPanel = false;
+  // Which base unit to emulate -- PC-1500 (false, default) or PC-1500A
+  // (true). Applied to Bus before cpu.reset() on a fresh boot (not a
+  // state restore, which already carries its own variant -- see
+  // Bus::saveState/loadState), same "only detected at cold-start"
+  // ordering requirement as the RAM fields below -- and must be applied
+  // *before* them, since they're interpreted relative to whichever
+  // variant is current. See main.cpp's Settings > Base Unit menu and
+  // Bus::setMachineVariant.
+  bool isPC1500A = false;
   // Emulated expansion-module RAM sizes (bytes), applied to Bus before
   // cpu.reset() on a fresh boot (not a state restore, which already
   // carries its own extRam sizes -- see Bus::saveState/loadState) --
   // the ROM only detects installed extension RAM at reset/cold-start, so
   // this has to be set before that first reset, not applied lazily later.
-  // See main.cpp's Settings > Extension RAM menu and Bus::setExtRam4800Size/
+  // extRamExtBytes is the expansion window -- 4800H-based on a PC-1500,
+  // 5800H-based on a PC-1500A, see Bus::extRamExtBase(). See main.cpp's
+  // Settings > Extension RAM menu and Bus::setExtRamExtSize/
   // setExtRam0000Size.
-  size_t extRam4800Bytes = 0;
+  size_t extRamExtBytes = 0;
   size_t extRam0000Bytes = 0;
   // CE-163 module (32K, banked into the same window as extRam0000Bytes) --
-  // mutually exclusive with both fields above, see Bus::setCe163Enabled's
-  // own comment. Same before-cpu.reset() ordering requirement as the two
-  // extRam fields.
+  // mutually exclusive with the two fields above and ce155Enabled below,
+  // see Bus::setCe163Enabled's own comment. Same before-cpu.reset()
+  // ordering requirement as the two extRam fields.
   bool ce163Enabled = false;
+  // CE-155 module (8K: 2K isolated at 3800H + 6K filling the expansion
+  // window) -- mutually exclusive with all three fields above, see
+  // Bus::setCe155Enabled's own comment. Same ordering requirement.
+  bool ce155Enabled = false;
 };
 
 // A missing file at `path` is not an error -- returns true with *out left

@@ -130,18 +130,23 @@ void stepOne(BootedMachine& m) {
   }
 }
 
-// extRam0000Bytes/extRam4800Bytes let a test approximate a RAM-expanded
-// machine (e.g. a CE-155-shaped 10K config) -- must be set before
-// cpu.reset() so BASIC's own boot-time RAM scan sees them, matching
-// AppConfig::extRam4800Bytes's own documented ordering requirement
-// (src/hoststate/app_config.h).
-std::unique_ptr<BootedMachine> bootAndSettle(const std::vector<uint8_t>& rom, size_t extRam0000Bytes = 0,
-                                              size_t extRam4800Bytes = 0) {
+// extRam0000Bytes/extRamExtBytes/variant let a test approximate a
+// RAM-expanded machine (e.g. a CE-155-shaped 10K config on a PC-1500) --
+// must be set before cpu.reset() so BASIC's own boot-time RAM scan sees
+// them, matching AppConfig::isPC1500A/extRamExtBytes's own documented
+// ordering requirement (src/hoststate/app_config.h).
+std::unique_ptr<BootedMachine> bootAndSettle(
+    const std::vector<uint8_t>& rom, size_t extRam0000Bytes = 0, size_t extRamExtBytes = 0,
+    pc1500::Bus::MachineVariant variant = pc1500::Bus::MachineVariant::PC1500) {
   auto m = std::make_unique<BootedMachine>();
   m->bus.ioPort().useManualRtcClock();
   m->bus.loadME0(0xC000, rom.data(), rom.size());
+  // Variant first -- extRamExtBytes is interpreted relative to whichever
+  // variant is current (Bus::extRamExtBase()), same ordering the real
+  // main.cpp's own pre-reset block uses.
+  m->bus.setMachineVariant(variant);
   m->bus.setExtRam0000Size(extRam0000Bytes);
-  m->bus.setExtRam4800Size(extRam4800Bytes);
+  m->bus.setExtRamExtSize(extRamExtBytes);
   m->cpu.reset();
   long bootCycles = 0;
   constexpr long kMaxBootCycles = 20'000'000;
@@ -1491,7 +1496,7 @@ void testSdloadUsesLiveProgramStartPointer() {
     f.write(reinterpret_cast<const char*>(kFixture.data()), static_cast<std::streamsize>(kFixture.size()));
   }
 
-  auto m = bootAndSettle(rom, /*extRam0000Bytes=*/16384, /*extRam4800Bytes=*/6144);
+  auto m = bootAndSettle(rom, /*extRam0000Bytes=*/16384, /*extRamExtBytes=*/6144);
   loadExpansionRom(*m, expRom, sdDir);
 
   tapKey(*m, pc1500::Key::Cl);

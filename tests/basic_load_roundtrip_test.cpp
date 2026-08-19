@@ -194,13 +194,15 @@ struct BootedMachine {
   int cyclesSinceTimerTick = 0;
 };
 
-// extRam4800Bytes: emulated module RAM to install at the 4800H window
+// extRamExtBytes: emulated module RAM to install at the expansion window
 // before boot (e.g. 0x2000 for an 8K module -- a real 1982-era hardware
-// option, see README's "Extension RAM (4800H)" section) -- the ROM only
-// detects installed extension RAM at reset/cold-start, not on the fly, so
-// this has to be set before the boot loop below runs, not after.
+// option, see README's "Extension RAM (expansion window)" section) -- the
+// ROM only detects installed extension RAM at reset/cold-start, not on
+// the fly, so this has to be set before the boot loop below runs, not
+// after. Machine variant defaults to stock PC-1500, so this window is
+// always based at 4800H for every call site in this file.
 std::unique_ptr<BootedMachine> bootAndSettle(const std::vector<uint8_t>& rom,
-                                              size_t extRam4800Bytes = 0) {
+                                              size_t extRamExtBytes = 0) {
   auto m = std::make_unique<BootedMachine>();
   // Freeze the RTC's clock to a fake, manually-advanced one (see
   // Upd1990ac::useManualClock()) so real elapsed wall-clock time
@@ -210,7 +212,7 @@ std::unique_ptr<BootedMachine> bootAndSettle(const std::vector<uint8_t>& rom,
   // jitter, since tp()/consumeRisingEdge() otherwise read the real clock.
   m->bus.ioPort().useManualRtcClock();
   m->bus.loadME0(0xC000, rom.data(), rom.size());
-  if (extRam4800Bytes > 0) m->bus.setExtRam4800Size(extRam4800Bytes);
+  if (extRamExtBytes > 0) m->bus.setExtRamExtSize(extRamExtBytes);
   m->cpu.reset();
   long bootCycles = 0;
   auto stepOne = [&]() {

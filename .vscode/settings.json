@@ -42,11 +42,11 @@
 
   // Used by "LH5801: Run in pc1500emu" / "LH5801: Debug in pc1500emu" to
   // launch a fresh instance when one isn't already running. romPath and
-  // extRam4800Bytes match this repo's own pc1500emu.json, so a fresh
+  // extRamExtBytes match this repo's own pc1500emu.json, so a fresh
   // Run/Debug session behaves the same as the normal GUI/state-file
   // setup -- e.g. printf()-using programs (needs >2KB) work without
   // extra configuration.
   "lh5801.emulatorPath": "${workspaceFolder}/build/src/host/RelWithDebInfo/pc1500emu.exe",
   "lh5801.romPath": "C:\\Users\\paulc\\Documents\\PC1500\\ROM1.BIN",
-  "lh5801.extRam4800Bytes": 10240
+  "lh5801.extRamExtBytes": 10240
 }

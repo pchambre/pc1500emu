@@ -467,13 +467,17 @@ void Bus::writeME0(uint16_t addr, uint8_t value) {
     }
     return;  // not claimed by any module -- isUnmapped's own discard below covers this range anyway
   }
-  // CE-163 bank-select trigger (PC-1500 wiring: pin 18 = S3 -> 5800H-5FFFH;
-  // a PC-1500A wires the same pin to S5 instead, a different range not
-  // emulated here). Pure address-line latch on real hardware -- the byte
-  // value is irrelevant, and nothing is actually stored at this address.
-  if (ce163Enabled_ && addr >= 0x5800 && addr <= 0x5FFF) {
-    ce163Bank_ = static_cast<uint8_t>(addr & 1);
-    return;
+  // CE-163 bank-select trigger: pin 18 = S3 -> 5800H-5FFFH on a PC-1500,
+  // or the same physical pin wired to S5 -> 6800H-6FFFH on a PC-1500A
+  // (see Bus::setCe163Enabled's own comment). Pure address-line latch on
+  // real hardware -- the byte value is irrelevant, and nothing is
+  // actually stored at this address.
+  {
+    uint16_t triggerBase = machineVariant_ == MachineVariant::PC1500A ? 0x6800 : 0x5800;
+    if (ce163Enabled_ && addr >= triggerBase && addr <= triggerBase + 0x7FF) {
+      ce163Bank_ = static_cast<uint8_t>(addr & 1);
+      return;
+    }
   }
   // CE-163 data write -- see readME0's own comment for why this bypasses
   // me0_ and goes straight to the bank-selected slice of ce163Ram_.
@@ -648,7 +652,7 @@ bool loadRomModuleState(std::istream& is, Bus::RomModule& m) {
 void Bus::saveState(std::ostream& os) const {
   using namespace pc1500state;
   writeBytes(os, me0_.data(), kSavedRamSize);
-  writeU32(os, static_cast<uint32_t>(extRam4800Size_));
+  writeU32(os, static_cast<uint32_t>(extRamExtSize_));
   writeU32(os, static_cast<uint32_t>(extRam0000Size_));
   writeBool(os, ce163Enabled_);
   writeU8(os, ce163Bank_);
@@ -656,12 +660,16 @@ void Bus::saveState(std::ostream& os) const {
   for (const RomModule& m : romModules_) {
     saveRomModule(os, m);
   }
+  // Version 5 additions -- appended at the end rather than inserted, to
+  // keep the diff against version 4's own field order minimal.
+  writeBool(os, machineVariant_ == MachineVariant::PC1500A);
+  writeBool(os, ce155Enabled_);
 }
 
 bool Bus::loadState(std::istream& is) {
   using namespace pc1500state;
   readBytes(is, me0_.data(), kSavedRamSize);
-  extRam4800Size_ = readU32(is);
+  extRamExtSize_ = readU32(is);
   extRam0000Size_ = readU32(is);
   ce163Enabled_ = readBool(is);
   ce163Bank_ = readU8(is);
@@ -670,6 +678,8 @@ bool Bus::loadState(std::istream& is) {
   for (RomModule& m : romModules_) {
     ok = loadRomModuleState(is, m) && ok;
   }
+  machineVariant_ = readBool(is) ? MachineVariant::PC1500A : MachineVariant::PC1500;
+  ce155Enabled_ = readBool(is);
   return ok && !is.fail();
 }
 

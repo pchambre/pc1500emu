@@ -151,17 +151,23 @@
           "default": "",
           "description": "Path to ROM1.BIN, passed to a freshly-launched pc1500emu by 'LH5801: Run in pc1500emu' / 'LH5801: Debug in pc1500emu'. Not needed if you always attach to an already-running instance."
         },
-        "lh5801.extRam4800Bytes": {
+        "lh5801.extRamExtBytes": {
           "type": "number",
-          "enum": [0, 4096, 8192, 10240],
+          "enum": [0, 4096, 6144, 8192, 10240],
           "default": 0,
-          "description": "Extension RAM (bytes) at 4800H-6FFFH -- the CE-158-style expansion module -- for a *freshly-launched* pc1500emu started by 'LH5801: Run in pc1500emu' / 'LH5801: Debug in pc1500emu' (never applied when attaching to one already running). 0 = none (base 2KB only, matches every default before this setting existed). Non-zero forces that launch to boot cold (--no-state), since the size is only detected by the ROM on a fresh, non-restored boot -- see AppConfig::extRam4800Bytes in src/hoststate/app_config.h."
+          "description": "Extension RAM (bytes) at the expansion window (4800H-6FFFH on a stock PC-1500, 5800H-6FFFH on a PC-1500A -- see lh5801.isPC1500A) -- the CE-151/CE-155-style expansion module -- for a *freshly-launched* pc1500emu started by 'LH5801: Run in pc1500emu' / 'LH5801: Debug in pc1500emu' (never applied when attaching to one already running). 0 = none (base built-in RAM only, matches every default before this setting existed). Non-zero forces that launch to boot cold (--no-state), since the size is only detected by the ROM on a fresh, non-restored boot -- see AppConfig::extRamExtBytes in src/hoststate/app_config.h."
         },
         "lh5801.extRam0000Bytes": {
           "type": "number",
           "enum": [0, 16384],
           "default": 0,
-          "description": "Extension RAM (bytes) at 0000H-3FFFH -- an emulator-only option with no real 1982 hardware equivalent -- for a freshly-launched pc1500emu. Same cold-boot caveat as lh5801.extRam4800Bytes."
+          "description": "Extension RAM (bytes) at 0000H-3FFFH -- an emulator-only option with no real 1982 hardware equivalent -- for a freshly-launched pc1500emu. Same cold-boot caveat as lh5801.extRamExtBytes."
+        },
+        "lh5801.isPC1500A": {
+          "type": "boolean",
+          "default": false,
+          "enum": [false, true],
+          "description": "Emulate a PC-1500A (6K built-in RAM at 4000H, expansion window based at 5800H instead of 4800H) instead of a stock PC-1500, for a freshly-launched pc1500emu. Same cold-boot caveat as lh5801.extRamExtBytes -- see AppConfig::isPC1500A in src/hoststate/app_config.h."
         },
         "lh5801.preloadRomModules": {
           "type": "array",
@@ -266,7 +272,7 @@
               "emulatorArgs": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Extra CLI args for a freshly-launched emulatorPath, overriding the bare romPath positional arg when given -- usually auto-populated by 'LH5801: Debug in pc1500emu' itself (e.g. [\"--conf\", \"<generated path>\", \"--no-state\"] when lh5801.extRam4800Bytes/extRam0000Bytes are non-default), not meant to be hand-written."
+                "description": "Extra CLI args for a freshly-launched emulatorPath, overriding the bare romPath positional arg when given -- usually auto-populated by 'LH5801: Debug in pc1500emu' itself (e.g. [\"--conf\", \"<generated path>\", \"--no-state\"] when lh5801.extRamExtBytes/extRam0000Bytes/isPC1500A are non-default), not meant to be hand-written."
               },
               "preloadRomModules": {
                 "type": "array",

@@ -47,7 +47,7 @@ void testRoundTrip() {
   // Ext-RAM windows must be sized *before* writing into them --
   // writeME0 drops writes to an unmapped (size-0) window (see
   // Bus::isUnmapped), so this order matters.
-  bus.setExtRam4800Size(0x2000);
+  bus.setExtRamExtSize(0x2000);
   bus.setExtRam0000Size(0x4000);
 
   // RAM contents -- a few distinguishing bytes spread across the saved
@@ -102,7 +102,7 @@ void testRoundTrip() {
   CHECK(bus2.readME0(0x6000) == 0xEF);
   CHECK(bus2.readME0(0x7FFF) == 0x99);
 
-  CHECK(bus2.extRam4800Size() == 0x2000);
+  CHECK(bus2.extRamExtSize() == 0x2000);
   CHECK(bus2.extRam0000Size() == 0x4000);
 
   CHECK(bus2.romModuleLoaded(0));
@@ -170,11 +170,49 @@ void testCe163RoundTrip() {
   std::remove(path.c_str());
 }
 
+// Version 5 additions: the machine-variant flag and CE-155's own enabled
+// flag. CE-155 is mutually exclusive with everything testRoundTrip/
+// testCe163RoundTrip already exercise (see Bus::setCe155Enabled's own
+// comment), so it needs its own pass, same reasoning as CE-163's own
+// dedicated test above. PC-1500A is the interesting case for the
+// variant flag -- PC-1500 is Bus's own default, so a round trip through
+// that alone wouldn't distinguish "saved as PC1500" from "field never
+// read at all".
+void testMachineVariantAndCe155RoundTrip() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  lh5801::CPU cpu(bus);
+
+  bus.setMachineVariant(pc1500::Bus::MachineVariant::PC1500A);
+  bus.setCe155Enabled(true);
+  bus.writeME0(0x3800, 0x11);   // CE-155's isolated 2K
+  bus.writeME0(0x5800, 0x22);   // expansion window, PC-1500A base
+
+  std::string path = tempPath("pc1500emu_state_roundtrip_test_variant.state");
+  std::string err;
+  CHECK(pc1500host::saveStateFile(cpu, bus, path, &err));
+  CHECK(err.empty());
+
+  pc1500::Keyboard kb2;
+  pc1500::Bus bus2(kb2);
+  lh5801::CPU cpu2(bus2);
+  err.clear();
+  CHECK(pc1500host::loadStateFile(cpu2, bus2, path, &err));
+  CHECK(err.empty());
+
+  CHECK(bus2.machineVariant() == pc1500::Bus::MachineVariant::PC1500A);
+  CHECK(bus2.ce155Enabled() == true);
+  CHECK(bus2.readME0(0x3800) == 0x11);
+  CHECK(bus2.readME0(0x5800) == 0x22);
+
+  std::remove(path.c_str());
+}
+
 void testCorruptMagicRejected() {
   pc1500::Keyboard kb;
   pc1500::Bus bus(kb);
   lh5801::CPU cpu(bus);
-  bus.setExtRam4800Size(0x1000);
+  bus.setExtRamExtSize(0x1000);
 
   std::string path = tempPath("pc1500emu_state_roundtrip_test_badmagic.state");
   std::string err;
@@ -194,7 +232,7 @@ void testCorruptMagicRejected() {
   CHECK(!pc1500host::loadStateFile(cpu2, bus2, path, &err));
   CHECK(!err.empty());
   // A fresh Bus's defaults must be untouched by the rejected load.
-  CHECK(bus2.extRam4800Size() == 0);
+  CHECK(bus2.extRamExtSize() == 0);
 
   std::remove(path.c_str());
 }
@@ -235,6 +273,7 @@ void testTruncatedFileRejected() {
 int main() {
   testRoundTrip();
   testCe163RoundTrip();
+  testMachineVariantAndCe155RoundTrip();
   testCorruptMagicRejected();
   testTruncatedFileRejected();
 

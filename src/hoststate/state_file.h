@@ -7,10 +7,12 @@
 // interrupt-latch state (format version 2; version 1 didn't; version 3
 // widened Bus::saveState/loadState from two ROM module slots to four;
 // version 4 added the CE-163 module's enabled flag, active bank, and 32K
-// backing store) -- restoring a session is meant to resume exactly where
-// OFF left the machine, the same way real hardware's OFF/ON cycle just
-// halts and wakes the CPU in place rather than resetting it, so the
-// caller must NOT call cpu.reset() after a successful loadStateFile.
+// backing store; version 5 added the PC-1500/PC-1500A machine-variant
+// flag and the CE-155 module's enabled flag) -- restoring a session is
+// meant to resume exactly where OFF left the machine, the same way real
+// hardware's OFF/ON cycle just halts and wakes the CPU in place rather
+// than resetting it, so the caller must NOT call cpu.reset() after a
+// successful loadStateFile.
 #pragma once
 
 #include <cstdint>
@@ -22,7 +24,7 @@
 namespace pc1500host {
 
 inline constexpr char kStateFileMagic[4] = {'P', 'C', '1', 'S'};
-inline constexpr uint16_t kStateFileVersion = 4;
+inline constexpr uint16_t kStateFileVersion = 5;
 
 // Writes an 8-byte header (4-byte magic, u16 version, 2 reserved bytes),
 // then cpu.saveState(), then bus.saveState(). Returns false with *error
