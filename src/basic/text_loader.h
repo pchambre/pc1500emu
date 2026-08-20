@@ -51,16 +51,35 @@ struct QueuedKeyAction {
 // own.
 bool charToTapActions(char c, std::deque<QueuedKeyAction>* out);
 
-// kBasicProgramStart is BASIC's fixed program-storage origin (PC-1500
-// Technical Reference Manual section 5-3-5's own worked example stores "10
-// PRINT A" / "20 END" starting here) -- not configurable, not detected at
-// runtime, just where the ROM always looks. kProgramEndPointerAddr is the
-// ROM's own cached copy of the program's end address (big-endian, value =
-// the address of the terminating 0xFFH byte); writing new program bytes at
-// kBasicProgramStart isn't enough on its own, this pointer has to agree or
-// LIST/RUN still act on the *old* end address.
+// kBasicProgramStart is BASIC's program-storage origin on a bare 2KB-RAM
+// machine only (PC-1500 Technical Reference Manual section 5-3-5's own
+// worked example stores "10 PRINT A" / "20 END" starting here). It is
+// NOT a fixed ROM constant in general -- the ROM's own boot sequence
+// computes this origin from whatever RAM is actually installed and
+// records it live at BASIC_PROGRAM_START_HI/LO_ABS (0x7865/0x7866,
+// 2-byte BE; see basicProgramStart() below), and that value shifts
+// whenever the installed RAM shape differs from bare-machine default --
+// e.g. 0x38C5 with an isolated 2K at 3800H (CE-155), or 0x00C5 with 16K
+// of extension RAM at 0000H (confirmed live: this emulator's 0000H
+// window is left-aligned from address 0, so contiguous free RAM now
+// starts there instead of at 4000H, and the reserve area's own 189-byte
+// offset shifts down with it). Code that reads/writes the *live* program
+// area (loading, saving, appending lines, etc.) must call
+// basicProgramStart(bus) instead of using this constant directly, or it
+// will silently operate on the wrong addresses whenever RAM differs from
+// bare-machine default -- this constant exists only as the bare-machine
+// reference value (e.g. for the disassembler's static BASPROG symbol,
+// which has no live Bus to query).
 constexpr uint16_t kBasicProgramStart = 0x40C5;
 constexpr uint16_t kProgramEndPointerAddr = 0x7867;
+
+// Reads BASIC's live program-storage origin from RAM (7865H/7866H,
+// 2-byte BE -- the ROM's own BASIC_PROGRAM_START_HI/LO_ABS) as computed
+// and recorded by the ROM's own boot sequence for whatever RAM is
+// currently installed. See kBasicProgramStart's own comment for why this
+// must be used instead of that constant for any live program-area
+// read/write.
+uint16_t basicProgramStart(pc1500::Bus& bus);
 
 // Returns the address of the terminating 0xFFH byte (i.e. one past the
 // last real program byte), or 0 if the structure runs off the end of the
@@ -68,7 +87,7 @@ constexpr uint16_t kProgramEndPointerAddr = 0x7867;
 // program area).
 uint32_t findBasicProgramEnd(pc1500::Bus& bus);
 
-// Reads the current BASIC program's raw tokenized bytes (kBasicProgramStart
+// Reads the current BASIC program's raw tokenized bytes (basicProgramStart()
 // through the trailing 0xFFH, inclusive). Returns an empty vector and sets
 // *error if the program area looks corrupt.
 std::vector<uint8_t> readBasicProgramBytes(pc1500::Bus& bus, std::string* error);

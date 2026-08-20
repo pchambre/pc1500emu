@@ -85,7 +85,7 @@ bool splitLineNumber(const std::string& line, std::string* numberStr, std::strin
 // address, not the content's) via *outAddr; false if not found (the
 // program's own 0xFFH end marker was reached first).
 bool findLineRecord(pc1500::Bus& bus, uint16_t lineNumber, uint32_t* outAddr) {
-  uint32_t addr = kBasicProgramStart;
+  uint32_t addr = basicProgramStart(bus);
   while (addr <= 0xFFFF) {
     uint8_t hi = bus.readME0(static_cast<uint16_t>(addr));
     if (hi == 0xFF) return false;
@@ -233,8 +233,14 @@ bool charToTapActions(char c, std::deque<QueuedKeyAction>* out) {
   return false;
 }
 
+uint16_t basicProgramStart(pc1500::Bus& bus) {
+  uint8_t hi = bus.readME0(0x7865);
+  uint8_t lo = bus.readME0(0x7866);
+  return static_cast<uint16_t>((hi << 8) | lo);
+}
+
 uint32_t findBasicProgramEnd(pc1500::Bus& bus) {
-  uint32_t addr = kBasicProgramStart;
+  uint32_t addr = basicProgramStart(bus);
   while (addr <= 0xFFFF) {
     uint8_t hi = bus.readME0(static_cast<uint16_t>(addr));
     if (hi == 0xFF) return addr;  // end-of-program marker
@@ -255,9 +261,10 @@ std::vector<uint8_t> readBasicProgramBytes(pc1500::Bus& bus, std::string* error)
     *error = "Could not find end of BASIC program (corrupt program area?).";
     return {};
   }
+  uint32_t startAddr = basicProgramStart(bus);
   std::vector<uint8_t> data;
-  data.reserve(endAddr - kBasicProgramStart + 1);
-  for (uint32_t a = kBasicProgramStart; a <= endAddr; a++) {
+  data.reserve(endAddr - startAddr + 1);
+  for (uint32_t a = startAddr; a <= endAddr; a++) {
     data.push_back(bus.readME0(static_cast<uint16_t>(a)));
   }
   return data;
@@ -307,8 +314,9 @@ bool loadBasicProgram(pc1500::Bus& bus, const char* path, std::string* error) {
     *error = "File doesn't end with the BASIC end-of-program marker (FFH) -- not a saved BASIC program?";
     return false;
   }
-  bus.loadME0(kBasicProgramStart, data.data(), data.size());
-  uint32_t endAddr = kBasicProgramStart + data.size() - 1;
+  uint16_t startAddr = basicProgramStart(bus);
+  bus.loadME0(startAddr, data.data(), data.size());
+  uint32_t endAddr = startAddr + data.size() - 1;
   bus.writeME0(kProgramEndPointerAddr, static_cast<uint8_t>(endAddr >> 8));
   bus.writeME0(kProgramEndPointerAddr + 1, static_cast<uint8_t>(endAddr & 0xFF));
   return true;
@@ -625,8 +633,8 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
   pressCl();
 
   // Full replace, not merge: clear the program through the ROM's own NEW
-  // command (typed, like everything else here) rather than poking
-  // kBasicProgramStart/kProgramEndPointerAddr directly -- confirmed
+  // command (typed, like everything else here) rather than poking the
+  // program start/end pointers directly -- confirmed
   // empirically that a direct poke leaves the program area in a state the
   // ROM's own periodic memory-validity pass doesn't recognize as either
   // "freshly typed" or "properly cleared", and it quietly re-zeroes

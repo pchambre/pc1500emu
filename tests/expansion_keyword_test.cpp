@@ -1472,9 +1472,10 @@ void testSdloadFileNotFoundRaisesError40() {
 // 3800H-3FFFH -- a real, already-documented emulator limitation, not a bug
 // in this test. A hand-built tokenized fixture (captured from a real save
 // earlier this session) is used directly rather than
-// typeBasicProgramText/saveBasicProgram, since those go through
-// text_loader.h's own *separate*, still-hardcoded kBasicProgramStart
-// constant on the host side, which would confound this specific check.
+// typeBasicProgramText/saveBasicProgram, to keep this test isolated from
+// text_loader.h's own host-side program-area functions -- those are
+// covered by their own dedicated test,
+// testSaveLoadBasicProgramUsesLiveProgramStartPointer, below.
 void testSdloadUsesLiveProgramStartPointer() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
@@ -1514,6 +1515,76 @@ void testSdloadUsesLiveProgramStartPointer() {
   CHECK(waitForIdle(*m));
 
   CHECK(payloadMatches(m->bus, kExpectedStart, kFixture));
+}
+
+// saveBasicProgram/loadBasicProgram -- the host-side functions behind the
+// GUI's "Save BASIC"/"Load BASIC" menu items and the "savebasic"/
+// "loadbasic" FIFO commands, used directly here with no expansion ROM
+// involved at all (this bug predates and is independent of SD support) --
+// must track the same live program-start pointer at
+// BASIC_PROGRAM_START_HI/LO_ABS (0x7865/0x7866) SDLOAD does, not the
+// bare-machine kBasicProgramStart constant (0x40C5). Boots with 16K of
+// extension RAM at 0000H, which shifts the real pointer to 0x00C5 (see
+// testSdloadUsesLiveProgramStartPointer's own comment for why not
+// 0x38C5). Before the fix, saveBasicProgram read from 0x40C5 regardless
+// -- a full 0x4000 away from where the program the user actually typed
+// lives in this configuration -- so the saved file was whichever
+// unrelated bytes happened to sit there, and loadBasicProgram wrote a
+// freshly loaded file to that same wrong address instead of where the
+// ROM's own line editor/LIST/RUN actually look, i.e. exactly the
+// reported bug (Save BASIC "not correctly finding the program when a
+// 16K expansion RAM is loaded at 0000H").
+void testSaveLoadBasicProgramUsesLiveProgramStartPointer() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  if (rom.empty()) {
+    std::printf("SKIP: testSaveLoadBasicProgramUsesLiveProgramStartPointer -- ROM1.BIN not found.\n");
+    return;
+  }
+
+  auto m = bootAndSettle(rom, /*extRam0000Bytes=*/16384);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  constexpr uint16_t kExpectedStart = 0x00C5;
+  CHECK(m->bus.readME0(0x7865) == 0x00);
+  CHECK(m->bus.readME0(0x7866) == 0xC5);
+
+  std::string typeError;
+  CHECK(pc1500::basic::typeBasicProgramText(m->bus, m->cpu, "10 PRINT 1\n20 END\n", kCyclesPerFrame,
+                                             kCyclesPerTimerTick, &typeError));
+
+  // "10 PRINT 1" / "20 END", tokenized -- same fixture shape used elsewhere
+  // in this file (see testSdloadUsesLiveProgramStartPointer's kFixture).
+  const std::vector<uint8_t> kExpectedBytes = {0x00, 0x0A, 0x04, 0xF0, 0x97, 0x31, 0x0D,
+                                                0x00, 0x14, 0x03, 0xF1, 0x8E, 0x0D, 0xFF};
+  CHECK(payloadMatches(m->bus, kExpectedStart, kExpectedBytes));
+
+  fs::path savePath =
+      makeTempTestDir("expansion_keyword_test_save_basic_live_start") / "SAVED.BAS";
+  std::string saveError;
+  CHECK(pc1500::basic::saveBasicProgram(m->bus, savePath.string().c_str(), &saveError));
+  if (!saveError.empty()) std::printf("  saveError: %s\n", saveError.c_str());
+
+  std::vector<uint8_t> savedBytes = readFile(savePath.string());
+  CHECK(savedBytes == kExpectedBytes);
+
+  // Round-trip: a fresh machine with the same RAM shape (so the live
+  // pointer lands at the same 0x00C5 again), NEW0'd clean, then
+  // loadBasicProgram from the file just saved -- must write to 0x00C5
+  // too, not 0x40C5.
+  auto m2 = bootAndSettle(rom, /*extRam0000Bytes=*/16384);
+  tapKey(*m2, pc1500::Key::Cl);
+  typeText(*m2, "NEW0");
+  tapKey(*m2, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m2));
+
+  std::string loadError;
+  CHECK(pc1500::basic::loadBasicProgram(m2->bus, savePath.string().c_str(), &loadError));
+  CHECK(payloadMatches(m2->bus, kExpectedStart, kExpectedBytes));
 }
 
 // SD_PARSE_QUOTED_NAME now uppercases lowercase input -- SDLOAD "test.bas"
@@ -3057,6 +3128,7 @@ int main() {
   testSdsaveMCallAddressRoundTrip();
   testSdloadFileNotFoundRaisesError40();
   testSdloadUsesLiveProgramStartPointer();
+  testSaveLoadBasicProgramUsesLiveProgramStartPointer();
   testSdmkdirCreatesDirectory();
   testSdmkdirFailsIfDirectoryAlreadyExists();
   testSdrmdirRemovesEmptyDirectory();
