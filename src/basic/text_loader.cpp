@@ -346,24 +346,14 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
   // SML is a persistent lowercase-input toggle on real hardware (confirmed:
   // it stays in effect across Enter, not just within one line), so this
   // state has to live for the whole function rather than being tracked
-  // per-line or per-character. charToTapActions folds 'a'-'z' to the same
-  // physical key as 'A'-'Z' (there's only one physical key per letter --
-  // case is a ROM-side keyboard mode, not a separate keystroke), so
-  // without this, lowercase source text like hexload1500.bas's German
-  // prompts ("Anfangsadresse (dez.):") always typed as uppercase.
-  bool smlActive = false;
-  auto setSml = [&](bool active) {
-    if (active == smlActive) return;
-    runKeyAction({pc1500::Key::Sml, true, kTapFrames});
-    runKeyAction({pc1500::Key::Sml, false, kIdleFrames});
-    smlActive = active;
-  };
+  // per-line or per-character -- SmlAwareTyper does exactly that, shared
+  // with every other text-sending path now (see its own comment).
+  SmlAwareTyper smlTyper(bus);
   auto typeChar = [&](char c) {
-    setSml(c >= 'a' && c <= 'z');
     std::deque<QueuedKeyAction> actions;
-    if (!charToTapActions(c, &actions)) return false;
+    bool ok = smlTyper.typeChar(c, &actions);
     for (const QueuedKeyAction& action : actions) runKeyAction(action);
-    return true;
+    return ok;
   };
   auto pressEnter = [&]() {
     runKeyAction({pc1500::Key::Ent, true, kTapFrames});
@@ -700,7 +690,11 @@ bool typeBasicProgramText(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string&
     *error = msg;
     return false;
   }
-  setSml(false);
+  {
+    std::deque<QueuedKeyAction> actions;
+    smlTyper.setActive(false, &actions);
+    for (const QueuedKeyAction& action : actions) runKeyAction(action);
+  }
   return true;
 }
 

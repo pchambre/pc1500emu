@@ -51,6 +51,74 @@ struct QueuedKeyAction {
 // own.
 bool charToTapActions(char c, std::deque<QueuedKeyAction>* out);
 
+// Wraps charToTapActions with the SML (lowercase-input toggle) awareness
+// every text-sending path needs -- charToTapActions itself case-folds
+// 'a'-'z' to the same physical key as 'A'-'Z' (see its own comment), so
+// producing genuine lowercase output means tapping SML before a lowercase
+// letter whenever not already in lowercase mode, and again before an
+// uppercase letter whenever currently in lowercase mode. This was
+// previously duplicated independently in two places (main.cpp's `type`
+// FIFO command and typeBasicProgramText below) and missing entirely from
+// several others (the typeline* FIFO command family) -- one shared
+// implementation now, used everywhere text gets typed.
+//
+// Only actual letters ('a'-'z'/'A'-'Z') drive the toggle -- confirmed on
+// real hardware (and by driving the live emulator's own SDL_TEXTINPUT
+// keyboard path, which has no SML logic at all and therefore can't have
+// this class of bug) that a space, digit, or punctuation character has no
+// case-dependent representation, so a real/live user never touches SML
+// for one. The first version of this class toggled for *any* character
+// where `(c is a-z) != smlActive_`, which fired on every space/digit/
+// punctuation mid-lowercase-run too (toggling off, typing it, then
+// toggling back on before the next lowercase letter) -- harmless-looking
+// but confirmed to make the ROM drop the very character being typed that
+// way (e.g. every space in "rem hello world" typed with SML active).
+// Restricting the toggle to letters alone matches how a live user
+// actually behaves and fixes this.
+//
+// Seeds its initial state from the machine's *live* SML status bit
+// (764EH bit 3 -- same one `status`'s own small= field reads) rather than
+// assuming a fixed starting state, so it self-corrects instead of
+// drifting out of sync if SML was toggled by something else (an
+// interleaved `key sml` command, a real keypress, or simply not being the
+// first text sent in a session) since the caller last checked.
+class SmlAwareTyper {
+ public:
+  explicit SmlAwareTyper(pc1500::Bus& bus) : smlActive_((bus.readME0(0x764E) & 0x08) != 0) {}
+
+  // Appends this character's SML toggle (if it's a letter whose case
+  // doesn't match the tracked state) followed by its own tap actions to
+  // `out`. Returns false (matching charToTapActions's own convention;
+  // `out` is left with only the SML toggle, if any, appended) if `c` has
+  // no keystroke mapping.
+  bool typeChar(char c, std::deque<QueuedKeyAction>* out) {
+    bool isLetter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    if (isLetter) {
+      bool wantLower = c >= 'a' && c <= 'z';
+      if (wantLower != smlActive_) {
+        out->push_back({pc1500::Key::Sml, true, kTapFrames});
+        out->push_back({pc1500::Key::Sml, false, kIdleFrames});
+        smlActive_ = wantLower;
+      }
+    }
+    return charToTapActions(c, out);
+  }
+
+  // Explicitly forces SML to `active`, appending the toggle tap to `out`
+  // if a change was actually needed -- for a caller that needs to leave
+  // the machine in a known state (e.g. back in uppercase mode) without
+  // that being driven by the next character typed.
+  void setActive(bool active, std::deque<QueuedKeyAction>* out) {
+    if (active == smlActive_) return;
+    out->push_back({pc1500::Key::Sml, true, kTapFrames});
+    out->push_back({pc1500::Key::Sml, false, kIdleFrames});
+    smlActive_ = active;
+  }
+
+ private:
+  bool smlActive_;
+};
+
 // kBasicProgramStart is BASIC's program-storage origin on a bare 2KB-RAM
 // machine only (PC-1500 Technical Reference Manual section 5-3-5's own
 // worked example stores "10 PRINT A" / "20 END" starting here). It is

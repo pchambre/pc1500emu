@@ -443,7 +443,7 @@ uint8_t Bus::readME0(uint16_t addr) {
     return ce163Ram_[static_cast<size_t>(ce163Bank_) * 0x4000 + addr];
   }
   if (isUnmapped(addr)) return 0xFF;
-  return me0_[effectiveAddr(addr)];
+  return me0_[effectiveAddr(addr, machineVariant_)];
 }
 
 void Bus::writeME0(uint16_t addr, uint8_t value) {
@@ -486,7 +486,7 @@ void Bus::writeME0(uint16_t addr, uint8_t value) {
     return;
   }
   if (isUnmapped(addr) || isRom(addr)) return;
-  me0_[effectiveAddr(addr)] = value;
+  me0_[effectiveAddr(addr, machineVariant_)] = value;
 }
 
 namespace {

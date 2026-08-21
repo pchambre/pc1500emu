@@ -4,6 +4,44 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.7.2] - 2026-08-21
+
+### Fixed
+- The PC-1500A's F1-F6 "reserve key" assignment feature (`SHIFT+MODE`)
+  threw `ERROR 13` ("insufficient space for RESERVE") under any non-bare
+  RAM configuration (e.g. 16K at `0000H`, CE-155). Root cause: the
+  reserve area's required zero-seeding (the ROM never initializes it
+  itself -- see the 2026-07-26 fix below) was a one-time, hardcoded
+  `4008H`-`40C4H` applied only at `Bus` construction, never re-applied
+  when the live reserve area moves along with `basicProgramStart()`'s own
+  RAM-config-dependent origin. `Bus::reserveAreaBase()`/
+  `reseedReserveArea()` now compute and re-seed the correct live location
+  on construction and on every RAM-config-changing setter.
+- Text sent through any FIFO/pipe text-typing command (`type`,
+  `typeline`/`typelinetrace`/`typelinenoenter`/`typelinepartialidle`/
+  `typelinepartialidletrace`/`typelinewatch`, `loadbasictext`) with SML
+  (lowercase mode) active could silently drop spaces, digits, and
+  punctuation immediately following a case change -- the shared
+  `SmlAwareTyper` helper was toggling SML around *every* character whose
+  literal-lowercase-ness didn't match the current mode, including
+  characters with no case-dependent representation at all. Real/live
+  keyboard typing never had this bug (a human only presses SML around an
+  actual letter). Now scoped to letters only.
+- The PC-1500A has real, independent 1K RAM at `7C00H`-`7FFFH`, unlike
+  the base PC-1500 (a mirror of `7800H`-`7BFFH`, unchanged).
+  `Bus::effectiveAddr` is now machine-variant-aware for this range.
+- The in-app Help > Special Keys popup implied host Shift itself toggles
+  PC-1500 SHIFT -- it doesn't (only Tab does, host Shift is inert); the
+  table's wording was just misleading, not the underlying keyboard
+  handling. Reworded.
+
+### Changed
+- Extracted the previously-duplicated SML-tracking logic (independently
+  reimplemented in `main.cpp`'s `type` handler and
+  `typeBasicProgramText`) into one shared `SmlAwareTyper` class
+  (`src/basic/text_loader.h`), now used by every text-sending path
+  instead of two copies plus several gaps.
+
 ## [0.6.6] - 2026-08-11
 
 ### Added

@@ -123,6 +123,57 @@ void testMirroredRegionsAliasRealRam() {
   CHECK(bus.readME0(0x7A00) == 0x00);  // unaffected -- outside this chip-select block
 }
 
+// Unlike the base PC-1500 (mirrored into 7800H-7BFFH, see
+// testMirroredRegionsAliasRealRam above -- that behavior must stay exactly
+// as-is), the PC-1500A has real, independent 1K RAM at 7C00H-7FFFH.
+void testPC1500A_7C00RangeIsRealRam() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  bus.setMachineVariant(pc1500::Bus::MachineVariant::PC1500A);
+
+  bus.writeME0(0x7C00, 0x33);
+  bus.writeME0(0x7800, 0x99);
+  CHECK(bus.readME0(0x7C00) == 0x33);  // not aliased to 7800H's own value
+  CHECK(bus.readME0(0x7800) == 0x99);
+
+  bus.writeME0(0x7FFF, 0x44);
+  bus.writeME0(0x7BFF, 0x88);
+  CHECK(bus.readME0(0x7FFF) == 0x44);  // not aliased to 7BFFH's own value
+  CHECK(bus.readME0(0x7BFF) == 0x88);
+}
+
+// The F1-F6 "reserve area" must read back all-zero (real hardware never
+// sees a truly uninitialized version of it -- see Bus's constructor's own
+// comment), and that's true regardless of which base it lives at for the
+// current RAM config, not just the bare-default 4008H-40C4H case.
+void testReserveAreaIsZeroedAtDefaultBase() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  for (uint16_t addr = 0x4008; addr <= 0x40C4; addr++) {
+    CHECK(bus.readME0(addr) == 0x00);
+  }
+  // Just outside the reserve area on both sides: still the generic 0xFF
+  // fill, confirming the zeroing is scoped to exactly this range.
+  CHECK(bus.readME0(0x4007) == 0xFF);
+  CHECK(bus.readME0(0x40C5) == 0xFF);
+}
+
+// Enabling 16K at 0000H shifts basicProgramStart() (and therefore the
+// reserve area, which always sits immediately before it) down to 0000H --
+// confirmed live this session. Before this fix, the reserve area's zero
+// seeding was a one-time, hardcoded 4008H-40C4H applied only at
+// construction, so this config left the *live* reserve area (0008H-00C4H)
+// unseeded, reproducing the original "RESERVE key throws ERROR 13"
+// bug's exact precondition through the ordinary Settings UI.
+void testReserveAreaFollowsExtRam0000Config() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  bus.setExtRam0000Size(pc1500::Bus::kExtRam0000WindowSize);  // 16K, fills the whole window
+  for (uint16_t addr = 0x0008; addr <= 0x00C4; addr++) {
+    CHECK(bus.readME0(addr) == 0x00);
+  }
+}
+
 void testRomIsReadOnly() {
   pc1500::Keyboard kb;
   pc1500::Bus bus(kb);
@@ -885,6 +936,9 @@ void testExpansionModuleFreeSpaceAndVolumeSizeSucceed() {
 int main() {
   testUnmappedRegionsReadHighAndIgnoreWrites();
   testMirroredRegionsAliasRealRam();
+  testPC1500A_7C00RangeIsRealRam();
+  testReserveAreaIsZeroedAtDefaultBase();
+  testReserveAreaFollowsExtRam0000Config();
   testRomIsReadOnly();
   testRamRegionsAreReadWrite();
   testIoPortControllerDdaGatesOpaReadback();

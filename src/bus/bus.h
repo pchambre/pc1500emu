@@ -473,19 +473,25 @@ class Bus : public lh5801::MemoryBus {
   // code path anywhere in the ROM ever writes that address) relies on
   // this undocumented hardware behavior. See docs/pc1500_hardware_reference.md.
   //
-  // The F1-F6 reserve-key area (4008H-40C4H) is the one documented
-  // exception: no ROM code path ever initializes it either (confirmed via
-  // instruction tracing -- the assignment-lookup loop at CEC6h just scans
-  // past 40C4H into whatever garbage follows, since it never finds the
-  // 00H "end of assignments" terminator the manual requires), yet real
-  // hardware reads 0 there whenever no keys are assigned. That 189-byte
-  // structure must already be a valid (all-zero, i.e. "nothing assigned
-  // yet") 00H-terminated list before the ROM ever touches it -- there is
-  // no real-hardware state equivalent to our synthetic all-0xFF default
-  // for this specific range, so it's seeded to 0 explicitly here.
+  // The F1-F6 reserve-key area (base+8..base+0xC4, 189 bytes -- 4008H-40C4H
+  // for the bare-default base of 4000H) is the one documented exception:
+  // no ROM code path ever initializes it either (confirmed via instruction
+  // tracing -- the assignment-lookup loop at CEC6h just scans past the end
+  // into whatever garbage follows, since it never finds the 00H "end of
+  // assignments" terminator the manual requires), yet real hardware reads
+  // 0 there whenever no keys are assigned. That 189-byte structure must
+  // already be a valid (all-zero, i.e. "nothing assigned yet")
+  // 00H-terminated list before the ROM ever touches it -- there is no
+  // real-hardware state equivalent to our synthetic all-0xFF default for
+  // this specific range, so it's seeded to 0 explicitly here (and
+  // re-seeded at its new location by reseedReserveArea()/
+  // reserveAreaBase(), below, whenever a RAM-config setter moves it --
+  // confirmed as a real, previously-missed bug this session: any non-bare
+  // RAM config left the *live* reserve area unseeded, reproducing this
+  // exact bug's ERROR 13 symptom through the ordinary Settings UI).
   explicit Bus(Keyboard& keyboard) : keyboard_(keyboard) {
     me0_.fill(0xFF);
-    std::fill(me0_.begin() + 0x4008, me0_.begin() + 0x40C5, 0x00);
+    reseedReserveArea();  // 4008H-40C4H for the bare-default config constructed with here
     ce163Ram_.fill(0xFF);  // matches real RAM's confirmed 0xFF power-up default, not C++'s own 0
   }
 
@@ -647,6 +653,10 @@ class Bus : public lh5801::MemoryBus {
     // macros silently mangle std::min's own name at the call site.
     size_t maxSize = extRamExtWindowMaxSize();
     if (extRamExtSize_ > maxSize) extRamExtSize_ = maxSize;
+    // No reseedReserveArea() call here, deliberately -- reserveAreaBase()
+    // doesn't depend on machineVariant_ at all (PC-1500 vs PC-1500A only
+    // differs in how far built-in RAM extends *above* 4000H, never in
+    // what's contiguous *below* it), so this setter can't move it.
   }
   MachineVariant machineVariant() const { return machineVariant_; }
 
@@ -715,6 +725,7 @@ class Bus : public lh5801::MemoryBus {
     // !ce163Enabled_ regardless of extRam0000Size_.
     ce163Enabled_ = false;
     ce155Enabled_ = false;
+    reseedReserveArea();  // may move reserveAreaBase() -- see its own comment
   }
   size_t extRam0000Size() const { return extRam0000Size_; }
 
@@ -739,6 +750,7 @@ class Bus : public lh5801::MemoryBus {
       extRamExtSize_ = 0;
       ce155Enabled_ = false;
     }
+    reseedReserveArea();  // may move reserveAreaBase() -- see its own comment
   }
   bool ce163Enabled() const { return ce163Enabled_; }
   uint8_t ce163Bank() const { return ce163Bank_; }
@@ -762,6 +774,7 @@ class Bus : public lh5801::MemoryBus {
       extRamExtSize_ = 0;
       ce163Enabled_ = false;
     }
+    reseedReserveArea();  // may move reserveAreaBase() -- see its own comment
   }
   bool ce155Enabled() const { return ce155Enabled_; }
 
@@ -868,8 +881,15 @@ class Bus : public lh5801::MemoryBus {
            (inExtWindow && (addr - extBase) >= extRamExtSize_) ||  // beyond configured expansion RAM
            (addr >= 0x8000 && addr <= 0xBFFF);                // CE-150/153/158 (not connected)
   }
-  // 7C00H-7FFFH is a duplicate of 7800H-7BFFH (the 1K system RAM) -- a
-  // half-decoded chip-select block, confirmed directly on real hardware.
+  // 7C00H-7FFFH on a base PC-1500 is a duplicate of 7800H-7BFFH (the 1K
+  // system RAM) -- a half-decoded chip-select block, confirmed directly on
+  // real hardware. On a PC-1500A, this range is instead a real, independent
+  // 1K of its own -- confirmed by the user; not yet independently verified
+  // on real PC-1500A hardware the way the base-unit mirror was, but treated
+  // as authoritative. The base PC-1500's own behavior here is otherwise
+  // undefined/unspecified by any source this project has -- it's simply
+  // left exactly as it already was (this mirror), rather than guessed at
+  // further, since that's already the confirmed, working behavior.
   //
   // 7000H-77FFH is driven by a RAM chip smaller than its address window:
   // address bits 9 and 10 (0200H/0400H) simply aren't decoded, so every
@@ -882,11 +902,42 @@ class Bus : public lh5801::MemoryBus {
   // whole 7000H-75FFH range a duplicate of 7600H-7BFFH -- closer to
   // correct than our first, narrower correction, just off on the exact
   // mechanism). 4000H-47FFH (the 2K user RAM) is NOT mirrored into
-  // 4800H-4FFFH.
-  static uint16_t effectiveAddr(uint16_t addr) {
+  // 4800H-4FFFH. This 7000H-77FFH aliasing applies to both machine
+  // variants alike -- only the 7C00H-7FFFH case differs by variant.
+  static uint16_t effectiveAddr(uint16_t addr, MachineVariant variant) {
     if (addr >= 0x7000 && addr <= 0x77FF) return static_cast<uint16_t>(addr | 0x0600);
-    if (addr >= 0x7C00 && addr <= 0x7FFF) return static_cast<uint16_t>(addr - 0x0400);
+    if (variant == MachineVariant::PC1500 && addr >= 0x7C00 && addr <= 0x7FFF) {
+      return static_cast<uint16_t>(addr - 0x0400);
+    }
     return addr;
+  }
+
+  // Base of the contiguous free-RAM region leading into 4000H -- the same
+  // "base" the ROM's own boot-time RAM detection settles on, and that
+  // basicProgramStart()'s live 7865H/7866H pointer reflects (confirmed
+  // this session: 0x0000 with a full 0000H-window module or CE-163,
+  // 0x3800 with CE-155, else 0x4000 bare) -- and therefore also where the
+  // F1-F6 "reserve area" (base+8 .. base+0xC4, see reseedReserveArea's
+  // own comment) actually lives.
+  uint16_t reserveAreaBase() const {
+    if (ce163Enabled_ || extRam0000Size_ >= kExtRam0000WindowSize) return 0x0000;
+    if (ce155Enabled_) return 0x3800;
+    return 0x4000;
+  }
+
+  // The F1-F6 reserve-key area is 189 bytes, base+8..base+0xC4 inclusive
+  // (see the constructor's own comment for why it must be pre-zeroed).
+  // Its location moves with reserveAreaBase() whenever installed RAM
+  // changes, so this needs to be re-applied any time a setter changes
+  // that -- not just once at construction. Whichever location was
+  // previously seeded (if different from the current one) is simply left
+  // behind: harmless, since the documented reset+CL+NEW0 workflow after
+  // any RAM-config change means nothing depends on stale reserve-area
+  // content surviving a reconfiguration, matching how real hardware would
+  // also need a fresh start after physically swapping RAM modules.
+  void reseedReserveArea() {
+    uint16_t base = reserveAreaBase();
+    std::fill(me0_.begin() + base + 0x8, me0_.begin() + base + 0xC5, 0x00);
   }
 
   std::array<uint8_t, 65536> me0_{};

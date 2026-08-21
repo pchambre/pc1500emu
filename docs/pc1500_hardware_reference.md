@@ -43,7 +43,7 @@ forms access ME1 (see `lh5801_opcode_reference.md`). On the PC-1500:
 | `7600H`-`76FFH` | Display buffer, chips 1 & 3 (see LCD section) |
 | `7700H`-`77FFH` | Display buffer, chips 2 & 4 |
 | `7800H`-`7BFFH` | System RAM (fixed variable area) |
-| `7C00H`-`7FFFH` | Duplicate of `7800H`-`7BFFH` (confirmed on real hardware). Per 4-2-3's schematic, chip-select S7 (system RAM, chip TC5514) is asserted for the whole `7800H`-`7FFFH` window from AD11/AD12/AD13 alone, same mechanism as the `7000H`-`77FFH` case above -- the actual RAM chip doesn't distinguish bit 10 within that window. |
+| `7C00H`-`7FFFH` | **Base PC-1500 only**: duplicate of `7800H`-`7BFFH` (confirmed on real hardware). Per 4-2-3's schematic, chip-select S7 (system RAM, chip TC5514) is asserted for the whole `7800H`-`7FFFH` window from AD11/AD12/AD13 alone, same mechanism as the `7000H`-`77FFH` case above -- the actual RAM chip doesn't distinguish bit 10 within that window. On a **PC-1500A**, this range is instead a real, independent 1K of its own -- see "PC-1500A base-unit variant" below. |
 | `8000H`-`BFFFH` | CE-150/CE-153/CE-158 system program + I/O PC (only present if that peripheral is connected) |
 | `C000H`-`FFFFH` | PC-1500 system ROM (16KB, chip SC61328F) |
 
@@ -97,6 +97,11 @@ manual states for a fully-expanded PC-1500A) -- see `pc1500emu`'s
   PC-1500A.
 - Max practical PC-1500A configuration: 16K at `0000H` (CE-159/generic) +
   6K built-in + 6K expansion window = 28K total.
+- `7C00H`-`7FFFH` is real, independent 1K RAM on a PC-1500A -- unlike the
+  base PC-1500, where this range is a mirror of `7800H`-`7BFFH` (see the
+  ME0 memory map above). Not yet independently re-derived/confirmed
+  against the manual's own schematic the way the base-unit mirror was;
+  treated as authoritative regardless.
 
 **Manual correction**: page A-8 of the Technical Reference Manual states
 that expansion-port Pin 5 selects the `0000H`-`3FFFH` address range --

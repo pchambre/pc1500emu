@@ -1003,9 +1003,10 @@ bool typeImmediateLine(pc1500::Bus& bus, lh5801::CPU& cpu, const std::string& li
     bus.setKeyState(action.key, action.pressed);
     stepCycles(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
   };
+  pc1500::basic::SmlAwareTyper smlTyper(bus);
   for (char c : line) {
     std::deque<QueuedKeyAction> actions;
-    if (!charToTapActions(c, &actions)) {
+    if (!smlTyper.typeChar(c, &actions)) {
       *error = "no keystroke mapping for character '" + std::string(1, c) + "'";
       return false;
     }
@@ -1048,9 +1049,10 @@ bool typeImmediateLinePartialIdle(pc1500::Bus& bus, lh5801::CPU& cpu, const std:
     bus.setKeyState(action.key, action.pressed);
     stepCycles(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
   };
+  pc1500::basic::SmlAwareTyper smlTyper(bus);
   for (size_t idx = 0; idx < line.size(); idx++) {
     std::deque<QueuedKeyAction> actions;
-    if (!charToTapActions(line[idx], &actions)) {
+    if (!smlTyper.typeChar(line[idx], &actions)) {
       *error = "no keystroke mapping for character '" + std::string(1, line[idx]) + "'";
       return false;
     }
@@ -1058,7 +1060,10 @@ bool typeImmediateLinePartialIdle(pc1500::Bus& bus, lh5801::CPU& cpu, const std:
     for (size_t ai = 0; ai < actions.size(); ai++) {
       QueuedKeyAction action = actions[ai];
       // Only the FINAL release action in this character's sequence is the
-      // "idle gap before the next character" -- override just that one.
+      // "idle gap before the next character" -- override just that one
+      // (SmlAwareTyper may have prepended an SML-toggle pair before this
+      // character's own actions, but those always come first, never last,
+      // so this still correctly targets only the character's own release).
       if (!action.pressed && ai + 1 == actions.size()) action.framesToWait = idleOverride;
       runKeyAction(action);
     }
@@ -1114,9 +1119,10 @@ bool typeImmediateLinePartialIdleTraced(pc1500::Bus& bus, lh5801::CPU& cpu, cons
     bus.setKeyState(action.key, action.pressed);
     stepCyclesMaybeTraced(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
   };
+  pc1500::basic::SmlAwareTyper smlTyper(bus);
   for (size_t idx = 0; idx < line.size(); idx++) {
     std::deque<QueuedKeyAction> actions;
-    if (!charToTapActions(line[idx], &actions)) {
+    if (!smlTyper.typeChar(line[idx], &actions)) {
       *error = "no keystroke mapping for character '" + std::string(1, line[idx]) + "'";
       return false;
     }
@@ -1201,9 +1207,10 @@ bool typeImmediateLineWatch(pc1500::Bus& bus, lh5801::CPU& cpu, const std::strin
     bus.setKeyState(action.key, action.pressed);
     stepCyclesWatched(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
   };
+  pc1500::basic::SmlAwareTyper smlTyper(bus);
   for (char c : line) {
     std::deque<QueuedKeyAction> actions;
-    if (!charToTapActions(c, &actions)) {
+    if (!smlTyper.typeChar(c, &actions)) {
       *error = "no keystroke mapping for character '" + std::string(1, c) + "'";
       return false;
     }
@@ -1245,9 +1252,10 @@ bool typeImmediateLineWithTrace(pc1500::Bus& bus, lh5801::CPU& cpu, const std::s
     bus.setKeyState(action.key, action.pressed);
     stepCycles(static_cast<long>(action.framesToWait) * kCyclesPerFrame);
   };
+  pc1500::basic::SmlAwareTyper smlTyper(bus);
   for (char c : line) {
     std::deque<QueuedKeyAction> actions;
-    if (!charToTapActions(c, &actions)) {
+    if (!smlTyper.typeChar(c, &actions)) {
       *error = "no keystroke mapping for character '" + std::string(1, c) + "'";
       return false;
     }
@@ -1693,23 +1701,12 @@ int main(int argc, char** argv) {
       // charToTapActions folds 'a'-'z' to the same physical key as 'A'-'Z'
       // by design (case is a persistent ROM-side SML mode, not a separate
       // keystroke -- see its own doc comment) and is deliberately SML-
-      // unaware, so genuine lowercase output needs the caller to drive SML
-      // itself, same as typeBasicProgramText's own setSml closure already
-      // does for `loadbasictext`. Seeded from the *live* SML status bit
-      // (764EH bit 3 -- same one `status`'s own small= field reads) rather
-      // than a separately-tracked variable, so this self-corrects instead
-      // of drifting out of sync if SML was toggled by an interleaved `key
-      // sml` command or a real keypress since the last `type` call.
-      bool smlActive = (bus.readME0(0x764E) & 0x08) != 0;
-      auto setSml = [&](bool active) {
-        if (active == smlActive) return;
-        symbolActionQueue.push_back({pc1500::Key::Sml, true, kTapFrames});
-        symbolActionQueue.push_back({pc1500::Key::Sml, false, kIdleFrames});
-        smlActive = active;
-      };
+      // unaware, so genuine lowercase output needs SmlAwareTyper's own
+      // live-seeded toggle tracking (shared with every other text-sending
+      // path -- see its own comment).
+      pc1500::basic::SmlAwareTyper smlTyper(bus);
       for (char c : text) {
-        setSml(c >= 'a' && c <= 'z');
-        if (!charToTapActions(c, &symbolActionQueue)) {
+        if (!smlTyper.typeChar(c, &symbolActionQueue)) {
           std::fprintf(stderr, "pc1500emu: 'type' has no mapping for char '%c' -- use 'key NAME'\n", c);
         }
       }
@@ -3304,8 +3301,8 @@ int main(int argc, char** argv) {
         row("F12", "ON (also BREAK while a program is running)");
         row("Shift+F12", "OFF");
         row("Ctrl+F12", "RESET (host-only; mimics the ALL RESET pinhole)");
-        row("Shift", "Tap to toggle (not a hold -- matches real hardware)");
-        row("Tab", "Standalone Shift keypress");
+        row("Tab", "Standalone Shift keypress (tap-to-toggle, matching real "
+                    "PC-1500 hardware -- host Shift itself does nothing)");
         ImGui::EndTable();
       }
       ImGui::Separator();
