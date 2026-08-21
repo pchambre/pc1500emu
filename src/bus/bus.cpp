@@ -651,36 +651,81 @@ bool loadRomModuleState(std::istream& is, Bus::RomModule& m) {
 
 void Bus::saveState(std::ostream& os) const {
   using namespace pc1500state;
-  writeBytes(os, me0_.data(), kSavedRamSize);
+  // Config scalars first (version 6 -- see state_file.h's own comment for
+  // why: loadState needs to check these against its *current* values
+  // before committing to restoring the large blobs below, so a config
+  // mismatch can be rejected without touching anything).
   writeU32(os, static_cast<uint32_t>(extRamExtSize_));
   writeU32(os, static_cast<uint32_t>(extRam0000Size_));
   writeBool(os, ce163Enabled_);
   writeU8(os, ce163Bank_);
+  writeBool(os, machineVariant_ == MachineVariant::PC1500A);
+  writeBool(os, ce155Enabled_);
+  writeBytes(os, me0_.data(), kSavedRamSize);
   writeBytes(os, ce163Ram_.data(), ce163Ram_.size());
   for (const RomModule& m : romModules_) {
     saveRomModule(os, m);
   }
-  // Version 5 additions -- appended at the end rather than inserted, to
-  // keep the diff against version 4's own field order minimal.
-  writeBool(os, machineVariant_ == MachineVariant::PC1500A);
-  writeBool(os, ce155Enabled_);
 }
 
-bool Bus::loadState(std::istream& is) {
+bool Bus::loadState(std::istream& is, std::string* error, bool* configMismatch,
+                     SavedConfig* savedConfig) {
   using namespace pc1500state;
+  size_t savedExtRamExtSize = readU32(is);
+  size_t savedExtRam0000Size = readU32(is);
+  bool savedCe163Enabled = readBool(is);
+  uint8_t savedCe163Bank = readU8(is);
+  MachineVariant savedVariant =
+      readBool(is) ? MachineVariant::PC1500A : MachineVariant::PC1500;
+  bool savedCe155Enabled = readBool(is);
+  if (!is) {
+    if (error) *error = "truncated or corrupt (couldn't even read the config header)";
+    return false;
+  }
+  // Reject outright, touching nothing else, if the saved config doesn't
+  // match what this Bus is currently configured for -- see loadState's
+  // own header-comment for why this matters (raw me0_ contents are only
+  // meaningful relative to the specific memory-map shape they were saved
+  // under). The caller is responsible for having already applied the
+  // intended config before calling this.
+  if (savedExtRamExtSize != extRamExtSize_ || savedExtRam0000Size != extRam0000Size_ ||
+      savedCe163Enabled != ce163Enabled_ || savedVariant != machineVariant_ ||
+      savedCe155Enabled != ce155Enabled_) {
+    if (error) {
+      *error =
+          "state file's saved RAM configuration doesn't match the currently configured "
+          "hardware -- apply the same Settings (base unit / extension RAM) the state was "
+          "saved under before loading it, the same way real PC-1500 RAM (short of a "
+          "battery-backed module) doesn't survive a hardware reconfiguration either";
+    }
+    if (configMismatch) *configMismatch = true;
+    if (savedConfig) {
+      savedConfig->extRamExtSize = savedExtRamExtSize;
+      savedConfig->extRam0000Size = savedExtRam0000Size;
+      savedConfig->ce163Enabled = savedCe163Enabled;
+      savedConfig->machineVariant = savedVariant;
+      savedConfig->ce155Enabled = savedCe155Enabled;
+    }
+    return false;
+  }
+  ce163Bank_ = savedCe163Bank;
   readBytes(is, me0_.data(), kSavedRamSize);
-  extRamExtSize_ = readU32(is);
-  extRam0000Size_ = readU32(is);
-  ce163Enabled_ = readBool(is);
-  ce163Bank_ = readU8(is);
   readBytes(is, ce163Ram_.data(), ce163Ram_.size());
   bool ok = true;
   for (RomModule& m : romModules_) {
     ok = loadRomModuleState(is, m) && ok;
   }
-  machineVariant_ = readBool(is) ? MachineVariant::PC1500A : MachineVariant::PC1500;
-  ce155Enabled_ = readBool(is);
-  return ok && !is.fail();
+  // Still worth doing even though config matched: a state saved under a
+  // matching config, but with an older build that predates this method
+  // existing (or predates reserveAreaBase() following the config at all),
+  // can still have its live reserve area sitting at the generic,
+  // never-seeded 0xFF fill -- see reseedReserveArea's own comment.
+  reseedReserveArea();
+  if (!ok || !is) {
+    if (error) *error = "truncated or corrupt";
+    return false;
+  }
+  return true;
 }
 
 }  // namespace pc1500

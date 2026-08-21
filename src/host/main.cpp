@@ -1451,17 +1451,51 @@ int main(int argc, char** argv) {
   // --no-state as "no state file configured this session" avoids both.
   // The persisted conf file itself is untouched, so a normal launch
   // (without --no-state) still resumes as configured.
+  // Applied unconditionally, *before* attempting any state-file load below
+  // -- not just on a no-state-restored fallback path. Bus::loadState (see
+  // its own comment) now refuses to restore a state whose saved config
+  // doesn't match the Bus's current config at the time it's called, so
+  // there has to be a well-defined "current config" (this) for it to
+  // compare against regardless of whether a restore ends up happening.
+  // Variant first -- the RAM fields below are interpreted relative to
+  // whichever variant is current (Bus::extRamExtBase()).
+  bus.setMachineVariant(appConfig.isPC1500A ? pc1500::Bus::MachineVariant::PC1500A
+                                             : pc1500::Bus::MachineVariant::PC1500);
+  bus.setExtRamExtSize(appConfig.extRamExtBytes);
+  bus.setExtRam0000Size(appConfig.extRam0000Bytes);
+  bus.setCe163Enabled(appConfig.ce163Enabled);
+  // Last, so it deterministically wins if a hand-edited conf file somehow
+  // has a contradictory combination -- setCe155Enabled(true) itself
+  // clears the two sizes and CE-163 right back off (see its own comment).
+  bus.setCe155Enabled(appConfig.ce155Enabled);
+
   std::string configuredStateFilePath =
       noState ? std::string() : appConfig.stateFilePath.value_or(std::string());
   bool stateRestored = false;
+  // Populated below only when the load fails specifically because the
+  // state file's saved RAM config doesn't match appConfig's current
+  // settings -- surfaced later, once the main window/ImGui context exist,
+  // as a startup popup offering to apply the saved config and retry
+  // instead of silently discarding the session (see that popup's own
+  // comment further down, near openStateMismatchPopup).
+  bool pendingStateMismatch = false;
+  pc1500::Bus::SavedConfig pendingStateMismatchConfig;
+  std::string pendingStateMismatchPath;
+  std::string pendingStateMismatchError;
   if (!configuredStateFilePath.empty() && appConfig.autoLoadOnStart) {
     std::ifstream probe(configuredStateFilePath, std::ios::binary);
     if (probe.good()) {
       probe.close();
       std::string stateErr;
-      if (pc1500host::loadStateFile(cpu, bus, configuredStateFilePath, &stateErr)) {
+      bool configMismatch = false;
+      if (pc1500host::loadStateFile(cpu, bus, configuredStateFilePath, &stateErr, &configMismatch,
+                                     &pendingStateMismatchConfig)) {
         std::printf("pc1500emu: restored state from %s\n", configuredStateFilePath.c_str());
         stateRestored = true;
+      } else if (configMismatch) {
+        pendingStateMismatch = true;
+        pendingStateMismatchPath = configuredStateFilePath;
+        pendingStateMismatchError = stateErr;
       } else {
         std::fprintf(stderr, "pc1500emu: could not load state file '%s': %s\n",
                      configuredStateFilePath.c_str(), stateErr.c_str());
@@ -1469,20 +1503,15 @@ int main(int argc, char** argv) {
     }
   }
   if (!stateRestored) {
-    // Must happen before this cpu.reset() -- see AppConfig::isPC1500A's
-    // own comment. A restored state file already carries its own variant/
-    // extRam sizes (Bus::loadState), so this is skipped in that branch.
-    // Variant first -- the RAM fields below are interpreted relative to
-    // whichever variant is current (Bus::extRamExtBase()).
-    bus.setMachineVariant(appConfig.isPC1500A ? pc1500::Bus::MachineVariant::PC1500A
-                                               : pc1500::Bus::MachineVariant::PC1500);
-    bus.setExtRamExtSize(appConfig.extRamExtBytes);
-    bus.setExtRam0000Size(appConfig.extRam0000Bytes);
-    bus.setCe163Enabled(appConfig.ce163Enabled);
-    // Last, so it deterministically wins if a hand-edited conf file somehow
-    // has a contradictory combination -- setCe155Enabled(true) itself
-    // clears the two sizes and CE-163 right back off (see its own comment).
-    bus.setCe155Enabled(appConfig.ce155Enabled);
+    // No state to restore (missing file, --no-state, autoLoadOnStart off,
+    // or Bus::loadState rejected it -- config mismatch or corrupt/
+    // truncated data) -- the config applied above is already correct
+    // either way, so just cold-boot from it. If this was a config
+    // mismatch, the startup popup below (triggered by pendingStateMismatch)
+    // may still retry the load with the saved config applied -- that
+    // retry's own cpu.loadState()/bus.loadState() calls fully overwrite
+    // whatever this cold boot left behind, so running it unconditionally
+    // here first is harmless.
     cpu.reset();
   }
 
@@ -2384,6 +2413,12 @@ int main(int argc, char** argv) {
   // panel's display, set on a successful ActiveDialog::LoadRomModule.
   std::array<std::string, pc1500::Bus::kNumRomModules> loadedModulePaths;
   std::string dialogError;
+  // One-shot trigger for the startup state-config-mismatch popup, below --
+  // pendingStateMismatch itself (set at startup, before this scope even
+  // exists) never clears, so this separate flag is what stops OpenPopup()
+  // from being called again every single frame once the user has already
+  // dismissed or acted on it once.
+  bool stateMismatchPopupShown = false;
   // Session-wide state-file/conf-file settings. configuredStateFilePath is
   // set up earlier in main(), before the SDL/ImGui init (see the
   // command-line-parsing block above); activeConfPath starts at whatever
@@ -2799,6 +2834,13 @@ int main(int argc, char** argv) {
     // id than BeginPopupModal looks up, so the popup would never open.
     bool openAboutPopup = false;
     bool openSpecialKeysPopup = false;
+    // One-shot: OpenPopup() is called from inside this per-frame block
+    // (not from the startup code that actually set pendingStateMismatch,
+    // which runs before any ImGui context/frame exists), gated on
+    // stateMismatchPopupShown so it only fires once even though this
+    // whole block re-runs every frame.
+    bool openStateMismatchPopup = pendingStateMismatch && !stateMismatchPopupShown;
+    if (openStateMismatchPopup) stateMismatchPopupShown = true;
 
     if (ImGui::BeginMainMenuBar()) {
       // Real keyboard shortcuts for the most-used menu actions -- polled
@@ -3301,8 +3343,7 @@ int main(int argc, char** argv) {
         row("F12", "ON (also BREAK while a program is running)");
         row("Shift+F12", "OFF");
         row("Ctrl+F12", "RESET (host-only; mimics the ALL RESET pinhole)");
-        row("Tab", "Standalone Shift keypress (tap-to-toggle, matching real "
-                    "PC-1500 hardware -- host Shift itself does nothing)");
+        row("Tab", "SHIFT (toggles SHIFT and clears on next keypress)");
         ImGui::EndTable();
       }
       ImGui::Separator();
@@ -3333,6 +3374,89 @@ int main(int argc, char** argv) {
       ImGui::TextUnformatted("Licensed under the Apache License, Version 2.0.");
       ImGui::Separator();
       if (ImGui::Button("OK", ImVec2(120, 0))) {
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
+
+    // Startup state-config-mismatch popup -- Bus::loadState refuses to
+    // restore a saved session whose RAM configuration doesn't match
+    // appConfig's current settings (see its own comment: raw RAM contents
+    // are only meaningful relative to the memory-map shape they were
+    // saved under). Rather than just cold-booting and reporting this to
+    // stderr only (invisible in a normal GUI launch), offer to apply the
+    // saved configuration and retry the restore -- the session is still
+    // sitting right there in the state file, just not currently loadable.
+    if (openStateMismatchPopup) {
+      ImGui::OpenPopup("Saved Session Configuration Mismatch");
+    }
+    if (ImGui::BeginPopupModal("Saved Session Configuration Mismatch", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+      // Fixed-height scrolling region for the path/reason -- both are
+      // unbounded-length strings (a long install path, a full sentence
+      // explaining the mismatch), but this whole popup has to fit inside
+      // pc1500emu's own small LCD-emulator-sized main window (no
+      // multi-viewport support), so it can't just grow to fit them: the
+      // Apply/Start Fresh buttons below need a *fixed* height budget above
+      // them, not one that varies with how long the saved path happens to
+      // be.
+      ImGui::TextWrapped("Could not restore the saved session -- its configuration doesn't "
+                          "match the current Settings:");
+      ImGui::BeginChild("##mismatchdetail", ImVec2(420, 80), true);
+      ImGui::TextWrapped("%s", pendingStateMismatchPath.c_str());
+      ImGui::Spacing();
+      ImGui::TextWrapped("%s", pendingStateMismatchError.c_str());
+      ImGui::EndChild();
+      const char* variantStr =
+          pendingStateMismatchConfig.machineVariant == pc1500::Bus::MachineVariant::PC1500A
+              ? "PC-1500A"
+              : "PC-1500";
+      if (pendingStateMismatchConfig.ce163Enabled) {
+        ImGui::Text("Saved config -- %s, 0000H: CE-163 (32K banked)", variantStr);
+      } else if (pendingStateMismatchConfig.ce155Enabled) {
+        ImGui::Text("Saved config -- %s, 0000H: CE-155 (8K)", variantStr);
+      } else {
+        ImGui::Text("Saved config -- %s, 0000H: %zu bytes, expansion: %zu bytes", variantStr,
+                     pendingStateMismatchConfig.extRam0000Size,
+                     pendingStateMismatchConfig.extRamExtSize);
+      }
+      ImGui::Separator();
+      if (ImGui::Button("Apply Saved Configuration and Restore Session", ImVec2(380, 0))) {
+        // Same order main.cpp's own startup block applies appConfig in --
+        // variant first (the two size setters below interpret their bytes
+        // relative to whichever variant is current), ce155 last so it
+        // deterministically wins if the saved combination is ever
+        // ambiguous (it shouldn't be -- these setters enforce mutual
+        // exclusion, so a saved config could only have reached this
+        // combination through the same ordering in the first place).
+        bus.setMachineVariant(pendingStateMismatchConfig.machineVariant);
+        bus.setExtRamExtSize(pendingStateMismatchConfig.extRamExtSize);
+        bus.setExtRam0000Size(pendingStateMismatchConfig.extRam0000Size);
+        bus.setCe163Enabled(pendingStateMismatchConfig.ce163Enabled);
+        bus.setCe155Enabled(pendingStateMismatchConfig.ce155Enabled);
+        appConfig.isPC1500A =
+            pendingStateMismatchConfig.machineVariant == pc1500::Bus::MachineVariant::PC1500A;
+        appConfig.extRamExtBytes = pendingStateMismatchConfig.extRamExtSize;
+        appConfig.extRam0000Bytes = pendingStateMismatchConfig.extRam0000Size;
+        appConfig.ce163Enabled = pendingStateMismatchConfig.ce163Enabled;
+        appConfig.ce155Enabled = pendingStateMismatchConfig.ce155Enabled;
+        persistActiveConf();
+        std::string retryErr;
+        if (pc1500host::loadStateFile(cpu, bus, pendingStateMismatchPath, &retryErr)) {
+          stateActionStatus = "Restored session from " + pendingStateMismatchPath;
+        } else {
+          // Shouldn't happen -- config now matches what was just applied
+          // from the same file's own header -- but report it plainly
+          // rather than silently failing a second time if it somehow does
+          // (e.g. the file was truncated/corrupted between the two reads).
+          stateActionStatus = "Still could not restore session: " + retryErr;
+        }
+        stateActionStatusFramesRemaining = kStateActionStatusFrames;
+        pendingStateMismatch = false;
+        ImGui::CloseCurrentPopup();
+      }
+      if (ImGui::Button("Start Fresh with Current Settings", ImVec2(380, 0))) {
+        pendingStateMismatch = false;
         ImGui::CloseCurrentPopup();
       }
       ImGui::EndPopup();

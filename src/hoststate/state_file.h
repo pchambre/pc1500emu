@@ -8,7 +8,16 @@
 // widened Bus::saveState/loadState from two ROM module slots to four;
 // version 4 added the CE-163 module's enabled flag, active bank, and 32K
 // backing store; version 5 added the PC-1500/PC-1500A machine-variant
-// flag and the CE-155 module's enabled flag) -- restoring a session is
+// flag and the CE-155 module's enabled flag; version 6 reordered
+// Bus::saveState/loadState to write the small RAM-config scalars first,
+// before the large me0_/ce163Ram_/romModules blobs, so loadState can
+// reject a state whose saved config doesn't match the currently
+// configured hardware without needing to read past them first -- see
+// Bus::loadState's own comment for why that matters: raw memory contents
+// saved under one RAM configuration are meaningless -- not just for the
+// reserve-key area, but in general -- loaded into a different one, the
+// same way real PC-1500 RAM (short of a battery-backed module) doesn't
+// survive a hardware reconfiguration either) -- restoring a session is
 // meant to resume exactly where OFF left the machine, the same way real
 // hardware's OFF/ON cycle just halts and wakes the CPU in place rather
 // than resetting it, so the caller must NOT call cpu.reset() after a
@@ -24,7 +33,7 @@
 namespace pc1500host {
 
 inline constexpr char kStateFileMagic[4] = {'P', 'C', '1', 'S'};
-inline constexpr uint16_t kStateFileVersion = 5;
+inline constexpr uint16_t kStateFileVersion = 6;
 
 // Writes an 8-byte header (4-byte magic, u16 version, 2 reserved bytes),
 // then cpu.saveState(), then bus.saveState(). Returns false with *error
@@ -41,8 +50,12 @@ bool saveStateFile(const lh5801::CPU& cpu, const pc1500::Bus& bus, const std::st
 // should treat any false return as fatal to this restore attempt -- if
 // the file is missing/unreadable, too short, has the wrong magic, or a
 // different version. On success, the caller must NOT follow up with
-// cpu.reset() -- see the file header comment.
-bool loadStateFile(lh5801::CPU& cpu, pc1500::Bus& bus, const std::string& path,
-                    std::string* error);
+// cpu.reset() -- see the file header comment. `configMismatch` and
+// `savedConfig`, if non-null, are forwarded from Bus::loadState -- see its
+// own comment -- and are only meaningfully set when this returns false
+// specifically because of a config mismatch (as opposed to a missing/bad-
+// magic/wrong-version/truncated file, none of which populate them).
+bool loadStateFile(lh5801::CPU& cpu, pc1500::Bus& bus, const std::string& path, std::string* error,
+                    bool* configMismatch = nullptr, pc1500::Bus::SavedConfig* savedConfig = nullptr);
 
 }  // namespace pc1500host

@@ -93,6 +93,12 @@ void testRoundTrip() {
   pc1500::Keyboard kb2;
   pc1500::Bus bus2(kb2);
   lh5801::CPU cpu2(bus2);
+  // loadState now rejects a config mismatch outright (see Bus::loadState's
+  // own comment) -- bus2 must be configured to match `bus` *before* the
+  // load, the same way main.cpp now applies AppConfig before attempting
+  // one, rather than relying on the load itself to set these fields.
+  bus2.setExtRamExtSize(0x2000);
+  bus2.setExtRam0000Size(0x4000);
   err.clear();
   CHECK(pc1500host::loadStateFile(cpu2, bus2, path, &err));
   CHECK(err.empty());
@@ -154,6 +160,9 @@ void testCe163RoundTrip() {
   pc1500::Keyboard kb2;
   pc1500::Bus bus2(kb2);
   lh5801::CPU cpu2(bus2);
+  // Must match bus's config before loading -- see testRoundTrip's own
+  // comment on this same pattern.
+  bus2.setCe163Enabled(true);
   err.clear();
   CHECK(pc1500host::loadStateFile(cpu2, bus2, path, &err));
   CHECK(err.empty());
@@ -196,6 +205,10 @@ void testMachineVariantAndCe155RoundTrip() {
   pc1500::Keyboard kb2;
   pc1500::Bus bus2(kb2);
   lh5801::CPU cpu2(bus2);
+  // Must match bus's config before loading -- see testRoundTrip's own
+  // comment on this same pattern.
+  bus2.setMachineVariant(pc1500::Bus::MachineVariant::PC1500A);
+  bus2.setCe155Enabled(true);
   err.clear();
   CHECK(pc1500host::loadStateFile(cpu2, bus2, path, &err));
   CHECK(err.empty());

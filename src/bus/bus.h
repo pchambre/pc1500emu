@@ -845,7 +845,43 @@ class Bus : public lh5801::MemoryBus {
   // cpu.reset() afterward) is the correct model of a real PC-1500's OFF/ON
   // cycle, not a reset.
   void saveState(std::ostream& os) const;
-  bool loadState(std::istream& is);
+
+  // The RAM-config scalars a state file carries, surfaced to a caller when
+  // loadState rejects a load over a mismatch -- so it can offer "apply
+  // this configuration and try again" instead of just reporting an error
+  // and discarding the saved session outright.
+  struct SavedConfig {
+    size_t extRamExtSize = 0;
+    size_t extRam0000Size = 0;
+    bool ce163Enabled = false;
+    MachineVariant machineVariant = MachineVariant::PC1500;
+    bool ce155Enabled = false;
+  };
+
+  // Refuses to load (returns false, leaving `this` completely untouched --
+  // not even partially applied) if the saved RAM-config scalars
+  // (extRamExtSize/extRam0000Size/ce163Enabled/machineVariant/ce155Enabled)
+  // don't match this Bus's *current* values for those exact same fields.
+  // Deliberate: raw me0_ contents are only meaningful relative to the
+  // specific memory-map shape they were saved under (program area,
+  // reserve-key area, etc. all live at different addresses depending on
+  // installed RAM) -- loading them into a differently-configured Bus is
+  // the same category of nonsensical as real PC-1500 RAM (short of a
+  // battery-backed module) simply not surviving a hardware
+  // reconfiguration. The caller is responsible for applying the intended
+  // config (setMachineVariant/setExtRamExtSize/setExtRam0000Size/
+  // setCe163Enabled/setCe155Enabled) *before* calling this -- see
+  // main.cpp's startup sequence, which now applies AppConfig's persisted
+  // settings unconditionally, before attempting any state-file load, so
+  // there's always a well-defined "current config" to compare against.
+  // `error`, if non-null, is set to a human-readable reason on failure
+  // (config mismatch, or truncated/corrupt data). `configMismatch` and
+  // `savedConfig`, if non-null, are set/populated only on the config-
+  // mismatch failure path (left untouched -- not even zeroed -- on
+  // success or on any other failure) -- see main.cpp's startup-time
+  // mismatch prompt, the only current caller that reads them.
+  bool loadState(std::istream& is, std::string* error = nullptr, bool* configMismatch = nullptr,
+                 SavedConfig* savedConfig = nullptr);
 
  private:
   // Applies a release that setKeyState deferred: updates Keyboard, and (for
@@ -929,15 +965,31 @@ class Bus : public lh5801::MemoryBus {
   // (see the constructor's own comment for why it must be pre-zeroed).
   // Its location moves with reserveAreaBase() whenever installed RAM
   // changes, so this needs to be re-applied any time a setter changes
-  // that -- not just once at construction. Whichever location was
-  // previously seeded (if different from the current one) is simply left
-  // behind: harmless, since the documented reset+CL+NEW0 workflow after
-  // any RAM-config change means nothing depends on stale reserve-area
-  // content surviving a reconfiguration, matching how real hardware would
-  // also need a fresh start after physically swapping RAM modules.
+  // that -- not just once at construction -- *and* after loadState()
+  // restores a saved me0_ snapshot (see that function's own call site):
+  // a state saved before this method existed (or under a different RAM
+  // config than the one it's now being loaded into) can have its live
+  // reserve area sitting at the generic, never-seeded 0xFF fill, exactly
+  // reproducing the original ERROR 13 bug even on a build that has this
+  // fix -- confirmed live this session, a real gap in the first version
+  // of this fix (which only covered the constructor and the four
+  // RAM-config setters, not a *loaded* config).
+  //
+  // Only reseeds a range that's still entirely the generic 0xFF fill --
+  // i.e. provably never touched since power-on/load, matching this
+  // area's own "there is no real-hardware equivalent of a truly
+  // uninitialized reserve area" invariant. Deliberately NOT unconditional:
+  // a range holding real F1-F6 assignment data (or already-correctly-
+  // zeroed empty data) never reads back as all-0xFF, so this can't
+  // clobber genuine saved assignments -- only ever fixes a location this
+  // invariant has never actually been established for yet.
   void reseedReserveArea() {
     uint16_t base = reserveAreaBase();
-    std::fill(me0_.begin() + base + 0x8, me0_.begin() + base + 0xC5, 0x00);
+    bool stillGenericFill = std::all_of(me0_.begin() + base + 0x8, me0_.begin() + base + 0xC5,
+                                         [](uint8_t b) { return b == 0xFF; });
+    if (stillGenericFill) {
+      std::fill(me0_.begin() + base + 0x8, me0_.begin() + base + 0xC5, 0x00);
+    }
   }
 
   std::array<uint8_t, 65536> me0_{};

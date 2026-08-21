@@ -4,6 +4,38 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.7.3] - 2026-08-21
+
+### Fixed
+- `ERROR 13` on RESERVE-key assignment could still occur under a non-bare
+  RAM configuration even with 0.7.2's `reseedReserveArea()` fix, if the
+  saved state file being auto-loaded on startup predated that fix (or was
+  saved under a different RAM configuration): `Bus::loadState` restored
+  `me0_` and the RAM-config scalars directly, bypassing the setters (and
+  therefore `reseedReserveArea()`) entirely. `Bus::loadState` now refuses
+  to load a state file whose saved RAM configuration doesn't match the
+  Bus's current configuration at load time, leaving the Bus completely
+  untouched -- raw RAM contents (including the reserve area) are only
+  meaningful relative to the specific memory-map shape they were saved
+  under, the same way real PC-1500 RAM (short of a battery-backed module)
+  doesn't survive a hardware reconfiguration either. `main.cpp`'s startup
+  sequence now applies `AppConfig`'s persisted hardware settings
+  unconditionally, before attempting any state-file load, so there's
+  always a well-defined "current config" for this check.
+
+### Added
+- Rather than silently discarding a saved session that fails the new
+  config-mismatch check above, `pc1500emu` now shows a startup popup
+  explaining what didn't match and offering to apply the saved
+  configuration and retry the restore, in addition to just starting fresh
+  with the current settings -- the session is still sitting right there
+  in the state file, just not currently loadable.
+
+### Changed
+- Help > Special Keys' Tab row shortened to "SHIFT (toggles SHIFT and
+  clears on next keypress)" -- clearer about which physical key is meant
+  and less text than 0.7.2's rewording.
+
 ## [0.7.2] - 2026-08-21
 
 ### Fixed

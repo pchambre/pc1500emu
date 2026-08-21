@@ -28,8 +28,8 @@ bool saveStateFile(const lh5801::CPU& cpu, const pc1500::Bus& bus, const std::st
   return true;
 }
 
-bool loadStateFile(lh5801::CPU& cpu, pc1500::Bus& bus, const std::string& path,
-                    std::string* error) {
+bool loadStateFile(lh5801::CPU& cpu, pc1500::Bus& bus, const std::string& path, std::string* error,
+                    bool* configMismatch, pc1500::Bus::SavedConfig* savedConfig) {
   std::ifstream f(path, std::ios::binary);
   if (!f) {
     if (error) *error = "could not open '" + path + "' for reading";
@@ -51,8 +51,9 @@ bool loadStateFile(lh5801::CPU& cpu, pc1500::Bus& bus, const std::string& path,
     return false;
   }
   cpu.loadState(f);
-  if (!bus.loadState(f) || !f) {
-    if (error) *error = "'" + path + "' is truncated or corrupt";
+  std::string busError;
+  if (!bus.loadState(f, &busError, configMismatch, savedConfig) || !f) {
+    if (error) *error = "'" + path + "': " + (busError.empty() ? "truncated or corrupt" : busError);
     return false;
   }
   return true;
