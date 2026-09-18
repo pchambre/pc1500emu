@@ -3,6 +3,9 @@
 #include "expansion_mock.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <thread>
 
 namespace pc1500 {
 
@@ -137,7 +140,12 @@ fs::path ExpansionMock::resolveCopyOrMoveDestination(const std::string& srcBasen
   return resolved;
 }
 
-uint8_t ExpansionMock::processCommand(uint8_t cmd, std::vector<uint8_t>& window) {
+// Real per-command work, unchanged from the old synchronous processCommand()
+// this was renamed from -- now called from a background thread (see
+// processCommand()'s own comment) instead of directly from Bus::writeME0(),
+// so a case that genuinely blocks for a while (kCommandTestDelay's real
+// sleep) no longer freezes the GUI/emulation loop.
+uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window) {
   switch (cmd) {
     case kCommandListSdDir:
       return listSdDir(window);
@@ -197,6 +205,20 @@ uint8_t ExpansionMock::processCommand(uint8_t cmd, std::vector<uint8_t>& window)
       return skipSdValues(window);
     case kCommandValidateSdName:
       return validateAndFoldSdName(window);
+    case kCommandTestDelay: {
+      // Diagnostic only -- see PC_EXP.h's own comment and the real
+      // firmware's DoCommand() case. Runs on processCommand()'s own
+      // background thread (2026-09-17), so a real sleep here genuinely
+      // holds BUSY for the requested duration without freezing the GUI/
+      // emulation loop -- matches the real MCU-side sleep_ms() this
+      // command performs on real hardware, letting the ROM-side DOSTUFF
+      // keyword's own wait/poll loop be exercised against a real,
+      // human-observable delay instead of instant resolution.
+      uint8_t seconds = window[0];  // EXP_BUFFER_START_ABS
+      if (seconds == 0) seconds = 1;
+      std::this_thread::sleep_for(std::chrono::seconds(seconds));
+      return kStatusSuccess;
+    }
     case kCommandClearStatus:
       return kStatusReady;
     default:
@@ -347,41 +369,42 @@ uint8_t ExpansionMock::openSdFileRead(std::vector<uint8_t>& window) {
 }
 
 // dataLen is a 2-byte BE count at window[0..1] (not length-prefixed-string
-// style -- matches main.c's own WRITE_TO_SD_FILE exactly), data starts at
-// window[2]. main.c also echoes dataLen into page 15 offset 0-1
-// (window[15*256..15*256+1]) as a debug artifact of the real firmware;
-// mirrored here for fidelity even though nothing currently reads it back.
+// style -- matches main.c's own WRITE_TO_SD_FILE exactly), data now starts
+// at window[0] (the full payload, no in-band length prefix -- see
+// kLengthPortOffset's own comment). The page-15 debug echo main.c used to
+// have (dataLen mirrored into the 6K ROM/keyword-table shadow region) was a
+// real landmine in the original and has been removed there, 2026 session --
+// not mirrored here either.
 uint8_t ExpansionMock::writeToSdFile(std::vector<uint8_t>& window) {
   if (fileStatus_ != kFileStatusOpenWrite || !openFile_.is_open()) return kStatusError;
-  if (window.size() < 2) return kStatusError;
-  uint16_t dataLen = (static_cast<uint16_t>(window[0]) << 8) | window[1];
+  if (window.size() < static_cast<size_t>(kLengthPortOffset) + 2) return kStatusError;
+  uint16_t dataLen = (static_cast<uint16_t>(window[kLengthPortOffset]) << 8) |
+                      window[kLengthPortOffset + 1];
   if (dataLen == 0) return kStatusError;
-  if (window.size() < static_cast<size_t>(2) + dataLen) return kStatusError;
-  if (window.size() > 15 * 256 + 1) {
-    window[15 * 256 + 0] = static_cast<uint8_t>(dataLen >> 8);
-    window[15 * 256 + 1] = static_cast<uint8_t>(dataLen & 0xFF);
-  }
-  openFile_.write(reinterpret_cast<const char*>(window.data() + 2), dataLen);
+  if (window.size() < static_cast<size_t>(dataLen)) return kStatusError;
+  openFile_.write(reinterpret_cast<const char*>(window.data()), dataLen);
   if (!openFile_.good()) return kStatusError;
   openFile_.flush();
   bytesWrittenTotal_ += dataLen;
   return kStatusSuccess;
 }
 
-// requestLen capped at 254 (not 255) matching main.c's own comment: data
-// goes back into the same page starting at +2, so it must fit in what's
-// left of a 256-byte page.
+// requestLen capped at kMaxTransferLen (1024, was 254 pre-2026-session --
+// see kLengthPortOffset's own comment for why the cap could be widened: the
+// length moved out of the payload page entirely, so the payload is now the
+// full window[0..kMaxTransferLen-1], not confined to one 256-byte page).
 uint8_t ExpansionMock::readFromSdFile(std::vector<uint8_t>& window) {
   if (fileStatus_ != kFileStatusOpenRead || !openFile_.is_open()) return kStatusError;
-  if (window.size() < 2) return kStatusError;
-  uint16_t requestLen = (static_cast<uint16_t>(window[0]) << 8) | window[1];
-  if (requestLen == 0 || requestLen > 254) return kStatusError;
-  if (window.size() < static_cast<size_t>(2) + requestLen) return kStatusError;
-  openFile_.read(reinterpret_cast<char*>(window.data() + 2), requestLen);
+  if (window.size() < static_cast<size_t>(kLengthPortOffset) + 2) return kStatusError;
+  uint16_t requestLen = (static_cast<uint16_t>(window[kLengthPortOffset]) << 8) |
+                        window[kLengthPortOffset + 1];
+  if (requestLen == 0 || requestLen > kMaxTransferLen) return kStatusError;
+  if (window.size() < static_cast<size_t>(requestLen)) return kStatusError;
+  openFile_.read(reinterpret_cast<char*>(window.data()), requestLen);
   std::streamsize bytesRead = openFile_.gcount();
   openFile_.clear();  // clear eof/fail from a short read -- not an error here
-  window[0] = static_cast<uint8_t>(bytesRead >> 8);
-  window[1] = static_cast<uint8_t>(bytesRead & 0xFF);
+  window[kLengthPortOffset] = static_cast<uint8_t>(bytesRead >> 8);
+  window[kLengthPortOffset + 1] = static_cast<uint8_t>(bytesRead & 0xFF);
   return kStatusSuccess;
 }
 
@@ -857,6 +880,53 @@ uint8_t ExpansionMock::getSdDfText(std::vector<uint8_t>& window) {
   std::string text = std::to_string(freeBytes) + "F / " + std::to_string(totalBytes) + "T";
   writeLengthPrefixedString(text, window, kScratchOffset);
   return kStatusSuccess;
+}
+
+ExpansionMock::~ExpansionMock() {
+  if (worker_.joinable()) worker_.join();
+}
+
+// Real async entry point (2026-09-17, replacing the old synchronous
+// processCommand() this file used to have -- dispatchCommand() above is
+// what that function's body was renamed to). Mirrors the real RP2350
+// firmware's own architecture: core0 (here, the calling/main thread)
+// stamps BUSY and hands the command off, never blocking; core1 (here, a
+// background std::thread) does the real work -- including, for
+// kCommandTestDelay, an actual multi-second sleep -- and reports the
+// final status when done. Requested by the user (2026-09-17) after
+// finding the old instant-resolution mock couldn't exercise the ROM's
+// real HLT/timer-poll wait loop at all, since it always saw a final
+// status before the ROM's own ~lda/cpi~ check ever ran.
+//
+// Synchronization: `window` itself is touched ONLY by whichever thread
+// currently "owns" the in-flight command (the worker, from launch until
+// its final status write; the main thread the rest of the time) -- by
+// the same protocol the real firmware and ROM already rely on (never
+// read data bytes until you've observed a non-BUSY status). pendingStatus_
+// is the one piece of state genuinely read from both threads at
+// unpredictable times, so it's a real std::atomic: the worker's final
+// store uses release ordering, Bus::readME0()'s poll (pollStatus()) uses
+// acquire, so a caller that waits to see non-BUSY there before reading
+// any other window byte is guaranteed to see this command's real result
+// data too, with no separate lock needed. Known limitation, acceptable
+// for a dev/test tool used interactively by one person: don't unload or
+// reconfigure a module while one of its commands is still in flight --
+// nothing currently blocks that, and it would leave the worker thread
+// writing into a `window` vector that's since been reset out from under
+// it.
+void ExpansionMock::processCommand(uint8_t cmd, std::vector<uint8_t>& window,
+                                    size_t instructionOffset) {
+  if (worker_.joinable()) worker_.join();  // serialize -- see this function's own comment
+  window[instructionOffset] = kStatusBusy;
+  pendingStatus_.store(kStatusBusy, std::memory_order_relaxed);
+  worker_ = std::thread(&ExpansionMock::runCommandAsync, this, cmd, &window, instructionOffset);
+}
+
+void ExpansionMock::runCommandAsync(uint8_t cmd, std::vector<uint8_t>* window,
+                                     size_t instructionOffset) {
+  uint8_t status = dispatchCommand(cmd, *window);
+  (*window)[instructionOffset] = status;
+  pendingStatus_.store(status, std::memory_order_release);
 }
 
 }  // namespace pc1500

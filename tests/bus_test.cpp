@@ -716,6 +716,16 @@ void writeLengthPrefixedArg(pc1500::Bus& bus, const std::string& text) {
 
 uint8_t triggerCommand(pc1500::Bus& bus, uint8_t cmd) {
   bus.writeME0(0x8FFF, cmd);
+  // ExpansionMock::processCommand() runs the real work on a background
+  // thread now (2026-09-17), returning immediately after stamping BUSY --
+  // matches the real firmware's own core0/core1 split, needed so a ROM-
+  // side wait loop has real BUSY duration to actually poll against. Every
+  // command every one of this file's own tests exercises still completes
+  // "instantly" in wall-clock terms once the worker thread actually runs,
+  // so waiting for it here preserves this helper's original synchronous-
+  // looking contract for its 19 existing callers without any of them
+  // needing to change.
+  bus.expansionMock().waitUntilIdleForTest();
   return bus.readME0(0x8FFF);
 }
 
@@ -795,10 +805,13 @@ void testExpansionModuleFileWriteReadRoundTrip() {
   CHECK(bus->readME0(0x8000) == pc1500::ExpansionMock::kFileStatusOpenWrite);
 
   std::string payload = "Hello, PC-1500!";
-  bus->writeME0(0x8000, static_cast<uint8_t>(payload.size() >> 8));
-  bus->writeME0(0x8001, static_cast<uint8_t>(payload.size() & 0xFF));
+  // Length lives at EXP_LENGTH_PORT_PAGE/ADDRESS (0x87FD/0x87FE), outside the
+  // payload region -- see PC_EXP.h's own comment. Payload itself starts at
+  // 0x8000 with no +2 offset.
+  bus->writeME0(0x87FD, static_cast<uint8_t>(payload.size() >> 8));
+  bus->writeME0(0x87FE, static_cast<uint8_t>(payload.size() & 0xFF));
   for (size_t i = 0; i < payload.size(); i++) {
-    bus->writeME0(static_cast<uint16_t>(0x8002 + i), static_cast<uint8_t>(payload[i]));
+    bus->writeME0(static_cast<uint16_t>(0x8000 + i), static_cast<uint8_t>(payload[i]));
   }
   CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandWriteToSdFile) ==
         pc1500::ExpansionMock::kStatusSuccess);
@@ -829,14 +842,14 @@ void testExpansionModuleFileWriteReadRoundTrip() {
                        bus->readME0(0x8003);
   CHECK(openSize == payload.size());
 
-  bus->writeME0(0x8000, 0x00);
-  bus->writeME0(0x8001, static_cast<uint8_t>(payload.size()));  // requestLen, BE, < 254
+  bus->writeME0(0x87FD, 0x00);
+  bus->writeME0(0x87FE, static_cast<uint8_t>(payload.size()));  // requestLen, BE, < EXP_MAX_TRANSFER_LEN
   CHECK(triggerCommand(*bus, pc1500::ExpansionMock::kCommandReadFromSdFile) ==
         pc1500::ExpansionMock::kStatusSuccess);
-  uint16_t bytesRead = (static_cast<uint16_t>(bus->readME0(0x8000)) << 8) | bus->readME0(0x8001);
+  uint16_t bytesRead = (static_cast<uint16_t>(bus->readME0(0x87FD)) << 8) | bus->readME0(0x87FE);
   CHECK(bytesRead == payload.size());
   for (size_t i = 0; i < payload.size(); i++) {
-    CHECK(bus->readME0(static_cast<uint16_t>(0x8002 + i)) == static_cast<uint8_t>(payload[i]));
+    CHECK(bus->readME0(static_cast<uint16_t>(0x8000 + i)) == static_cast<uint8_t>(payload[i]));
   }
 
   writeLengthPrefixedArg(*bus, "TEST.BIN");  // GET_SD_FILE_NAME doesn't take an arg, but

@@ -3,23 +3,33 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace pc1500 {
 
 // Mocks a real expansion-board MCU's command processing (e.g. the
-// PC1500-PSOC5 project's main.c DoCommand()) for a Bus::RomModule with a
-// writable data window. Bus calls processCommand() synchronously whenever
-// the CPU writes to that module's configured instruction address -- same
-// contract as the real board's DoCommand(). SD-card commands are backed by
-// a real directory on the host filesystem (setRootDir()) rather than an
-// in-memory list, so the still-stub SSAVE/SLOAD/SRM/SDF ROM routines have
-// something real to develop and test against -- drop files into that
-// directory and SLS/SLOAD see them; SSAVE writes real files there.
+// PC1500-PSOC5 project's RP2350 monitor.c DoCommand()) for a Bus::RomModule
+// with a writable data window. Bus calls processCommand() whenever the CPU
+// writes to that module's configured instruction address -- same contract
+// as the real board's DoCommand()/WriteStatus() protocol (write a command
+// byte, poll the same address for a non-BUSY status). Genuinely
+// asynchronous (2026-09-17, see processCommand()'s own comment): a
+// background thread does the real work while the calling/main thread
+// returns immediately, mirroring the real firmware's own core0/core1
+// split -- needed so a ROM-side wait loop (HLT/timer-poll or a tight
+// busy-loop, either way) has real, multi-instruction-cycle BUSY duration
+// to actually exercise, not an already-resolved status the instant it
+// checks. SD-card commands are backed by a real directory on the host
+// filesystem (setRootDir()) rather than an in-memory list, so the still-stub
+// SSAVE/SLOAD/SRM/SDF ROM routines have something real to develop and test
+// against -- drop files into that directory and SLS/SLOAD see them; SSAVE
+// writes real files there.
 // Command/status constants below mirror PC_EXP.h exactly; keep them in
 // sync by hand (same caveat as rom_defs.inc's own mirror of PC_EXP.h).
 class ExpansionMock {
@@ -50,14 +60,42 @@ class ExpansionMock {
   void setFreeSpaceBytes(uint32_t bytes) { freeSpaceBytes_ = bytes; }
   uint32_t freeSpaceBytes() const { return freeSpaceBytes_; }
 
-  // Processes `cmd` against `window` (a module's own writable data-window
-  // buffer, indexed from 0 -- i.e. window[0] is EXP_BUFFER_START_PAGE/
-  // EXP_BUFFER_START_ADDRESS, window[256] is EXP_SCRATCH_PAGE/0, in
-  // PC_EXP.h's own addressing). Returns the final status byte to store
-  // back at the instruction address, exactly like DoCommand()'s own
-  // WriteStatus() calls -- BUSY is never externally observable here since
-  // (unlike real SD I/O) every command completes within the one call.
-  uint8_t processCommand(uint8_t cmd, std::vector<uint8_t>& window);
+  // Starts processing `cmd` against `window` (a module's own writable
+  // data-window buffer, indexed from 0 -- i.e. window[0] is
+  // EXP_BUFFER_START_PAGE/EXP_BUFFER_START_ADDRESS, window[256] is
+  // EXP_SCRATCH_PAGE/0, in PC_EXP.h's own addressing) on a background
+  // thread and returns immediately -- mirrors the real RP2350 firmware's
+  // own core0-hands-off-to-core1 architecture (2026-09-17; the old,
+  // fully-synchronous version couldn't hold BUSY for any real duration,
+  // so it never exercised the ROM's own HLT/status-poll wait loop at
+  // all). `instructionOffset` is where the status byte lives within
+  // `window` (Bus already knows this as m.instructionAddr-m.dataWindowBase).
+  // Stamps BUSY into `window` synchronously before returning; see
+  // pollStatus() for how a caller observes the real final status once the
+  // worker thread reports it, and this class's own .cpp comment for the
+  // full synchronization contract.
+  void processCommand(uint8_t cmd, std::vector<uint8_t>& window, size_t instructionOffset);
+
+  // The status of whatever command processCommand() most recently began
+  // -- Bus::readME0() serves this (not window[instructionOffset] read
+  // directly) on every read of a loaded module's instruction address, so
+  // a real in-progress delay is genuinely observable as BUSY rather than
+  // Bus reading back whatever the worker thread's own writes have gotten
+  // to so far. See this class's own .cpp comment for the acquire/release
+  // pairing this relies on.
+  uint8_t pollStatus() const { return pendingStatus_.load(std::memory_order_acquire); }
+
+  // Test-only: blocks until whatever command processCommand() most
+  // recently started has fully finished. Real ROM/CPU code never needs
+  // this -- it always polls pollStatus() instead, the same way real
+  // hardware polls the status byte -- but a test calling processCommand()
+  // directly (bypassing Bus/the CPU entirely) needs an explicit way to
+  // wait for the async result before checking pollStatus().
+  void waitUntilIdleForTest() {
+    if (worker_.joinable()) worker_.join();
+  }
+
+  ~ExpansionMock();
 
   // PC_EXP.h mirrors -- see that file for the authoritative definitions.
   static constexpr uint8_t kStatusReady = 0;
@@ -79,6 +117,7 @@ class ExpansionMock {
   static constexpr uint8_t kCommandOpenSdFileRead = 10;
   static constexpr uint8_t kCommandReadFromSdFile = 11;
   static constexpr uint8_t kCommandListSdDir = 12;
+  static constexpr uint8_t kCommandTestDelay = 13;  // diagnostic only, see PC_EXP.h's own comment
   static constexpr uint8_t kCommandRemoveSdFile = 14;
   static constexpr uint8_t kCommandGetSdVolumeSize = 15;
   static constexpr uint8_t kCommandChangeSdDir = 16;
@@ -134,6 +173,17 @@ class ExpansionMock {
 
   static constexpr int kScratchOffset = 256;  // EXP_SCRATCH_PAGE(1) * 256
 
+  // EXP_LENGTH_PORT_PAGE/ADDRESS -- readFromSdFile/writeToSdFile's 2-byte BE
+  // length value, deliberately outside the payload region. Same page as the
+  // instruction byte (EXP_INSTRUCTION_PAGE*256+EXP_INSTRUCTION_ADDRESS =
+  // 2047, not part of this window/vector -- Bus special-cases that one
+  // address), just before it. 2026 session: widened the single-call payload
+  // cap from 254 to kMaxTransferLen, moving the length out of page 0 so the
+  // whole 4-page payload region can be pure data with no +2 offset.
+  static constexpr int kLengthPortOffset = 0x7FD;  // = EXP_LENGTH_PORT_PAGE*256 +
+                                                     // EXP_LENGTH_PORT_ADDRESS - window base
+  static constexpr int kMaxTransferLen = 1024;      // matches PC_EXP.h's EXP_MAX_TRANSFER_LEN
+
   static constexpr int kDirNameLen = 16;
   static constexpr int kDirSizeTextLen = 10;
   static constexpr int kDirRecordSize = 30;
@@ -145,10 +195,25 @@ class ExpansionMock {
   // for entries *and* the summary line inside the 2K data window (shrunk
   // from 4K when ROM_BASE moved 0x9000->0x8800 to grow the ROM region to
   // 6K, 2026-08-18 session), clear of the instruction byte at its last
-  // address. Matches PC_EXP.h's own mirror.
+  // address. Unchanged by the kLengthPortOffset addition (same slack
+  // absorbs the extra 2 reserved bytes -- see PC_EXP.h's own comment).
+  // Matches PC_EXP.h's own mirror.
   static constexpr int kDirMaxEntries = 67;
 
  private:
+  // The actual per-command work -- unchanged body from the old
+  // synchronous processCommand() this was renamed from; now called only
+  // from runCommandAsync() on the worker thread, never directly.
+  uint8_t dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window);
+  // Worker-thread entry point: runs dispatchCommand(), then publishes the
+  // real final status both into *window and pendingStatus_ (release
+  // order) -- see processCommand()'s own .cpp comment for the full
+  // synchronization contract this pairs with.
+  void runCommandAsync(uint8_t cmd, std::vector<uint8_t>* window, size_t instructionOffset);
+
+  std::atomic<uint8_t> pendingStatus_{kStatusReady};
+  std::thread worker_;
+
   static void formatSizeText(uint32_t value, std::vector<uint8_t>& window, size_t offset,
                               int width);
   static void writeText(const std::string& text, std::vector<uint8_t>& window, size_t offset,

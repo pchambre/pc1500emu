@@ -621,6 +621,15 @@ class Bus : public lh5801::MemoryBus {
   void unloadRomModule(int slot) { romModules_[slot] = RomModule{}; }
   bool romModuleLoaded(int slot) const { return !romModules_[slot].data.empty(); }
   const RomModule& romModule(int slot) const { return romModules_[slot]; }
+  // Mutable, test-only counterpart to the const romModule() above -- lets
+  // a test directly poke a module's dataWindow bytes (e.g. to force-hold
+  // a status byte at BUSY across many real HLT/timer-interrupt cycles,
+  // stress-testing ROM-side wait loops) without going through writeME0(),
+  // which always re-triggers ExpansionMock::processCommand() as a fresh
+  // command dispatch for any write landing on instructionAddr -- not what
+  // a test poking raw state wants. Real firmware never has this kind of
+  // back-door access; this exists purely for in-process test harnesses.
+  RomModule& romModuleForTest(int slot) { return romModules_[slot]; }
   ExpansionMock& expansionMock() { return expansionMock_; }
 
   // Forwarded from the CPU's own SPU/RPU/SPV/RPV opcode handlers (see

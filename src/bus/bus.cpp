@@ -428,7 +428,17 @@ uint8_t Bus::readME0(uint16_t addr) {
     // module with hasDataWindow can genuinely be written to (see
     // writeME0), unlike a plain read-only loadrommodule-style module.
     for (const RomModule& m : romModules_) {
-      if (m.tryReadWindow(addr, pv_, v)) return v;
+      if (m.tryReadWindow(addr, pv_, v)) {
+        // The instruction/status byte specifically is served from
+        // ExpansionMock's own pollStatus() instead of the plain window
+        // byte -- a command's real work now runs on a background thread
+        // (see ExpansionMock::processCommand's own comment), so this is
+        // what lets a still-in-progress command genuinely read back as
+        // BUSY rather than whatever the worker thread's writes have
+        // gotten to so far.
+        if (m.hasDataWindow && addr == m.instructionAddr) return expansionMock_.pollStatus();
+        return v;
+      }
     }
     for (const RomModule& m : romModules_) {
       if (m.tryRead(addr, pv_, pu_, v)) return v;
@@ -460,8 +470,7 @@ void Bus::writeME0(uint16_t addr, uint8_t value) {
     for (RomModule& m : romModules_) {
       if (!m.tryWrite(addr, pv_, value)) continue;
       if (m.hasDataWindow && addr == m.instructionAddr) {
-        uint8_t status = expansionMock_.processCommand(value, m.dataWindow);
-        m.dataWindow[m.instructionAddr - m.dataWindowBase] = status;
+        expansionMock_.processCommand(value, m.dataWindow, m.instructionAddr - m.dataWindowBase);
       }
       return;
     }

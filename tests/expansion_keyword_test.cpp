@@ -418,8 +418,9 @@ void testSdmkdirFailsIfDirectoryAlreadyExists() {
   window[1] = static_cast<uint8_t>(name.size());
   for (size_t i = 0; i < name.size(); i++) window[2 + i] = static_cast<uint8_t>(name[i]);
 
-  uint8_t status = bus.expansionMock().processCommand(pc1500::ExpansionMock::kCommandMakeSdDir, window);
-  CHECK(status == pc1500::ExpansionMock::kStatusError);
+  bus.expansionMock().processCommand(pc1500::ExpansionMock::kCommandMakeSdDir, window, 0x7FF);
+  bus.expansionMock().waitUntilIdleForTest();
+  CHECK(bus.expansionMock().pollStatus() == pc1500::ExpansionMock::kStatusError);
 }
 
 // SDRMDIR on a non-empty directory must fail and leave it (and its
@@ -443,8 +444,9 @@ void testSdrmdirFailsOnNonEmptyDirectory() {
   window[1] = static_cast<uint8_t>(name.size());
   for (size_t i = 0; i < name.size(); i++) window[2 + i] = static_cast<uint8_t>(name[i]);
 
-  uint8_t status = bus.expansionMock().processCommand(pc1500::ExpansionMock::kCommandRemoveSdDir, window);
-  CHECK(status == pc1500::ExpansionMock::kStatusError);
+  bus.expansionMock().processCommand(pc1500::ExpansionMock::kCommandRemoveSdDir, window, 0x7FF);
+  bus.expansionMock().waitUntilIdleForTest();
+  CHECK(bus.expansionMock().pollStatus() == pc1500::ExpansionMock::kStatusError);
   CHECK(fs::exists(sdDir / "NONEMPTY"));
   CHECK(fs::exists(sdDir / "NONEMPTY" / "FILE.TXT"));
 }
@@ -1147,6 +1149,85 @@ void testSdsaveBasicRoundTrip() {
 
   tapKey(*m, pc1500::Key::Cl);
   typeText(*m, "SDLOAD \"OUT.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  std::vector<uint8_t> reloaded = pc1500::basic::readBasicProgramBytes(m->bus, &readError);
+  CHECK(reloaded == savedProgram);
+}
+
+// SDSAVE/SDLOAD round trip with a fixture large enough (>2048 bytes,
+// spanning at least 3 widened 1024-byte chunks) to prove the widened
+// EXP_MAX_TRANSFER_LEN chunking/chaining actually works across chunk
+// boundaries, not just for a single-chunk fixture like
+// testSdsaveBasicRoundTrip.
+void testSdsaveSdloadWidenedChunkRoundTrip() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdsaveSdloadWidenedChunkRoundTrip -- ROM1.BIN and/or rom_8800.bin not found.\n");
+    return;
+  }
+
+  // Build a BASIC program comfortably over 2048 bytes of tokenized program
+  // text so a save/load round trip must cross at least two 1024-byte
+  // chunk boundaries in both SD_WRITE_RANGE and SD_OPEN_AND_LOAD_READ_LOOP.
+  std::string programText;
+  for (int i = 0; i < 120; ++i) {
+    programText += std::to_string(10 + i * 10);
+    programText += " REM AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
+  }
+  programText += "9999 END\n";
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdsave_widened_chunk_roundtrip");
+  // Default (unexpanded) program RAM is too small to hold a >2048-byte
+  // fixture -- give the machine extension RAM (as testSdmVariables and
+  // others already do for oversized fixtures) so the fixture itself, not
+  // an unrelated RAM ceiling, is what's under test here.
+  auto m = bootAndSettle(rom, /*extRam0000Bytes=*/16384);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  std::string loadError;
+  bool loaded = pc1500::basic::typeBasicProgramText(m->bus, m->cpu, programText, kCyclesPerFrame,
+                                                      kCyclesPerTimerTick, &loadError);
+  CHECK(loaded);
+  if (!loaded) {
+    std::printf("  fixture generation loadError: %s\n", loadError.c_str());
+    return;
+  }
+  std::string readError;
+  std::vector<uint8_t> savedProgram = pc1500::basic::readBasicProgramBytes(m->bus, &readError);
+  CHECK(!savedProgram.empty());
+  CHECK(savedProgram.size() > 2048);
+  if (savedProgram.size() <= 2048) {
+    std::printf("  fixture too small: %zu bytes (need > 2048 to force multiple chunks)\n",
+                savedProgram.size());
+  }
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDSAVE \"BIG.BAS\"");
+  tapKey(*m, pc1500::Key::Ent);  // new file -- no overwrite prompt expected
+  CHECK(waitForIdle(*m));
+
+  std::vector<uint8_t> onDisk = readFile((sdDir / "BIG.BAS").string());
+  CHECK(onDisk == savedProgram);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDLOAD \"BIG.BAS\"");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -3107,9 +3188,60 @@ void testSdinputOverlongStringRaisesError42() {
   CHECK(m->bus.readME0(kErlAbs) == 42);
 }
 
+// STAGE keyword recognition -- added 2026-09 for the RP2350 ROM-to-SRAM
+// redirect feature. First real-hardware attempt reported "STAGE is not a
+// recognized keyword" at all; this checks the same thing here, fast and
+// deterministically, before burning another hardware round-trip. STAGE's
+// own no-argument query path issues EXP_COMMAND_ROM_GET_MODE (0x25), which
+// ExpansionMock's own default: case reports as NOT_IMPLEMENTED (matching
+// the real DoCommand()'s own default) -- STAGE_QUERY's own ROM code
+// already treats that as "MODE UNKNOWN" and returns normally (see
+// rom.asm's own comment on that path), so this doesn't need any new mock
+// support to reach a clean, testable outcome: no ERROR 1 raised, and
+// idle reached after the one dismissal keypress ECVER's own pattern needs.
+void testStageQueryIsRecognizedKeyword() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testStageQueryIsRecognizedKeyword -- ROM1.BIN and/or rom_8800.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_stage_query");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "STAGE");
+  tapKey(*m, pc1500::Key::Ent);  // dispatch STAGE (no argument -- query mode)
+  CHECK(waitForIdle(*m));        // settles on STAGE_QUERY_SHOW's own KEYSCAN_WAIT
+
+  uint8_t erlAfterDispatch = m->bus.readME0(kErlAbs);
+  CHECK(erlAfterDispatch == 0);
+  if (erlAfterDispatch != 0) {
+    std::printf("  ERL after typing STAGE + Enter: %u (want 0 -- nonzero means "
+                "the keyword table walker never reached STAGE_ROUTINE at all)\n",
+                (unsigned)erlAfterDispatch);
+  }
+
+  tapKey(*m, pc1500::Key::Ent);  // dismiss STAGE_QUERY_SHOW's own message
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+}
+
 }  // namespace
 
 int main() {
+  testStageQueryIsRecognizedKeyword();
   testSlsExitThenTypingDoesNotConcatenate();
   testSdlsHidesBlinkingCursorDuringBrowse();
   testStrayEnterAfterSlsExitDoesNotRedispatch();
@@ -3120,6 +3252,7 @@ int main() {
   testSdloadMExplicitAddressDecimal();
   testSdloadMExplicitAddressHex();
   testSdsaveBasicRoundTrip();
+  testSdsaveSdloadWidenedChunkRoundTrip();
   testSdsaveOverwritePromptNAborts();
   testSdsaveOverwritePromptYOverwrites();
   testSdsaveDashYSkipsPrompt();
