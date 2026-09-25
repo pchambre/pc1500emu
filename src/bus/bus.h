@@ -604,9 +604,24 @@ class Bus : public lh5801::MemoryBus {
   // sub-range (initialized to 0xFF, matching real RAM's confirmed power-up
   // default) with command processing at `instructionAddr` -- see
   // RomModule's own comment and ExpansionMock.
+  // windowSeedData/windowSeedSize (2026-09-23): optional initial content for
+  // the data window, copied in (bounds-checked against dataWindowSize)
+  // before the usual 0xFF fill would otherwise be the only content. Real
+  // firmware's monitor_init_buffer() loads ONE combined image covering both
+  // the data window (0x8000-0x87FF) and the ROM region (0x8800+) -- unlike
+  // this mock, which previously always left the data window blank. That
+  // mattered for real, resident code: anything placed in the data window's
+  // own "scratch pocket" (STAGE_COPY_ROUTINE_ABS at 0x8500, RAMTEST2 at
+  // 0x8000, STAGE_MANUAL_BLOCK0 at 0x8400, ...) executed as pure 0xFF
+  // garbage here regardless of whether it was otherwise correct -- confirmed
+  // live via typelinetrace against STAGE DEBUG, which reached
+  // STAGE_COPY_ROUTINE_ABS correctly then immediately ran off into garbage.
+  // Defaults to nullptr/0 (unchanged behavior) so existing callers that only
+  // ever cared about the ROM region are unaffected.
   void loadExpansionModule(int slot, const uint8_t* romData, size_t romSize, uint16_t base,
                             bool requirePv, bool usePuBank, uint16_t dataWindowBase,
-                            uint16_t dataWindowSize, uint16_t instructionAddr) {
+                            uint16_t dataWindowSize, uint16_t instructionAddr,
+                            const uint8_t* windowSeedData = nullptr, size_t windowSeedSize = 0) {
     RomModule& m = romModules_[slot];
     m = RomModule{};
     m.data.assign(romData, romData + romSize);
@@ -615,8 +630,16 @@ class Bus : public lh5801::MemoryBus {
     m.usePuBank = usePuBank;
     m.hasDataWindow = true;
     m.dataWindow.assign(dataWindowSize, 0xFF);
+    if (windowSeedData != nullptr) {
+      size_t n = (std::min)(windowSeedSize, static_cast<size_t>(dataWindowSize));
+      std::copy(windowSeedData, windowSeedData + n, m.dataWindow.begin());
+    }
     m.dataWindowBase = dataWindowBase;
     m.instructionAddr = instructionAddr;
+    // Gives ExpansionMock its own copy of the ROM image for STAGE's
+    // GET_BLOCK to copy from, and (re)sizes the mock SRAM chip to match --
+    // see ExpansionMock::setRomImage()'s own comment.
+    expansionMock_.setRomImage(m.data);
   }
   void unloadRomModule(int slot) { romModules_[slot] = RomModule{}; }
   bool romModuleLoaded(int slot) const { return !romModules_[slot].data.empty(); }

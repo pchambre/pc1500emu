@@ -60,6 +60,39 @@ class ExpansionMock {
   void setFreeSpaceBytes(uint32_t bytes) { freeSpaceBytes_ = bytes; }
   uint32_t freeSpaceBytes() const { return freeSpaceBytes_; }
 
+  // Simulates a slow real-world SD link for testing ROM/BASIC-side
+  // robustness (polling loops, watchdog timeouts, perceived UI
+  // responsiveness) without needing real hardware -- see the RP2350
+  // Pico2W dongle's own 2026-09 session, where the real SC18IS602B
+  // I2C-bridge link turned out to run at only ~5-10KB/s in practice.
+  // 0 (default) = unlimited/instant, this mock's original behavior.
+  // Applies to every real file read/write's actual transferred byte
+  // count (readFromSdFile/writeToSdFile) via a real
+  // std::this_thread::sleep_for() -- safe now that command dispatch runs
+  // on its own worker thread (see processCommand()'s own comment), so
+  // this genuinely holds BUSY for the simulated duration instead of
+  // blocking the caller/main thread. Also applies to
+  // simulatedFatScanBytes() below, since real hardware's own dominant
+  // SDLS cost turned out to be free-space accounting, not file data
+  // volume -- see that setter's own comment.
+  void setSdRateLimitBytesPerSec(uint32_t bytesPerSec) { sdRateLimitBytesPerSec_ = bytesPerSec; }
+  uint32_t sdRateLimitBytesPerSec() const { return sdRateLimitBytesPerSec_; }
+
+  // Real hardware's own SDLS slowness (2026-09 session) traced to FatFs's
+  // f_getfree() doing a full FAT-table scan on the first free-space query
+  // per mount/boot -- proportional to the card/FAT's own size, not to how
+  // many files are listed or their sizes, so it can't be modeled as an
+  // ordinary byte-count charge on listSdDir()'s own directory entries.
+  // 0 (default) = no simulated scan cost. Charged (at the same simulated
+  // rate as setSdRateLimitBytesPerSec()) every time free space is
+  // computed -- by both listSdDir()'s own summary line and
+  // getSdFreeSpace() -- not just once per mount; this mock doesn't model
+  // FatFs's own free-cluster-count caching, so set this to 0 between
+  // calls in a test that specifically wants to observe a "second call is
+  // fast" pattern.
+  void setSimulatedFatScanBytes(uint32_t bytes) { simulatedFatScanBytes_ = bytes; }
+  uint32_t simulatedFatScanBytes() const { return simulatedFatScanBytes_; }
+
   // Starts processing `cmd` against `window` (a module's own writable
   // data-window buffer, indexed from 0 -- i.e. window[0] is
   // EXP_BUFFER_START_PAGE/EXP_BUFFER_START_ADDRESS, window[256] is
@@ -98,7 +131,10 @@ class ExpansionMock {
   ~ExpansionMock();
 
   // PC_EXP.h mirrors -- see that file for the authoritative definitions.
-  static constexpr uint8_t kStatusReady = 0;
+  // 4, not 0, since 2026-09-24 -- a sleeping RP2350 leaves the data window
+  // reading 0xFF, and READY must differ from both 0x00 and 0xFF (see the
+  // real firmware's pc_exp.h EXP_STATUS_READY/EXP_COMMAND_DONE).
+  static constexpr uint8_t kStatusReady = 4;
   static constexpr uint8_t kStatusBusy = 1;
   static constexpr uint8_t kStatusSuccess = 2;
   static constexpr uint8_t kStatusEof = 3;  // kCommandSdReadValue only -- see PC_EXP.h's own comment
@@ -142,7 +178,113 @@ class ExpansionMock {
   // expressed in C++, and this side already receives the full name for
   // every command that uses one.
   static constexpr uint8_t kCommandValidateSdName = 30;
+
+  // STAGE keyword support (2026-09-23) -- mocks the real board's GreenPAK-
+  // driven "Remap" mechanism: normally the 6K ROM region (this module's own
+  // `data`) answers every read; STAGE tells the (real) GreenPAK to instead
+  // answer that same address range directly from an external SRAM chip,
+  // bypassing the ROM image entirely until reverted. Here, `remapActive_`
+  // is that same on/off switch, and `sram_` is the mock stand-in for the
+  // external chip -- see Bus::readME0/writeME0 for the actual address-range
+  // redirection this flag gates (RomModule itself stays unaware of any of
+  // this, same as real hardware's own GreenPAK-vs-MCU split). Real
+  // PC_EXP.h values, kept in sync by hand like every other constant here.
+  static constexpr uint8_t kCommandRomFromMcu = 0x20;
+  static constexpr uint8_t kCommandRomFromSram = 0x21;
+  static constexpr uint8_t kCommandRomCopyBegin = 0x22;
+  static constexpr uint8_t kCommandRomCopyGetBlock = 0x23;
+  static constexpr uint8_t kCommandRomCopyFinish = 0x24;
+  static constexpr uint8_t kCommandRomGetMode = 0x25;
+  // Diagnostic-only on real hardware (logged, never gates STAGE's own
+  // outcome) -- mocked as accept-and-succeed, no actual logging needed.
+  static constexpr uint8_t kCommandLogBlockChecksum = 0x29;
+  static constexpr uint8_t kCommandStageByteMismatch = 0x2A;
+
+  // End-of-keyword marker (2026-09-24) -- the real RP2350 goes DORMANT on
+  // this in STAGE RAM mode. The mock has no sleep to model, so it just
+  // succeeds; rom.asm sends it from KEYWORD_RETURN and SD_RAISE_ERROR_*.
+  static constexpr uint8_t kCommandDone = 0x2C;
+  // MLOGMSG (2026-09-24): 'S' + length + characters at window[1]. The
+  // mock has no MCU log, so it just records the (truncated) text for
+  // tests -- see lastUserLogMessage().
+  static constexpr uint8_t kCommandLogUserMessage = 0x2D;
+
+  // MLOG (RP2350 only). The mock keeps just the VERBOSE/QUIET flag and an
+  // always-empty log.
+  static constexpr uint8_t kCommandLogList = 0x26;
+  static constexpr uint8_t kCommandLogClear = 0x27;
+  static constexpr uint8_t kCommandLogSetInfoEnabled = 0x28;
+  static constexpr uint8_t kCommandLogGetInfoEnabled = 0x2B;
+
+  // Keyword executor (2026-09-25) -- the expansion ROM hands each keyword's
+  // raw argument text to the MCU, which parses it and returns actions for
+  // the ROM to carry out. Handled by the real firmware's own keywords.c,
+  // compiled into this library (see src/bus/CMakeLists.txt).
+  static constexpr uint8_t kCommandKeyword = 0x2E;
+  static constexpr uint8_t kCommandKeywordContinue = 0x2F;
+
+  // MCONF settings (2026-09-25): byte 0 = setting number, bytes 1-2 = BE
+  // value. The mock keeps them in memory (real firmware: flash).
+  static constexpr uint8_t kCommandConfigGet = 0x30;
+  static constexpr uint8_t kCommandConfigSet = 0x31;
+  static constexpr int kConfigCount = 2;  // LED, SLEEPWAIT -- mcu_config.h
+
   static constexpr uint8_t kCommandClearStatus = 0xFF;
+
+  // EXP_BLOCK_CHECKSUM_PAGE(7)*256 + EXP_BLOCK_CHECKSUM_ADDRESS(0xFB) -
+  // window base -- 2-byte BE per-block checksum GET_BLOCK stamps into the
+  // window alongside the payload, same page as kLengthPortOffset, just
+  // before it. Matches PC_EXP.h's own EXP_BLOCK_CHECKSUM_ABS layout.
+  static constexpr int kBlockChecksumOffset = 0x7FB;
+
+  // Sets the module's own ROM image bytes for STAGE's GET_BLOCK to copy
+  // from, and (re)sizes+resets the mock SRAM chip to match (0xFF-filled,
+  // matching real RAM's confirmed power-up default -- same convention
+  // loadExpansionModule() already uses for a fresh dataWindow). Called by
+  // Bus::loadExpansionModule() right after it sets the module's own
+  // `data`, so this never needs to be called separately -- mirrors
+  // setRootDir()'s own "setter called once at load time" shape.
+  void setRomImage(std::vector<uint8_t> image) {
+    romImage_ = std::move(image);
+    sram_.assign(romImage_.size(), 0xFF);
+    remapActive_ = false;
+    romCopyActive_ = false;
+    romCopyBlockIndex_ = 0;
+    romStagedVerified_ = false;
+    romCopyBeginCount_ = 0;
+  }
+
+  // Mirrors the real firmware's romStagedVerified (monitor.c, 2026-09-24):
+  // true only after a ROM_COPY_FINISH whose checksum matched, cleared by
+  // BEGIN/ROM_FROM_MCU -- ROM_GET_MODE's second response byte, which the
+  // ROM's boot hook and STAGE RAM use to skip re-staging.
+  bool romStagedVerified() const { return romStagedVerified_; }
+  // Test-only: how many ROM_COPY_BEGINs have been processed since the
+  // image was loaded -- lets a test confirm a copy was (or wasn't) run.
+  int romCopyBeginCount() const { return romCopyBeginCount_; }
+
+  // Test-only: the text of the most recent MLOGMSG, as the real firmware
+  // would log it (truncated to 23 characters).
+  std::string lastUserLogMessage() const { return lastUserLogMessage_; }
+
+  // Test-only: an MCONF setting's current value (0 = LED, 1 = SLEEPWAIT).
+  uint16_t configValue(int id) const { return id >= 0 && id < kConfigCount ? config_[id] : 0; }
+
+  // Whether the mock GreenPAK's Remap is currently active -- Bus::readME0/
+  // writeME0 check this before falling back to the module's own static ROM
+  // image, exactly mirroring the priority `tryReadWindow` already has over
+  // `tryRead` for the 2K data window.
+  bool remapActive() const { return remapActive_; }
+
+  // Bounds-checked SRAM accessors for Bus::readME0/writeME0 -- an
+  // out-of-range read returns 0xFF (matching an empty/unmapped socket
+  // elsewhere in Bus), an out-of-range write is silently dropped (should
+  // never actually happen if the caller's own bankSize math is right, but
+  // cheap to guard rather than trust every call site).
+  uint8_t sramByte(size_t offset) const { return offset < sram_.size() ? sram_[offset] : 0xFF; }
+  void setSramByte(size_t offset, uint8_t value) {
+    if (offset < sram_.size()) sram_[offset] = value;
+  }
 
   // SDOPEN/SDCLOSE/SDINPUT#/SDPRINT#/SDSKIP# -- up to kMaxSdChannels files
   // open at once, numbered 1..kMaxSdChannels (0 is the "close all"
@@ -198,7 +340,7 @@ class ExpansionMock {
   // address. Unchanged by the kLengthPortOffset addition (same slack
   // absorbs the extra 2 reserved bytes -- see PC_EXP.h's own comment).
   // Matches PC_EXP.h's own mirror.
-  static constexpr int kDirMaxEntries = 67;
+  static constexpr int kDirMaxEntries = 66;  // 67 until 2026-09-25 (keyword action block)
 
  private:
   // The actual per-command work -- unchanged body from the old
@@ -211,8 +353,16 @@ class ExpansionMock {
   // synchronization contract this pairs with.
   void runCommandAsync(uint8_t cmd, std::vector<uint8_t>* window, size_t instructionOffset);
 
+  // Sleeps for bytes/sdRateLimitBytesPerSec_ (real wall-clock time -- see
+  // setSdRateLimitBytesPerSec()'s own comment for why that's safe here)
+  // if a rate limit is set; a no-op (0 == unlimited) otherwise. Called
+  // from dispatchCommand()'s own worker thread, never the caller's.
+  void throttleForBytes(uint32_t bytes) const;
+
   std::atomic<uint8_t> pendingStatus_{kStatusReady};
   std::thread worker_;
+  uint32_t sdRateLimitBytesPerSec_ = 0;
+  uint32_t simulatedFatScanBytes_ = 0;
 
   static void formatSizeText(uint32_t value, std::vector<uint8_t>& window, size_t offset,
                               int width);
@@ -294,6 +444,14 @@ class ExpansionMock {
   uint8_t writeSdValue(std::vector<uint8_t>& window);
   uint8_t readSdValue(std::vector<uint8_t>& window);
   uint8_t skipSdValues(std::vector<uint8_t>& window);
+  uint8_t romFromMcu(std::vector<uint8_t>& window);
+  uint8_t romFromSram(std::vector<uint8_t>& window);
+  uint8_t romCopyBegin(std::vector<uint8_t>& window);
+  uint8_t romCopyGetBlock(std::vector<uint8_t>& window);
+  uint8_t romCopyFinish(std::vector<uint8_t>& window);
+  uint8_t romGetMode(std::vector<uint8_t>& window);
+  uint8_t logBlockChecksum(std::vector<uint8_t>& window);
+  uint8_t stageByteMismatch(std::vector<uint8_t>& window);
   // Closes channels_[index] if open -- shared by closeSdChannel (one or
   // "all") and openSdChannel (reusing an already-open number).
   void closeSdChannelAt(int index);
@@ -311,6 +469,22 @@ class ExpansionMock {
   // (shape violation -- rom.asm's SD_PARSE_QUOTED_NAME maps this onto the
   // same "malformed" Carry-set exit it always had).
   uint8_t validateAndFoldSdName(std::vector<uint8_t>& window);
+
+  // STAGE/Remap mock state -- see setRomImage()/remapActive()/sramByte()'s
+  // own comments above.
+  std::vector<uint8_t> romImage_;
+  std::vector<uint8_t> sram_;
+  bool remapActive_ = false;
+  bool romCopyActive_ = false;
+  int romCopyBlockIndex_ = 0;
+  bool romStagedVerified_ = false;
+  int romCopyBeginCount_ = 0;
+  std::string lastUserLogMessage_;
+  bool logInfoEnabled_ = false;
+  uint16_t config_[kConfigCount] = {1, 0};  // mcu_config.c's defaults
+  // The window of the keyword command in progress, for runKeywordCommand().
+  std::vector<uint8_t>* kwWindow_ = nullptr;
+  static uint8_t runKeywordCommand(uint8_t cmd, void* ctx);
 
   std::filesystem::path rootDir_;
   // Defaults to rootDir_ whenever that's (re)set -- see setRootDir's own

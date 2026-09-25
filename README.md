@@ -298,18 +298,32 @@ Commands:
   slot.
 - `loadexpansionmodule[2-4] <base hex> <requirePv 0|1> <usePuBank 0|1>
   <dataWindowBase hex> <dataWindowSize hex> <instructionAddr hex> <path>
-  [sdDir]` — like `loadrommodule`, but for a module with a genuinely
-  writable data window backed by a mock command processor
+  [sdDir] [windowImagePath]` — like `loadrommodule`, but for a module with a
+  genuinely writable data window backed by a mock command processor
   (`src/bus/expansion_mock.h`), modeling boards like the PC1500-PSOC5
   expansion where that whole address range is one real, shared RAM buffer
   rather than true ROM. `path` is just the ROM bytes (a trimmed,
   base-aligned binary — not a full window-sized image with the data-window
-  portion blanked out); the data window itself is separately allocated and
-  initialized to `0xFF` (matching real RAM's confirmed power-up default).
-  A CPU write to `instructionAddr` triggers mock command processing
+  portion blanked out); the data window itself is separately allocated and,
+  by default, initialized to `0xFF` (matching real RAM's confirmed power-up
+  default). A CPU write to `instructionAddr` triggers mock command processing
   synchronously, mirroring the real board's `DoCommand()`/`WriteStatus()`
   protocol: write a command byte, poll that same address for a non-`BUSY`
-  status. The optional trailing `sdDir` points the mock's SD-card commands
+  status. The optional trailing `windowImagePath` (2026-09-23) seeds the data
+  window's initial content instead of leaving it all-`0xFF`: a full image,
+  base-aligned at `dataWindowBase` (e.g. `rom.bin`, not the trimmed
+  `rom_8800.bin`), whose first `dataWindowSize` bytes get copied in —
+  matching real firmware's `monitor_init_buffer()`, which loads one combined
+  image covering both the data window and the ROM region. Needed for any
+  resident code a real board's own firmware places in the data window's own
+  "scratch pocket" (this project's own `STAGE_COPY_ROUTINE_ABS`, `RAMTEST2`,
+  etc.) — without it, that code runs as garbage the instant it's reached,
+  since it was never actually loaded (confirmed the hard way: `STAGE DEBUG`
+  reached its own real dispatch entry correctly, then immediately executed
+  `0xFF` filler once it jumped into the data window). Pass `-` for `sdDir`
+  to skip it and still reach `windowImagePath` (positional parsing has no
+  other way to leave a middle argument blank). The optional `sdDir`
+  points the mock's SD-card commands
   (`LIST_SD_DIR`, create/open/read/write/close/remove a file, get file
   size/status/name, get free space/volume size, format) at a real host
   directory, so `SSAVE`/`SLOAD`/`SLS`/etc. can be developed and tested

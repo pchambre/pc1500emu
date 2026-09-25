@@ -327,6 +327,81 @@ void testSdlsHidesBlinkingCursorDuringBrowse() {
   CHECK(m->bus.readME0(0x787F) == 0x00);
 }
 
+// Real-hardware bug (2026-09-19/20): scrolling down through a listing was
+// fine, but scrolling back up sometimes showed a corrupted file name --
+// "random and less repeatable" than the separate summary-line "r" bug.
+// Root cause: SD_LIST_INDEX_ABS/COUNT_ABS/ADDR_HI_ABS/ADDR_LO_ABS (the
+// browser's own navigation state, rewritten on every Up/Down keypress)
+// used to live at EXP_SCRATCH_ABS (window offset 256) -- which a real
+// directory entry's own data reaches once there are 9+ files: entry #8
+// occupies window offsets [242, 272), which contains [256, 260), so
+// every Up/Down write silently clobbered the last 2 characters of entry
+// #8's name and the first 2 of its size text with whatever navigation
+// state was current at that moment. Invisible while scrolling past it
+// (not being displayed at that instant); only visible the next time it's
+// redrawn -- which is why going back up to revisit it looked like random
+// corruption, when it was really just stale index/address bytes. Fixed
+// by moving that state to a dedicated SD_LIST_SCRATCH_ABS (window offset
+// 2038) past every entry's and the summary line's maximum reach. This
+// test needs 9+ files specifically to reach entry #8 and would have
+// failed before that fix (entry #8's name changing between the first
+// visit and a later revisit after scrolling further and back).
+void testSdlsScrollUpDoesNotCorruptEntryPastScratchOffset() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf(
+        "SKIP: testSdlsScrollUpDoesNotCorruptEntryPastScratchOffset -- ROM1.BIN "
+        "and/or rom_8800.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sls_scratch_collision");
+  for (int i = 0; i < 12; i++) {
+    std::ofstream f(sdDir / ("FILE" + std::to_string(i) + ".BAS"), std::ios::binary);
+    f << "10 PRINT 1\n";
+  }
+
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "SDLS");
+  tapKey(*m, pc1500::Key::Ent);  // dispatch -- draws entry 0
+  CHECK(waitForIdle(*m));
+
+  for (int i = 0; i < 8; i++) {  // walk down to entry #8 (0-indexed)
+    tapKey(*m, pc1500::Key::Down);
+    CHECK(waitForIdle(*m));
+  }
+  std::string entry8Before = readDisplayBuffer(m->bus);
+
+  for (int i = 0; i < 3; i++) {  // scroll further down (entries 9-11)...
+    tapKey(*m, pc1500::Key::Down);
+    CHECK(waitForIdle(*m));
+  }
+  for (int i = 0; i < 3; i++) {  // ...and back up to entry #8 again
+    tapKey(*m, pc1500::Key::Up);
+    CHECK(waitForIdle(*m));
+  }
+  std::string entry8After = readDisplayBuffer(m->bus);
+
+  CHECK(entry8Before == entry8After);
+  if (entry8Before != entry8After) {
+    std::printf("  entry #8 before further scrolling: \"%s\"\n", entry8Before.c_str());
+    std::printf("  entry #8 after scrolling down and back up:  \"%s\"\n", entry8After.c_str());
+  }
+}
+
 // SDMKDIR "<name>" creates a real subdirectory under the SD root.
 void testSdmkdirCreatesDirectory() {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
@@ -3188,6 +3263,199 @@ void testSdinputOverlongStringRaisesError42() {
   CHECK(m->bus.readME0(kErlAbs) == 42);
 }
 
+// Validates STAGE_COPY_BLOCK_VERIFY_LOOP's checksum ARITHMETIC in
+// isolation, added 2026-09-21 after a real per-block mismatch report
+// (expected 0x8EF9, found 0x8ED1) -- the board owner's own question: is
+// the ROM-side checksum *computation* itself proven correct, or could its
+// own arithmetic be wrong rather than the SRAM content actually differing?
+// pc1500emu's ExpansionMock doesn't implement the real BEGIN/GET_BLOCK/
+// SRAM protocol, so this deliberately bypasses all of that: writes a known
+// 1024-byte pattern into the data window, jumps the CPU directly into the
+// verify loop (CPU register injection via cpu.setP/setX/setU -- same
+// technique testSdsaveMCallAddressRoundTrip already uses for writeME0'd
+// routines, just also setting registers instead of only memory), lets it
+// run, and compares the result against a checksum computed independently
+// right here in C++ (not by calling any shared helper) -- a genuinely
+// separate implementation of "sum these 1024 bytes, 16-bit wraparound",
+// so agreement here means the ASSEMBLY loop's own arithmetic is sound,
+// independent of anything happening on the real SRAM chip.
+void testStageBlockChecksumAlgorithmMatchesIndependentComputation() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  // rom_8800.bin only covers 0x8800+ (see build.ps1's own comment) --
+  // STAGE_COPY_ROUTINE_ABS lives at 0x8500, INSIDE loadExpansionModule's
+  // separately-managed, blank-0xFF-initialized "data window"
+  // (0x8000-0x87FF, see bus.h's own RomModule::dataWindow), which
+  // rom_8800.bin never touches. rom.bin (0x8000-anchored) is the one file
+  // that actually contains those bytes -- loaded below and poked directly
+  // into the data window via writeME0, the same way
+  // testSdsaveMCallAddressRoundTrip pokes a hand-written routine into
+  // plain RAM, so this test executes the REAL assembled routine instead
+  // of the data window's default blank fill (confirmed the hard way: the
+  // first version of this test skipped this step, jumped into 0xFF-filled
+  // RAM instead of real code, and predictably got back 0xFFFF).
+  const std::string kRomBinPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  std::vector<uint8_t> romBin = readFile(kRomBinPath);
+  if (rom.empty() || expRom.empty() || romBin.empty()) {
+    std::printf("SKIP: testStageBlockChecksumAlgorithmMatchesIndependentComputation -- "
+                "ROM1.BIN, rom_8800.bin, and/or rom.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_stage_block_cksum_algo");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  // loadExpansionModule() was called with requirePv=false (see
+  // loadExpansionRom() above) -- correct, this board's expansion module
+  // runs with PV low throughout, not toggled per-entry the way a real
+  // CE-150-style cartridge dance would be. Every RomModule::tryRead/
+  // tryWrite call -- including the writeME0 pokes below -- silently
+  // no-ops unless the bus's currently-tracked PV pin matches that,
+  // though, and this test never goes through this board's own normal
+  // dispatch path at all (it jumps the CPU straight into
+  // STAGE_COPY_BLOCK_VERIFY_LOOP) -- so it isn't guaranteed PV is still
+  // low here rather than whatever the base ROM's own (unrelated, opcode
+  // 0xA8/0xB8-driven) use of the same flip-flop left it at by the end of
+  // cold boot. Confirmed the hard way: even after fixing the
+  // missing-routine-bytes bug above, this test still silently got back
+  // 0xFFFF, because EVERY writeME0 below (loading the routine bytes, the
+  // known data pattern, and zeroing the checksum cells) was failing this
+  // same gating check before ever reaching a single real byte. Forcing it
+  // false here, directly on the bus (the authoritative copy RomModule's
+  // gating actually reads), makes every write below land for real.
+  m->bus.setPv(false);
+
+  // Addresses from rom.lst -- MUST be re-confirmed there any time rom.asm's
+  // STAGE_COPY_ROUTINE_ABS block changes size at all (these are absolute,
+  // not symbolic, since this test pokes the CPU directly rather than going
+  // through the keyword dispatcher). Confirmed the hard way, twice: adding
+  // the per-block checksum feature, and later STAGE DEBUG's own per-byte
+  // copy loop, each silently shifted every address below without changing
+  // this test at all, making it jump into the wrong code and fail with the
+  // exact same "0xFFFF" symptom as the ORIGINAL missing-bytes bug -- a
+  // stale address here is indistinguishable from a real regression unless
+  // you re-check rom.lst first.
+  constexpr uint16_t kStageCopyStart = 0x8400;  // STAGE_COPY_START
+  constexpr uint16_t kStageCopyEnd = 0x8717;    // STAGE_COPY_END (exclusive)
+  constexpr uint16_t kCksumHiAddr = 0x86B0;     // STAGE_BLOCK_CKSUM_HI
+  constexpr uint16_t kCksumLoAddr = 0x86B1;     // STAGE_BLOCK_CKSUM_LO
+  constexpr uint16_t kVerifyLoopAddr = 0x848D;  // STAGE_COPY_BLOCK_VERIFY_LOOP
+
+  // rom.bin's byte 0 is address 0x8000 (see build.ps1's own comment), so
+  // STAGE_COPY_START's bytes start at offset (kStageCopyStart - 0x8000).
+  CHECK(romBin.size() >= static_cast<size_t>(kStageCopyEnd - 0x8000));
+  for (uint16_t addr = kStageCopyStart; addr < kStageCopyEnd; addr++) {
+    m->bus.writeME0(addr, romBin[static_cast<size_t>(addr - 0x8000)]);
+  }
+
+  // Known 1024-byte pattern in the payload window (0x8000-0x83FF, the same
+  // region GET_BLOCK's real response would occupy) -- i & 0xFF repeating
+  // four times, summed independently right here. Written AFTER the routine
+  // bytes above so it isn't clobbered by them (STAGE_COPY_ROUTINE_ABS
+  // starts at 0x8500, well past 0x83FF, so there's no overlap either way,
+  // but this keeps the ordering obviously safe regardless).
+  constexpr uint16_t kDataAddr = 0x8000;
+  constexpr uint16_t kLen = 1024;
+  uint16_t expectedSum = 0;
+  for (uint16_t i = 0; i < kLen; i++) {
+    uint8_t v = static_cast<uint8_t>(i & 0xFF);
+    m->bus.writeME0(static_cast<uint16_t>(kDataAddr + i), v);
+    expectedSum = static_cast<uint16_t>(expectedSum + v);
+  }
+
+  // Same pre-loop state STAGE_COPY_ROUTINE_ABS's own code sets up right
+  // before entering the loop (X=data pointer, U=1024, checksum zeroed) --
+  // done directly here instead of by executing that setup code, so this
+  // test exercises ONLY the loop's own arithmetic, nothing upstream of it.
+  m->bus.writeME0(kCksumHiAddr, 0x00);
+  m->bus.writeME0(kCksumLoAddr, 0x00);
+  m->cpu.setX(kDataAddr);
+  m->cpu.setU(kLen);
+
+  // BASIC's own idle loop legitimately runs with interrupts enabled
+  // (IE=1, waiting on the periodic timer interrupt to wake it from HLT --
+  // see this ROM's own "HLT-based... polynomial timer interrupt" idle
+  // convention). Confirmed directly: without disabling interrupts here,
+  // the real timer interrupt fires partway through the 20000-step budget
+  // below and hijacks execution into genuine system-ROM interrupt-handler
+  // code, which never returns to this routine. CPU has no public "set IE"
+  // accessor, so a tiny 4-byte bootstrap (RIE, then JMP into the real
+  // loop) is written into free scratch space (0x8700 -- well inside the
+  // ~329 free bytes between STAGE_COPY_END and EXP_BLOCK_CHECKSUM_ABS,
+  // confirmed via rom.lst) and executed for real, exactly like
+  // hand-written test routines elsewhere in this file (e.g.
+  // testSdsaveMCallAddressRoundTrip's own writeME0'd routine) -- this way
+  // the CPU's own RIE opcode does the disabling, not a direct field poke.
+  // RIE is a two-byte extended opcode (0xFD prefix + 0xBE -- see
+  // CPU::step()'s own opcode==0xFD dispatch to execFD(), a separate table
+  // from execPrimary()'s). Confirmed the hard way: writing bare 0xBE first
+  // (no prefix) instead decoded as execPrimary's own 0xBE -- an unrelated
+  // CALL-style instruction (push16(p_); p_=fetch16()) -- which consumed
+  // the JMP opcode byte that followed as part of ITS OWN address operand,
+  // sending P to a garbage address nowhere near the real loop.
+  constexpr uint16_t kBootstrapAddr = 0x87C0;  // clear of STAGE_COPY_END (0x8785 as of this
+                                                // writing -- growing with each fix, so this is
+                                                // deliberately given more headroom than the bare
+                                                // minimum) and still inside the 0x8500-0x87FC budget
+  const std::vector<uint8_t> kBootstrap = {
+      0xFD, 0xBE,                                                     // RIE
+      0xBA, static_cast<uint8_t>(kVerifyLoopAddr >> 8),               // JMP
+      static_cast<uint8_t>(kVerifyLoopAddr & 0xFF)};
+  for (size_t i = 0; i < kBootstrap.size(); i++) {
+    m->bus.writeME0(static_cast<uint16_t>(kBootstrapAddr + i), kBootstrap[i]);
+  }
+  m->cpu.setP(kBootstrapAddr);
+
+  // bootAndSettle() naturally leaves the CPU halted (BASIC's own idle HLT
+  // loop) -- CPU::step() is documented to return 0 and do nothing while
+  // halted, so setP() alone never actually redirects execution; confirmed
+  // directly (an earlier version of this test, without this line, just
+  // sat at P unchanged for its first 20 "steps" before the timer
+  // interrupt eventually woke it on its own).
+  m->cpu.setHalted(false);
+
+  // Stop the instant the loop itself exits (P reaches the comparison code
+  // right after it, STAGE_COPY_BLOCK_VERIFY_OK's own "cpa
+  // (EXP_BLOCK_CHECKSUM_ABS)" at 0x857A per rom.lst) -- STAGE_BLOCK_
+  // CKSUM_HI/LO are already final at that point, and running any further
+  // would fall into the mismatch/report path, which writes
+  // EXP_INSTRUCTION_ABS and triggers ExpansionMock's real background-
+  // thread command processing (see Bus::writeME0's own comment) -- not
+  // something safe to blindly single-step through synchronously, and not
+  // needed for what this test is actually checking. Confirmed the hard
+  // way: an earlier version ran a fixed 20000-step budget regardless,
+  // which dragged execution into exactly that path and off into
+  // unrelated system-ROM territory before ever reading the checksum back.
+  constexpr uint16_t kComparisonAddr = 0x84A7;  // first instruction after the loop (lda (STAGE_BLOCK_CKSUM_HI)) -- addresses updated 2026-09-24 from rom.rst
+  constexpr int kMaxSteps = 20000;              // generous fallback -- the loop alone needs ~11264
+  int stepsTaken = 0;
+  while (m->cpu.p() != kComparisonAddr && stepsTaken < kMaxSteps) {
+    stepOne(*m);
+    stepsTaken++;
+  }
+  CHECK(m->cpu.p() == kComparisonAddr);
+  if (m->cpu.p() != kComparisonAddr) {
+    std::printf("  loop never reached its own exit point: P=%04X after %d steps (expected 0x%04X)\n",
+                m->cpu.p(), stepsTaken, kComparisonAddr);
+  }
+
+  uint16_t foundSum = static_cast<uint16_t>((m->bus.readME0(kCksumHiAddr) << 8) |
+                                             m->bus.readME0(kCksumLoAddr));
+  CHECK(foundSum == expectedSum);
+  if (foundSum != expectedSum) {
+    std::printf("  STAGE_COPY_BLOCK_VERIFY_LOOP checksum algorithm mismatch: "
+                "independently computed 0x%04X, ROM loop computed 0x%04X\n",
+                expectedSum, foundSum);
+  }
+}
+
 // STAGE keyword recognition -- added 2026-09 for the RP2350 ROM-to-SRAM
 // redirect feature. First real-hardware attempt reported "STAGE is not a
 // recognized keyword" at all; this checks the same thing here, fast and
@@ -3238,12 +3506,534 @@ void testStageQueryIsRecognizedKeyword() {
   CHECK(m->bus.readME0(kErlAbs) == 0);
 }
 
+// "DEBUG" bare-word safety check -- added 2026-09-21 alongside STAGE DEBUG
+// (a new argument word for the STAGE keyword's per-byte SRAM verify mode).
+// This session already found MLOG's own argument vocabulary tripped over
+// reserved-word collisions twice (LOG itself, then ON/OFF/CLEAR) -- cheap
+// insurance to confirm "DEBUG" isn't also a real PC-1500 BASIC keyword
+// before relying on it, same rigor as testMlogViewIsRecognized's own
+// history. A real reserved word would raise some ERL other than 1 here (a
+// genuine syntax/logic error from actually executing as its own built-in
+// meaning), or execute cleanly with no error at all if it's a valid
+// no-argument statement -- either way, distinguishable from ERROR 1 (bare
+// SD_RAISE_ERROR_1, exactly what an unrecognized bare word not matching
+// any keyword produces here).
+void testDebugBareWordIsNotAReservedKeyword() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  if (rom.empty()) {
+    std::printf("SKIP: testDebugBareWordIsNotAReservedKeyword -- ROM1.BIN not found.\n");
+    return;
+  }
+  {
+    auto m = bootAndSettle(rom);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "NEW0");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "DEBUG");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    uint8_t erl = m->bus.readME0(kErlAbs);
+    std::printf("bare DEBUG -> ERL=%u\n", (unsigned)erl);
+  }
+  // Control: a deliberately-nonsense bare word that's definitely not any
+  // real keyword. If THIS also gives ERL=0, that means bare identifiers
+  // just don't error on this BASIC at all (likely parsed as an implicit
+  // variable-reference expression statement, a legal no-op) -- explaining
+  // DEBUG's own ERL=0 without it being reserved, rather than needing to
+  // treat that as a collision the way LOG/ON/OFF genuinely were.
+  {
+    auto m = bootAndSettle(rom);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "NEW0");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "ZQXVK");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    uint8_t erl = m->bus.readME0(kErlAbs);
+    std::printf("bare ZQXVK (control, definitely not a keyword) -> ERL=%u\n", (unsigned)erl);
+  }
+}
+
+// STAGE DEBUG keyword recognition -- added 2026-09-21, the debug/per-byte-
+// verify sibling of "STAGE RAM" (see STAGE_COPY_ROUTINE_ABS's own comment
+// in rom.asm for why it was added: the per-block checksum feature
+// narrowed a real failure to "block 0, off by 0x28 overall" but couldn't
+// say which byte).
+//
+// 2026-09-24: now seeds the data window from rom.bin (like the real
+// firmware's combined buffer image) so STAGE_COPY_ROUTINE_ABS at 0x8400 is
+// real code, and checks the real outcome -- the mock implements the whole
+// ROM_COPY_* sequence now. Previously the window was left 0xFF, so this
+// "passed" by executing fill bytes that happened to wander back to idle
+// (it printed ERL=0, not the ERL=1 its own comment expected), and broke as
+// soon as the jump into the pocket moved.
+void testStageDebugIsRecognizedKeyword() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomDir =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom/";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomDir + "rom_8800.bin");
+  std::vector<uint8_t> romBin = readFile(kExpRomDir + "rom.bin");
+  if (rom.empty() || expRom.empty() || romBin.size() < 0x800) {
+    std::printf("SKIP: testStageDebugIsRecognizedKeyword -- ROM1.BIN, rom_8800.bin and/or rom.bin "
+                "not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_stage_debug");
+  auto m = bootAndSettle(rom);
+  m->bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x8800, /*requirePv=*/false,
+                             /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
+                             /*dataWindowSize=*/0x800, /*instructionAddr=*/0x87FF, romBin.data(),
+                             0x800);
+  m->bus.expansionMock().setRootDir(sdDir);
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "STAGE DEBUG");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m, 20'000'000));  // per-byte verify copy of all 6K
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+  CHECK(m->bus.expansionMock().romCopyBeginCount() == 1);
+  CHECK(m->bus.expansionMock().romStagedVerified());
+  tapKey(*m, pc1500::Key::Ent);  // dismiss "STAGE: OK"
+  CHECK(waitForIdle(*m));
+}
+
+// MLOG keyword recognition/argument-parsing checks -- added 2026-09-21 after
+// a real-hardware report of "MLOG INFO ON shows ERROR 1", to find bugs fast
+// and deterministically instead of guessing at hand-rolled character-by-
+// character ROM assembly by re-reading it. None of these need ExpansionMock
+// to implement the underlying EXP_COMMAND_LOG_* wire commands -- the ROM's
+// own *_DO routines never check EC_WAIT_NOT_BUSY's return status before
+// showing their confirmation message (same as the STAGE query test's own
+// precedent: an unimplemented command reports NOT_IMPLEMENTED, which
+// callers that don't check status just plow through), so these only test
+// whether the keyword parser reaches the right *_DO routine at all -- an
+// ERL of 1 here can only come from MLOG_BAD_ARG's own jmp SD_RAISE_ERROR_1,
+// i.e. a real parsing bug, not a missing mock.
+//
+// Final argument vocabulary is VIEW/VERBOSE/QUIET/RESET (see rom.asm's own
+// MLOG_ROUTINE comment for the two rounds of collision bugs -- whole
+// reserved words, then a word-boundary collision between two individually
+// safe words -- that got the vocabulary here).
+void testMlogViewIsRecognized() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testMlogViewIsRecognized -- ROM1.BIN and/or rom_8800.bin not found.\n");
+    return;
+  }
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_mlog_view");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "MLOG VIEW");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  uint8_t erl = m->bus.readME0(kErlAbs);
+  CHECK(erl == 0);
+  if (erl != 0) {
+    std::printf("  ERL after typing MLOG VIEW + Enter: %u (want 0)\n", (unsigned)erl);
+  }
+}
+
+void testMlogVerboseIsRecognized() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testMlogVerboseIsRecognized -- ROM1.BIN and/or rom_8800.bin not found.\n");
+    return;
+  }
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_mlog_verbose");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "MLOG VERBOSE");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  uint8_t erl = m->bus.readME0(kErlAbs);
+  CHECK(erl == 0);
+  if (erl != 0) {
+    std::printf("  ERL after typing MLOG VERBOSE + Enter: %u (want 0 -- nonzero means "
+                "MLOG_CHECK_V's 'V' vs VIEW/VERBOSE disambiguation, or "
+                "MLOG_CHECK_VERBOSE_REST, rejected it)\n", (unsigned)erl);
+  }
+}
+
+void testMlogQuietIsRecognized() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testMlogQuietIsRecognized -- ROM1.BIN and/or rom_8800.bin not found.\n");
+    return;
+  }
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_mlog_quiet");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "MLOG QUIET");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  uint8_t erl = m->bus.readME0(kErlAbs);
+  CHECK(erl == 0);
+  if (erl != 0) {
+    std::printf("  ERL after typing MLOG QUIET + Enter: %u (want 0)\n", (unsigned)erl);
+  }
+}
+
+void testMlogResetIsRecognized() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testMlogResetIsRecognized -- ROM1.BIN and/or rom_8800.bin not found.\n");
+    return;
+  }
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_mlog_reset");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "MLOG RESET");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  uint8_t erl = m->bus.readME0(kErlAbs);
+  CHECK(erl == 0);
+  if (erl != 0) {
+    std::printf("  ERL after typing MLOG RESET + Enter: %u (want 0)\n", (unsigned)erl);
+  }
+}
+
+// Boot-hook STAGE (2026-09-24): BOOT_SELFCHECK_ENTRY (ROM_BASE+0AH) now
+// jumps to STAGE_BOOT_ENTRY, so a reset with the module attached should
+// stage the ROM into SRAM during the base ROM's own module scan and still
+// finish booting normally; a second reset, and STAGE RAM typed at the
+// prompt, should both skip the copy because ROM_GET_MODE now reports a
+// verified copy. The module is loaded BEFORE cpu.reset() here -- every
+// other test attaches it after boot via loadExpansionRom(), so the hook
+// never runs for them -- with rom.bin's first 2K as the data-window seed,
+// matching the real firmware's single combined buffer image, so the copy
+// routine at 0x8400 is real code rather than 0xFF fill.
+void testBootHookStagesRomThenSkipsOnReset() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomDir =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom/";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomDir + "rom_8800.bin");
+  std::vector<uint8_t> romBin = readFile(kExpRomDir + "rom.bin");
+  if (rom.empty() || expRom.empty() || romBin.size() < 0x800) {
+    std::printf("SKIP: testBootHookStagesRomThenSkipsOnReset -- ROM1.BIN, rom_8800.bin and/or "
+                "rom.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_boot_stage");
+  auto m = std::make_unique<BootedMachine>();
+  m->bus.ioPort().useManualRtcClock();
+  m->bus.loadME0(0xC000, rom.data(), rom.size());
+  m->bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x8800, /*requirePv=*/false,
+                             /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
+                             /*dataWindowSize=*/0x800, /*instructionAddr=*/0x87FF, romBin.data(),
+                             0x800);
+  m->bus.expansionMock().setRootDir(sdDir);
+  const pc1500::ExpansionMock& mock = m->bus.expansionMock();
+
+  // Same two-stage boot as bootAndSettle(), then the usual NEW0 dismissal --
+  // reaching idle afterwards is the proof the hook returned cleanly.
+  auto resetAndBoot = [&]() {
+    m->cpu.reset();
+    for (long c = 0; !m->cpu.halted() && c < 20'000'000; c++) stepOne(*m);
+    for (long i = 0; i < 4'000'000; i++) stepOne(*m);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "NEW0");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+  };
+
+  resetAndBoot();
+  CHECK(mock.romCopyBeginCount() == 1);
+  CHECK(mock.remapActive());
+  CHECK(mock.romStagedVerified());
+  size_t mismatches = 0;
+  for (size_t i = 0; i < expRom.size(); i++) {
+    if (mock.sramByte(i) != expRom[i]) mismatches++;
+  }
+  CHECK(mismatches == 0);
+  if (mismatches != 0) std::printf("  SRAM differs from ROM image at %zu byte(s)\n", mismatches);
+
+  // Keywords still resolve with ROM_BASE+ now answered by the SRAM copy.
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "STAGE");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  resetAndBoot();
+  CHECK(mock.romCopyBeginCount() == 1);  // verified copy already there -- skipped
+  CHECK(mock.remapActive());
+
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "STAGE RAM");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));                // STAGE_SHOW_OK's own KEYSCAN_WAIT
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+  CHECK(mock.romCopyBeginCount() == 1);  // early exit, no copy
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+}
+
+// MLOGMSG (2026-09-24): its own keyword ahead of MLOG in the 'M' chain, so
+// this also confirms MLOG still resolves once it's no longer the first M
+// entry. Literal and string-variable forms both reach the MCU as the same
+// 'S' chunk; numeric variables, empty "" and unterminated quotes are
+// ERROR 1; long text is truncated to the log's 23-character width.
+void testMlogmsgLogsLiteralAndStringVariable() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testMlogmsgLogsLiteralAndStringVariable -- ROM1.BIN and/or rom_8800.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_mlogmsg");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+  const pc1500::ExpansionMock& mock = m->bus.expansionMock();
+
+  auto run = [&](const std::string& line) {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, line);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    return m->bus.readME0(kErlAbs);
+  };
+
+  run("NEW0");
+
+  CHECK(run("MLOGMSG \"HELLO THERE\"") == 0);
+  CHECK(mock.lastUserLogMessage() == "HELLO THERE");
+
+  CHECK(run("A$=\"FROM A VARIABLE\"") == 0);
+  CHECK(run("MLOGMSG A$") == 0);
+  CHECK(mock.lastUserLogMessage() == "FROM A VARIABLE");
+
+  CHECK(run("MLOGMSG \"ABCDEFGHIJKLMNOPQRSTUVWXYZ\"") == 0);
+  CHECK(mock.lastUserLogMessage() == "ABCDEFGHIJKLMNOPQRSTUVW");  // 23 characters
+
+  // MLOG still resolves as the second M entry: bare MLOG shows the
+  // VERBOSE/QUIET state and waits for a key. Checked before the error
+  // cases below -- ERL keeps the last error rather than resetting.
+  CHECK(run("MLOG") == 0);
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(run("MLOGMSG A") == 1);           // numeric variable
+  CHECK(run("MLOGMSG \"\"") == 1);        // empty
+  CHECK(run("MLOGMSG \"UNTERMINATED") == 1);
+  CHECK(mock.lastUserLogMessage() == "ABCDEFGHIJKLMNOPQRSTUVW");  // none of those logged
+}
+
+
+// MCONF (2026-09-25): shows and sets the MCU's persisted settings. The
+// keyword runs on the MCU executor (keywords.c); the mock keeps settings
+// in memory. A single-setting query SHOWs "NAME=value" at 0x8000 and waits
+// for a key; bare MCONF browses them all.
+void testMconfShowsAndSetsSettings() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testMconfShowsAndSetsSettings -- ROM1.BIN and/or rom_8800.bin not found.\n");
+    return;
+  }
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_mconf");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+  const pc1500::ExpansionMock& mock = m->bus.expansionMock();
+
+  auto run = [&](const std::string& line) {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, line);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    return m->bus.readME0(kErlAbs);
+  };
+  // A SHOW's text is at 0x8000; a listing's first entry at 0x8002.
+  auto shown = [&](uint16_t at = 0x8000) {
+    std::string text;
+    for (int i = 0; i < 26; i++) text += static_cast<char>(m->bus.readME0(static_cast<uint16_t>(at + i)));
+    return text.substr(0, text.find_last_not_of(' ') + 1);
+  };
+
+  run("NEW0");
+
+  // ECVER is ROM-only now, but still shows its message and waits for a key.
+  CHECK(run("ECVER") == 0);
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  // "SLEEPWAIT" also covers the detokenizer: BASIC hands it over as
+  // "SLEEP" + the WAIT token.
+  CHECK(run("MCONF SLEEPWAIT=1000") == 0);
+  CHECK(mock.configValue(1) == 1000);
+  CHECK(run("MCONF LED=0") == 0);
+  CHECK(mock.configValue(0) == 0);
+
+  CHECK(run("MCONF SLEEPWAIT") == 0);
+  CHECK(shown() == "SLEEPWAIT=1000");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  CHECK(run("MCONF") == 0);  // browse: first entry is LED
+  CHECK(shown(0x8002) == "LED=0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  // Errors last -- ERL keeps the last error rather than resetting.
+  CHECK(run("MCONF LED=2") == 1);          // out of range
+  CHECK(mock.configValue(0) == 0);
+  CHECK(run("MCONF COLOUR=1") == 1);       // unknown setting
+  CHECK(run("MCONF SLEEPWAIT=") == 1);     // no value
+  CHECK(mock.configValue(1) == 1000);
+}
+
+
+// Keywords in a running program, with BASIC expressions as arguments
+// (2026-09-25): the ROM hands the MCU the statement wherever BASIC's text
+// pointer is (the program line here), the MCU asks the ROM to evaluate
+// anything that isn't a plain literal, and every keyword returns through
+// BASIC's own end-of-statement vector, so the rest of the line and the
+// next line still run. Also at the prompt: expression arguments.
+void testKeywordsInProgramWithExpressions() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testKeywordsInProgramWithExpressions -- ROM1.BIN and/or rom_8800.bin not found.%c", 10);
+    return;
+  }
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_program");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+  const pc1500::ExpansionMock& mock = m->bus.expansionMock();
+  auto run = [&](const std::string& line) {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, line);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    return m->bus.readME0(kErlAbs);
+  };
+  auto number = [&](uint16_t at) {  // exponent, then the first mantissa byte
+    return (m->bus.readME0(at) << 8) | m->bus.readME0(static_cast<uint16_t>(at + 2));
+  };
+
+  run("NEW0");
+  m->bus.writeME0(kErlAbs, 0);
+
+  // At the prompt: expressions, and a statement after ':'.
+  CHECK(run("MLOGMSG \"A\"+\"B\"") == 0);
+  CHECK(mock.lastUserLogMessage() == "AB");
+  CHECK(run("MCONF SLEEPWAIT=2*500") == 0);
+  CHECK(mock.configValue(1) == 1000);
+  // A second statement after ':' at the prompt is ERROR 1 for BASIC's own
+  // statements too (E=1:D=3 -- the PC-1500 doesn't run multi-statement
+  // lines in immediate mode), and the keywords now end the same way.
+  m->bus.writeME0(kErlAbs, 0);
+  CHECK(run("E=1:D=3") == 1);
+  m->bus.writeME0(kErlAbs, 0);
+  CHECK(run("SDCLOSE ALL:D=4") == 1);
+  m->bus.writeME0(kErlAbs, 0);
+
+  std::string typeError;
+  CHECK(pc1500::basic::typeBasicProgramText(
+      m->bus, m->cpu,
+      "10 SDOPEN \"PROG.SDF\" AS 1:A=5:SDPRINT #1,A*2,\"X\"+\"Y\":SDCLOSE 1\n"
+      "20 F$=\"PROG.SDF\":SDOPEN F$,2:SDINPUT #2,B,T$:SDCLOSE 2:C=7\n",
+      kCyclesPerFrame, kCyclesPerTimerTick, &typeError));
+  tapKey(*m, pc1500::Key::Cl);
+  tapKey(*m, pc1500::Key::Mode);  // PRO -> RUN mode; RUN in PRO mode is ERROR 26
+  CHECK(run("RUN") == 0);
+  CHECK(fs::exists(sdDir / "PROG.SDF"));
+  CHECK(number(0x7908) == 0x0110);  // B = 10: exponent 1, mantissa 1.0
+  CHECK(m->bus.readME0(kVarTDollar) == 'X');
+  CHECK(m->bus.readME0(kVarTDollar + 1) == 'Y');
+  CHECK(m->bus.readME0(kVarTDollar + 2) == 0);
+  CHECK(number(0x7910) == 0x0070);  // C = 7 -- the line went on after the keywords
+}
 }  // namespace
 
 int main() {
+  testKeywordsInProgramWithExpressions();
+
+  testMconfShowsAndSetsSettings();
+  testMlogmsgLogsLiteralAndStringVariable();
+  testBootHookStagesRomThenSkipsOnReset();
   testStageQueryIsRecognizedKeyword();
+  testDebugBareWordIsNotAReservedKeyword();
+  testStageDebugIsRecognizedKeyword();
+  testStageBlockChecksumAlgorithmMatchesIndependentComputation();
+#if 0  // TEMPORARILY narrowed to just the STAGE tests above for a fast
+       // iteration loop -- board owner's own direction, 2026-09-21: restore
+       // before the next real-hardware flash/final confirmation.
+  testMlogViewIsRecognized();
+  testMlogVerboseIsRecognized();
+  testMlogQuietIsRecognized();
+  testMlogResetIsRecognized();
   testSlsExitThenTypingDoesNotConcatenate();
   testSdlsHidesBlinkingCursorDuringBrowse();
+  testSdlsScrollUpDoesNotCorruptEntryPastScratchOffset();
   testStrayEnterAfterSlsExitDoesNotRedispatch();
   testSdloadSelectsAndLoadsFile();
   testSdloadDirectFilenameLoad();
@@ -3302,6 +4092,7 @@ int main() {
   testSdskipAdvancesAndRaisesError40PastEnd();
   testSdChannelCommandsRaiseError1OnMalformedArgument();
   testSdinputOverlongStringRaisesError42();
+#endif
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

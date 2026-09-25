@@ -441,6 +441,18 @@ uint8_t Bus::readME0(uint16_t addr) {
       }
     }
     for (const RomModule& m : romModules_) {
+      // STAGE's mock Remap: while active, this module's own ROM-region
+      // range is answered directly from ExpansionMock's mock SRAM chip
+      // instead of the module's static `data` -- same priority-check shape
+      // as tryReadWindow's own precedence over tryRead just above, applied
+      // to the 6K ROM region instead of the 2K data window. See
+      // ExpansionMock::remapActive()/sramByte()'s own comments.
+      if (m.hasDataWindow && expansionMock_.remapActive() && pv_ == m.requirePv) {
+        size_t bankSize = m.usePuBank ? m.data.size() / 2 : m.data.size();
+        if (bankSize != 0 && addr >= m.base && addr < m.base + bankSize) {
+          return expansionMock_.sramByte(addr - m.base);
+        }
+      }
       if (m.tryRead(addr, pv_, pu_, v)) return v;
     }
     return 0xFF;  // empty socket, or a module present but not selected by the current PV level
@@ -468,6 +480,18 @@ void Bus::writeME0(uint16_t addr, uint8_t value) {
     // board's DoCommand()/WriteStatus() protocol (write a command byte,
     // poll the same address for a non-BUSY status) -- see ExpansionMock.
     for (RomModule& m : romModules_) {
+      // Mirrors readME0's own Remap redirection -- while active, a write
+      // landing in this module's ROM-region range goes to the mock SRAM
+      // chip (this is how STAGE's own `tin` copy loop actually gets bytes
+      // into it) instead of being silently dropped the way a write to real
+      // ROM always is.
+      if (m.hasDataWindow && expansionMock_.remapActive() && pv_ == m.requirePv) {
+        size_t bankSize = m.usePuBank ? m.data.size() / 2 : m.data.size();
+        if (bankSize != 0 && addr >= m.base && addr < m.base + bankSize) {
+          expansionMock_.setSramByte(addr - m.base, value);
+          return;
+        }
+      }
       if (!m.tryWrite(addr, pv_, value)) continue;
       if (m.hasDataWindow && addr == m.instructionAddr) {
         expansionMock_.processCommand(value, m.dataWindow, m.instructionAddr - m.dataWindowBase);

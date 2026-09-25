@@ -931,7 +931,7 @@ bool loadRomModule(pc1500::Bus& bus, int slot, uint16_t base, bool requirePv, bo
 bool loadExpansionModule(pc1500::Bus& bus, int slot, uint16_t base, bool requirePv,
                           bool usePuBank, uint16_t dataWindowBase, uint16_t dataWindowSize,
                           uint16_t instructionAddr, const char* path, const std::string& sdDir,
-                          std::string* error) {
+                          const std::string& windowImagePath, std::string* error) {
   std::vector<uint8_t> data = readFile(path);
   if (data.empty()) {
     *error = "Could not read file (or file is empty).";
@@ -945,9 +945,22 @@ bool loadExpansionModule(pc1500::Bus& bus, int slot, uint16_t base, bool require
     *error = "instructionAddr must fall within [dataWindowBase, dataWindowBase+dataWindowSize).";
     return false;
   }
+  std::vector<uint8_t> windowSeed;
+  if (!windowImagePath.empty()) {
+    windowSeed = readFile(windowImagePath.c_str());
+    if (windowSeed.empty()) {
+      *error = "Could not read window image file (or file is empty).";
+      return false;
+    }
+  }
   bus.loadExpansionModule(slot, data.data(), data.size(), base, requirePv, usePuBank,
-                           dataWindowBase, dataWindowSize, instructionAddr);
-  if (!sdDir.empty()) bus.expansionMock().setRootDir(sdDir);
+                           dataWindowBase, dataWindowSize, instructionAddr,
+                           windowSeed.empty() ? nullptr : windowSeed.data(), windowSeed.size());
+  // "-" is a skip sentinel for sdDir specifically -- lets a caller reach the
+  // positional windowImagePath argument after it without an sdDir, since
+  // `iss >>`-style positional parsing has no way to leave a middle argument
+  // genuinely blank (2026-09-23).
+  if (!sdDir.empty() && sdDir != "-") bus.expansionMock().setRootDir(sdDir);
   return true;
 }
 
@@ -1216,6 +1229,15 @@ bool typeImmediateLineWatch(pc1500::Bus& bus, lh5801::CPU& cpu, const std::strin
     }
     for (const QueuedKeyAction& action : actions) runKeyAction(action);
   }
+  // Was missing entirely until 2026-09-23 (found live: STAGE DEBUG sat
+  // typed-but-never-submitted on screen every time, with an empty watch
+  // log, across every extraCycles budget tried) -- typeImmediateLineWithTrace
+  // (typelinetrace) presses Enter before its own cycles budget; this
+  // function never did. Matches that function's own pattern.
+  bus.setKeyState(pc1500::Key::Ent, true);
+  stepCyclesWatched(static_cast<long>(kTapFrames) * kCyclesPerFrame);
+  bus.setKeyState(pc1500::Key::Ent, false);
+  stepCyclesWatched(static_cast<long>(kIdleFrames) * kCyclesPerFrame);
   if (extraCycles > 0) stepCyclesWatched(extraCycles);
   *watchOut = out.str();
   return true;
@@ -2127,28 +2149,37 @@ int main(int argc, char** argv) {
     } else if (cmd == "loadexpansionmodule" || cmd == "loadexpansionmodule2" ||
                cmd == "loadexpansionmodule3" || cmd == "loadexpansionmodule4") {
       // <base hex> <requirePv 0|1> <usePuBank 0|1> <dataWindowBase hex>
-      // <dataWindowSize hex> <instructionAddr hex> <path> [sdDir] -- like
-      // loadrommodule, but for a module with a genuinely writable data
-      // window and mock command processing (see Bus::RomModule's own
-      // comment and ExpansionMock). Same four independent slots as
-      // loadrommodule, sharing the same slot array. Optional trailing
-      // sdDir points the (single, Bus-wide) ExpansionMock's SD-card
-      // commands at a real host directory -- see loadExpansionModule's
+      // <dataWindowSize hex> <instructionAddr hex> <path> [sdDir]
+      // [windowImagePath] -- like loadrommodule, but for a module with a
+      // genuinely writable data window and mock command processing (see
+      // Bus::RomModule's own comment and ExpansionMock). Same four
+      // independent slots as loadrommodule, sharing the same slot array.
+      // Optional trailing sdDir points the (single, Bus-wide) ExpansionMock's
+      // SD-card commands at a real host directory -- see loadExpansionModule's
       // own comment; omitted leaves SD commands erroring ("no card").
+      // Optional windowImagePath (2026-09-23): a full image, base-aligned at
+      // dataWindowBase (e.g. rom.bin, not the trimmed rom_8800.bin), whose
+      // first dataWindowSize bytes seed the data window's own initial
+      // content -- matching real firmware's monitor_init_buffer(), which
+      // loads one combined image covering both the data window and the ROM
+      // region. Without this, the data window starts all-0xFF and any
+      // resident code placed there (STAGE_COPY_ROUTINE_ABS, RAMTEST2,
+      // STAGE_MANUAL_BLOCK0, ...) runs as garbage the instant it's reached.
       int slot = (cmd == "loadexpansionmodule") ? 0 : (cmd.back() - '1');
       long base = 0, requirePv = 0, usePuBank = 0, dataWindowBase = 0, dataWindowSize = 0,
            instructionAddr = 0;
-      std::string path, sdDir;
+      std::string path, sdDir, windowImagePath;
       iss >> std::hex >> base >> std::dec >> requirePv >> usePuBank;
       iss >> std::hex >> dataWindowBase >> dataWindowSize >> instructionAddr;
       iss >> path;
       iss >> sdDir;
+      iss >> windowImagePath;
       std::string error;
       bool ok = loadExpansionModule(bus, slot, static_cast<uint16_t>(base), requirePv != 0,
                                      usePuBank != 0, static_cast<uint16_t>(dataWindowBase),
                                      static_cast<uint16_t>(dataWindowSize),
                                      static_cast<uint16_t>(instructionAddr), path.c_str(), sdDir,
-                                     &error);
+                                     windowImagePath, &error);
       writeResponse(ok ? "OK" : ("ERROR: " + error));
     } else if (cmd == "unloadrommodule" || cmd == "unloadrommodule2" ||
                cmd == "unloadrommodule3" || cmd == "unloadrommodule4") {

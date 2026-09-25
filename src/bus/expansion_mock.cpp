@@ -7,6 +7,10 @@
 #include <cstdio>
 #include <thread>
 
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+#include "keywords.h"
+#endif
+
 namespace pc1500 {
 
 namespace fs = std::filesystem;
@@ -140,6 +144,12 @@ fs::path ExpansionMock::resolveCopyOrMoveDestination(const std::string& srcBasen
   return resolved;
 }
 
+void ExpansionMock::throttleForBytes(uint32_t bytes) const {
+  if (sdRateLimitBytesPerSec_ == 0 || bytes == 0) return;
+  double seconds = static_cast<double>(bytes) / static_cast<double>(sdRateLimitBytesPerSec_);
+  std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+}
+
 // Real per-command work, unchanged from the old synchronous processCommand()
 // this was renamed from -- now called from a background thread (see
 // processCommand()'s own comment) instead of directly from Bus::writeME0(),
@@ -205,6 +215,22 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       return skipSdValues(window);
     case kCommandValidateSdName:
       return validateAndFoldSdName(window);
+    case kCommandRomFromMcu:
+      return romFromMcu(window);
+    case kCommandRomFromSram:
+      return romFromSram(window);
+    case kCommandRomCopyBegin:
+      return romCopyBegin(window);
+    case kCommandRomCopyGetBlock:
+      return romCopyGetBlock(window);
+    case kCommandRomCopyFinish:
+      return romCopyFinish(window);
+    case kCommandRomGetMode:
+      return romGetMode(window);
+    case kCommandLogBlockChecksum:
+      return logBlockChecksum(window);
+    case kCommandStageByteMismatch:
+      return stageByteMismatch(window);
     case kCommandTestDelay: {
       // Diagnostic only -- see PC_EXP.h's own comment and the real
       // firmware's DoCommand() case. Runs on processCommand()'s own
@@ -221,9 +247,57 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     }
     case kCommandClearStatus:
       return kStatusReady;
+    case kCommandDone:
+      return kStatusSuccess;
+    case kCommandLogUserMessage: {
+      if (window.size() < 3 || window[1] != 'S') return kStatusError;
+      size_t len = (std::min<size_t>)(window[2], 23);  // MCU_LOG_MSG_MAX
+      if (3 + len > window.size()) return kStatusError;
+      lastUserLogMessage_.assign(reinterpret_cast<const char*>(&window[3]), len);
+      return kStatusSuccess;
+    }
+    case kCommandKeyword:
+    case kCommandKeywordContinue:
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+      // The real firmware's keyword executor -- see keywords.h. Its nested
+      // commands run straight through dispatchCommand() on this same
+      // worker thread, so none of their statuses reach pollStatus().
+      if (window.size() < 2048) return kStatusError;
+      kwWindow_ = &window;
+      return kw_command(cmd, window.data(), &ExpansionMock::runKeywordCommand, this);
+#else
+      return kStatusNotImplemented;
+#endif
+    case kCommandLogList: {
+      // No MCU log here: an empty listing (just the summary line), in
+      // LIST_SD_DIR's shape, so MLOG VIEW has something to browse.
+      static const char kSummary[] = "0 ENTRIES";
+      window[0] = 0;
+      window[1] = 0;
+      for (int i = 0; i < kSummaryLineLen; i++)
+        window[2 + i] = i < static_cast<int>(sizeof kSummary - 1) ? static_cast<uint8_t>(kSummary[i]) : ' ';
+      return kStatusSuccess;
+    }
+    case kCommandConfigGet:
+      if (window[0] >= kConfigCount) return kStatusError;
+      window[1] = static_cast<uint8_t>(config_[window[0]] >> 8);
+      window[2] = static_cast<uint8_t>(config_[window[0]]);
+      return kStatusSuccess;
+    case kCommandConfigSet:
+      if (window[0] >= kConfigCount) return kStatusError;
+      config_[window[0]] = static_cast<uint16_t>((window[1] << 8) | window[2]);
+      return kStatusSuccess;
+    case kCommandLogClear:
+      return kStatusSuccess;
+    case kCommandLogSetInfoEnabled:
+      logInfoEnabled_ = window[0] != 0;
+      return kStatusSuccess;
+    case kCommandLogGetInfoEnabled:
+      window[0] = logInfoEnabled_ ? 1 : 0;
+      return kStatusSuccess;
     default:
       // Matches DoCommand()'s own default: case -- every command this
-      // mock doesn't implement (ROM_FROM_MCU/SRAM, TEST_COPY_STRING, ...)
+      // mock doesn't implement (TEST_COPY_STRING, the MLOG commands, ...)
       // reports NOT_IMPLEMENTED rather than silently succeeding, so ROM
       // code relying on a real result fails loudly.
       return kStatusNotImplemented;
@@ -309,6 +383,7 @@ uint8_t ExpansionMock::listSdDir(std::vector<uint8_t>& window) {
         std::to_string(count) + " FILES " + std::to_string(totalBytes) + "B " +
         std::to_string(freeBytes) + "F";
     writeText(summary, window, summaryOffset, kSummaryLineLen);
+    throttleForBytes(simulatedFatScanBytes_);
   }
   return kStatusSuccess;
 }
@@ -323,6 +398,7 @@ uint8_t ExpansionMock::getSdFreeSpace(std::vector<uint8_t>& window) {
   window[1] = static_cast<uint8_t>(v >> 16);
   window[2] = static_cast<uint8_t>(v >> 8);
   window[3] = static_cast<uint8_t>(v);
+  throttleForBytes(simulatedFatScanBytes_);
   return kStatusSuccess;
 }
 
@@ -386,6 +462,7 @@ uint8_t ExpansionMock::writeToSdFile(std::vector<uint8_t>& window) {
   if (!openFile_.good()) return kStatusError;
   openFile_.flush();
   bytesWrittenTotal_ += dataLen;
+  throttleForBytes(dataLen);
   return kStatusSuccess;
 }
 
@@ -405,6 +482,7 @@ uint8_t ExpansionMock::readFromSdFile(std::vector<uint8_t>& window) {
   openFile_.clear();  // clear eof/fail from a short read -- not an error here
   window[kLengthPortOffset] = static_cast<uint8_t>(bytesRead >> 8);
   window[kLengthPortOffset + 1] = static_cast<uint8_t>(bytesRead & 0xFF);
+  throttleForBytes(static_cast<uint32_t>(bytesRead));
   return kStatusSuccess;
 }
 
@@ -863,6 +941,114 @@ uint8_t ExpansionMock::validateAndFoldSdName(std::vector<uint8_t>& window) {
   return kStatusSuccess;
 }
 
+// STAGE/Remap mock commands -- see setRomImage()/remapActive()'s own
+// comments in expansion_mock.h. Kept in sync by hand with the real RP2350
+// firmware's monitor.c DoCommand() cases for these same commands.
+
+uint8_t ExpansionMock::romFromMcu(std::vector<uint8_t>& /*window*/) {
+  // Real board also clears GP1 write-enable and resets romCopyActive as a
+  // safety measure -- this doubles as STAGE's own mid-copy/checksum-
+  // failure recovery path, not just a normal mode switch. The mock has no
+  // separate write-enable concept (see romCopyGetBlock's own comment), so
+  // clearing remapActive_ + romCopyActive_ is the whole of it here.
+  remapActive_ = false;
+  romCopyActive_ = false;
+  romStagedVerified_ = false;
+  return kStatusSuccess;
+}
+
+uint8_t ExpansionMock::romFromSram(std::vector<uint8_t>& /*window*/) {
+  remapActive_ = true;
+  return kStatusSuccess;
+}
+
+uint8_t ExpansionMock::romCopyBegin(std::vector<uint8_t>& /*window*/) {
+  // Real board sets GreenPAK1's Remap + write-enable and GreenPAK2's
+  // Remap over I2C, then reads them back to confirm before reporting
+  // success -- no I2C here, so no failure mode to model; this mock always
+  // succeeds (a deliberate scope choice: it's testing ROM-side sequencing/
+  // logic bugs, not GreenPAK I2C failure handling).
+  remapActive_ = true;
+  romCopyActive_ = true;
+  romCopyBlockIndex_ = 0;
+  romStagedVerified_ = false;
+  romCopyBeginCount_++;
+  return kStatusSuccess;
+}
+
+uint8_t ExpansionMock::romCopyGetBlock(std::vector<uint8_t>& window) {
+  if (!romCopyActive_ || romCopyBlockIndex_ >= 6) return kStatusError;
+  size_t srcOffset = static_cast<size_t>(romCopyBlockIndex_) * kMaxTransferLen;
+  for (int i = 0; i < kMaxTransferLen; i++) {
+    uint8_t b = (srcOffset + static_cast<size_t>(i) < romImage_.size())
+                    ? romImage_[srcOffset + static_cast<size_t>(i)]
+                    : 0xFF;
+    if (static_cast<size_t>(i) < window.size()) window[static_cast<size_t>(i)] = b;
+  }
+  // Same additive-checksum algorithm as the real board's ComputeBlockChecksum()
+  // -- 16-bit unsigned wraparound, no multiply (the LH5801 has none).
+  uint16_t checksum = 0;
+  for (int i = 0; i < kMaxTransferLen; i++) {
+    checksum = static_cast<uint16_t>(checksum + window[static_cast<size_t>(i)]);
+  }
+  if (window.size() > static_cast<size_t>(kBlockChecksumOffset) + 1) {
+    window[static_cast<size_t>(kBlockChecksumOffset)] = static_cast<uint8_t>(checksum >> 8);
+    window[static_cast<size_t>(kBlockChecksumOffset) + 1] = static_cast<uint8_t>(checksum & 0xFF);
+  }
+  romCopyBlockIndex_++;
+  return kStatusSuccess;
+}
+
+uint8_t ExpansionMock::romCopyFinish(std::vector<uint8_t>& window) {
+  if (window.size() < 2) return kStatusError;
+  uint16_t reported = static_cast<uint16_t>((window[0] << 8) | window[1]);
+  // Compares against romImage_ (the MCU's own known-good copy), NOT sram_
+  // -- matching the real board's own ComputeRomChecksum(), which sums its
+  // own buffer, never actually reading the external SRAM chip for this
+  // check. The ROM's own report is trusted to reflect what it wrote (and
+  // separately confirmed along the way, per-block, by LOG_BLOCK_CHECKSUM).
+  //
+  // Must sum over all 6 blocks (6*kMaxTransferLen bytes), padding with 0xFF
+  // past romImage_'s own real length -- exactly matching romCopyGetBlock's
+  // own padding for any block whose range extends past the file's actual
+  // content (romImage_ is rom_8800.bin, typically shorter than the full 6K
+  // ROM region, since the assembler doesn't emit trailing unused bytes).
+  // Previously only summed romImage_ itself: internally inconsistent with
+  // GET_BLOCK's own padding, so the ROM's own accumulated checksum (built
+  // from what GET_BLOCK actually served, padding included) could never
+  // match -- confirmed live: all 6 per-block LOG_BLOCK_CHECKSUM checks
+  // passed, but FINISH failed every time, on a real board+ROM combination
+  // with nothing else wrong. Found 2026-09-23 testing STAGE DEBUG after
+  // fixing the data-window-loading gap that made this reachable at all.
+  constexpr size_t kTotalRomBytes = 6 * static_cast<size_t>(kMaxTransferLen);
+  uint16_t computed = 0;
+  for (size_t i = 0; i < kTotalRomBytes; i++) {
+    uint8_t b = (i < romImage_.size()) ? romImage_[i] : 0xFF;
+    computed = static_cast<uint16_t>(computed + b);
+  }
+  romCopyActive_ = false;
+  romStagedVerified_ = (reported == computed);
+  return (reported == computed) ? kStatusSuccess : kStatusError;
+}
+
+uint8_t ExpansionMock::romGetMode(std::vector<uint8_t>& window) {
+  if (window.size() < 2) return kStatusError;
+  window[0] = remapActive_ ? 1 : 0;
+  window[1] = (remapActive_ && romStagedVerified_) ? 1 : 0;
+  return kStatusSuccess;
+}
+
+uint8_t ExpansionMock::logBlockChecksum(std::vector<uint8_t>& /*window*/) {
+  // Diagnostic only on real hardware (logged via mcu_log_error/_info, never
+  // gates STAGE's own outcome) -- accept-and-succeed is a faithful mock.
+  return kStatusSuccess;
+}
+
+uint8_t ExpansionMock::stageByteMismatch(std::vector<uint8_t>& /*window*/) {
+  // Diagnostic only, same as logBlockChecksum above.
+  return kStatusSuccess;
+}
+
 // Ported from main.c's EXP_COMMAND_GET_SD_DF_TEXT case: pre-rendered
 // "<free>F / <total>T" text, matching listSdDir's own summary-line "B"/"F"
 // suffix convention -- the ROM has no decimal-to-ASCII conversion of its
@@ -914,6 +1100,11 @@ ExpansionMock::~ExpansionMock() {
 // nothing currently blocks that, and it would leave the worker thread
 // writing into a `window` vector that's since been reset out from under
 // it.
+uint8_t ExpansionMock::runKeywordCommand(uint8_t cmd, void* ctx) {
+  auto* self = static_cast<ExpansionMock*>(ctx);
+  return self->dispatchCommand(cmd, *self->kwWindow_);
+}
+
 void ExpansionMock::processCommand(uint8_t cmd, std::vector<uint8_t>& window,
                                     size_t instructionOffset) {
   if (worker_.joinable()) worker_.join();  // serialize -- see this function's own comment
