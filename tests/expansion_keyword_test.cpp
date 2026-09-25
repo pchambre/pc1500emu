@@ -3927,6 +3927,8 @@ void testMconfShowsAndSetsSettings() {
   CHECK(mock.configValue(1) == 1000);
   CHECK(run("MCONF LED=0") == 0);
   CHECK(mock.configValue(0) == 0);
+  CHECK(run("MCONF LOGSIZE=512") == 0);
+  CHECK(mock.configValue(2) == 512);
 
   CHECK(run("MCONF SLEEPWAIT") == 0);
   CHECK(shown() == "SLEEPWAIT=1000");
@@ -4012,9 +4014,84 @@ void testKeywordsInProgramWithExpressions() {
   CHECK(m->bus.readME0(kVarTDollar + 2) == 0);
   CHECK(number(0x7910) == 0x0070);  // C = 7 -- the line went on after the keywords
 }
+
+// FNCLR / FNSAVE / FNLOAD and STSAVE / STLOAD (2026-09-25). The function
+// keys are the 195 bytes ending just before the BASIC program (7865H);
+// FNCLR runs in the ROM alone. STLOAD writes all of 0000H-7FFFH back --
+// the stack page last, from the ROM's RESTORE -- and resumes right after
+// the STSAVE that made the state: at the prompt that just finishes the
+// command; in a program, the program carries on from there.
+void testFnKeysAndStateSaveRestore() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testFnKeysAndStateSaveRestore -- ROM1.BIN and/or rom_8800.bin not found.%c", 10);
+    return;
+  }
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_fn_state");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+  auto run = [&](const std::string& line) {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, line);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    return m->bus.readME0(kErlAbs);
+  };
+  auto number = [&](uint16_t at) {  // exponent, then the first mantissa byte
+    return (m->bus.readME0(at) << 8) | m->bus.readME0(static_cast<uint16_t>(at + 2));
+  };
+
+  run("NEW0");
+  m->bus.writeME0(kErlAbs, 0);
+
+  // Function keys
+  uint16_t start = static_cast<uint16_t>((m->bus.readME0(0x7865) << 8) | m->bus.readME0(0x7866));
+  uint16_t keys = static_cast<uint16_t>(start - 195);
+  for (int i = 0; i < 195; i++) m->bus.writeME0(static_cast<uint16_t>(keys + i), static_cast<uint8_t>(i * 7 + 1));
+  CHECK(run("FNSAVE") == 0);
+  CHECK(run("FNCLR") == 0);
+  bool cleared = true;
+  for (int i = 0; i < 195; i++) cleared = cleared && m->bus.readME0(static_cast<uint16_t>(keys + i)) == 0;
+  CHECK(cleared);
+  CHECK(m->bus.readME0(static_cast<uint16_t>(keys - 1)) != 0 || keys == 0);  // nothing before them touched
+  CHECK(run("FNLOAD") == 0);
+  bool restored = true;
+  for (int i = 0; i < 195; i++)
+    restored = restored && m->bus.readME0(static_cast<uint16_t>(keys + i)) == static_cast<uint8_t>(i * 7 + 1);
+  CHECK(restored);
+
+  // State at the prompt: variables come back, and the prompt still works.
+  CHECK(run("A=5") == 0);
+  CHECK(run("STSAVE") == 0);
+  CHECK(run("A=9") == 0);
+  CHECK(number(0x7900) == 0x0090);  // A = 9
+  CHECK(run("STLOAD") == 0);
+  CHECK(number(0x7900) == 0x0050);  // A = 5 again
+  CHECK(run("B=2") == 0);
+  CHECK(number(0x7908) == 0x0020);
+
+  // State saved inside a program: STLOAD resumes the program after STSAVE.
+  run("NEW");
+  std::string typeError;
+  CHECK(pc1500::basic::typeBasicProgramText(m->bus, m->cpu, "10 C=0:STSAVE:C=C+1\n", kCyclesPerFrame,
+                                             kCyclesPerTimerTick, &typeError));
+  tapKey(*m, pc1500::Key::Cl);
+  tapKey(*m, pc1500::Key::Mode);  // PRO -> RUN mode
+  CHECK(run("RUN") == 0);
+  CHECK(number(0x7910) == 0x0010);  // C = 1
+  CHECK(run("C=5") == 0);
+  CHECK(run("STLOAD") == 0);
+  CHECK(number(0x7910) == 0x0010);  // C = 0 restored, then C=C+1 ran again
+}
 }  // namespace
 
 int main() {
+  testFnKeysAndStateSaveRestore();
   testKeywordsInProgramWithExpressions();
 
   testMconfShowsAndSetsSettings();

@@ -227,7 +227,15 @@ class ExpansionMock {
   // value. The mock keeps them in memory (real firmware: flash).
   static constexpr uint8_t kCommandConfigGet = 0x30;
   static constexpr uint8_t kCommandConfigSet = 0x31;
-  static constexpr int kConfigCount = 2;  // LED, SLEEPWAIT -- mcu_config.h
+  static constexpr int kConfigCount = 3;  // LED, SLEEPWAIT, LOGSIZE -- mcu_config.h
+
+  // FNSAVE/FNLOAD/STSAVE/STLOAD stores (2026-09-25): the real firmware
+  // keeps them in flash (mcu_store.c), the mock in memory. Parameters at
+  // window offset kStoreParams: slot, offset (BE), length (BE); data at 0.
+  static constexpr uint8_t kCommandStoreErase = 0x32;
+  static constexpr uint8_t kCommandStoreWrite = 0x33;
+  static constexpr uint8_t kCommandStoreRead = 0x34;
+  static constexpr int kStoreParams = 0x7F0;
 
   static constexpr uint8_t kCommandClearStatus = 0xFF;
 
@@ -481,7 +489,10 @@ class ExpansionMock {
   int romCopyBeginCount_ = 0;
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
-  uint16_t config_[kConfigCount] = {1, 0};  // mcu_config.c's defaults
+  uint16_t config_[kConfigCount] = {1, 0, 100};  // mcu_config.c's defaults
+  // slot 0: function keys (1 sector), slot 1: state (9 sectors) -- sizes as
+  // in the firmware's flash_layout.h; erased flash reads 0xFF
+  std::vector<uint8_t> stores_[2] = {std::vector<uint8_t>(4096, 0xFF), std::vector<uint8_t>(9 * 4096, 0xFF)};
   // The window of the keyword command in progress, for runKeywordCommand().
   std::vector<uint8_t>* kwWindow_ = nullptr;
   static uint8_t runKeywordCommand(uint8_t cmd, void* ctx);

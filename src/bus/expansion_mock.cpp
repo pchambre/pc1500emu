@@ -287,6 +287,26 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       if (window[0] >= kConfigCount) return kStatusError;
       config_[window[0]] = static_cast<uint16_t>((window[1] << 8) | window[2]);
       return kStatusSuccess;
+    case kCommandStoreErase:
+    case kCommandStoreWrite:
+    case kCommandStoreRead: {
+      const uint8_t* p = &window[kStoreParams];
+      if (p[0] > 1) return kStatusError;
+      std::vector<uint8_t>& store = stores_[p[0]];
+      size_t offset = (p[1] << 8) | p[2], len = (p[3] << 8) | p[4];
+      if (cmd == kCommandStoreErase) {
+        std::fill(store.begin(), store.end(), 0xFF);
+        return kStatusSuccess;
+      }
+      if (len == 0 || len > 2048 || offset + len > store.size()) return kStatusError;
+      if (cmd == kCommandStoreWrite) {
+        if (offset % 256) return kStatusError;
+        for (size_t i = 0; i < len; i++) store[offset + i] &= window[i];  // flash: bits only clear
+      } else {
+        std::copy(store.begin() + offset, store.begin() + offset + len, window.begin());
+      }
+      return kStatusSuccess;
+    }
     case kCommandLogClear:
       return kStatusSuccess;
     case kCommandLogSetInfoEnabled:
