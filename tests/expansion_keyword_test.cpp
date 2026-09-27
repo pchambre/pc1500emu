@@ -3929,6 +3929,11 @@ void testMconfShowsAndSetsSettings() {
   CHECK(mock.configValue(0) == 0);
   CHECK(run("MCONF LOGSIZE=512") == 0);
   CHECK(mock.configValue(2) == 512);
+  // BLE is setting 5: the table maps names to ids, not positions.
+  CHECK(run("MCONF BLE=1") == 0);
+  CHECK(mock.configValue(5) == 1);
+  CHECK(run("MCONF BLE=0") == 0);
+  CHECK(mock.configValue(5) == 0);
 
   CHECK(run("MCONF SLEEPWAIT") == 0);
   CHECK(shown() == "SLEEPWAIT=1000");
@@ -3946,6 +3951,8 @@ void testMconfShowsAndSetsSettings() {
   CHECK(run("MCONF COLOUR=1") == 1);       // unknown setting
   CHECK(run("MCONF SLEEPWAIT=") == 1);     // no value
   CHECK(mock.configValue(1) == 1000);
+  CHECK(run("MCONF BLE=2") == 1);          // out of range
+  CHECK(mock.configValue(5) == 0);
 }
 
 
