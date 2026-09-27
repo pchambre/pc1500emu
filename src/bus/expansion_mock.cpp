@@ -3,6 +3,7 @@
 #include "expansion_mock.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <thread>
@@ -307,6 +308,14 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       }
       return kStatusSuccess;
     }
+    case kCommandBleScan:
+    case kCommandBleConnect:
+    case kCommandBleConnectName:
+    case kCommandBleDisconnect:
+    case kCommandBleText:
+    case kCommandBleFilePut:
+    case kCommandBleFileGet:
+      return bleCommand(cmd, window);
     case kCommandLogClear:
       return kStatusSuccess;
     case kCommandLogSetInfoEnabled:
@@ -472,6 +481,7 @@ uint8_t ExpansionMock::openSdFileRead(std::vector<uint8_t>& window) {
 // real landmine in the original and has been removed there, 2026 session --
 // not mirrored here either.
 uint8_t ExpansionMock::writeToSdFile(std::vector<uint8_t>& window) {
+  if (bleXfer_ != BleXfer::kNone) return bleWrite(window);
   if (fileStatus_ != kFileStatusOpenWrite || !openFile_.is_open()) return kStatusError;
   if (window.size() < static_cast<size_t>(kLengthPortOffset) + 2) return kStatusError;
   uint16_t dataLen = (static_cast<uint16_t>(window[kLengthPortOffset]) << 8) |
@@ -491,6 +501,7 @@ uint8_t ExpansionMock::writeToSdFile(std::vector<uint8_t>& window) {
 // length moved out of the payload page entirely, so the payload is now the
 // full window[0..kMaxTransferLen-1], not confined to one 256-byte page).
 uint8_t ExpansionMock::readFromSdFile(std::vector<uint8_t>& window) {
+  if (bleXfer_ != BleXfer::kNone) return bleRead(window);
   if (fileStatus_ != kFileStatusOpenRead || !openFile_.is_open()) return kStatusError;
   if (window.size() < static_cast<size_t>(kLengthPortOffset) + 2) return kStatusError;
   uint16_t requestLen = (static_cast<uint16_t>(window[kLengthPortOffset]) << 8) |
@@ -507,6 +518,7 @@ uint8_t ExpansionMock::readFromSdFile(std::vector<uint8_t>& window) {
 }
 
 uint8_t ExpansionMock::closeSdFile(std::vector<uint8_t>& window) {
+  if (bleXfer_ != BleXfer::kNone) return bleClose();
   if (!openFile_.is_open() || fileStatus_ == kFileStatusClosed) return kStatusError;
   openFile_.close();
   fileStatus_ = kFileStatusClosed;
@@ -518,6 +530,140 @@ uint8_t ExpansionMock::closeSdFile(std::vector<uint8_t>& window) {
   }
   bytesWrittenTotal_ = 0;
   return kStatusSuccess;
+}
+
+// ---- BLE (2026-09-27) ----
+//
+// A fake peer in place of the firmware's radio (RP2350/pc_exp.h's
+// EXP_COMMAND_BLE_*): what the keywords see is the same, a SUCCESS/ERROR
+// per command with the same window layouts. BLE_PROTOCOL.md's error codes
+// come back at window[0]: 3 = not found, 4 = exists, 0 = no link.
+
+namespace {
+std::string bleNameFromSlot(const std::vector<uint8_t>& window) {
+  size_t len = (static_cast<size_t>(window[0]) << 8) | window[1];
+  if (len > 40) len = 40;
+  return std::string(window.begin() + 2, window.begin() + 2 + static_cast<long>(len));
+}
+
+std::string upper(std::string s) {
+  for (char& ch : s) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  return s;
+}
+}  // namespace
+
+// The link drops once bleDropAfter_ more file bytes have moved.
+bool ExpansionMock::bleMoved(size_t bytes) {
+  if (bleDropAfter_ < 0) return true;
+  bleDropAfter_ -= static_cast<long>(bytes);
+  if (bleDropAfter_ >= 0) return true;
+  bleConnected_ = false;
+  bleXferFailed_ = true;
+  bleDropAfter_ = -1;
+  return false;
+}
+
+uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
+  auto connected = [&](const std::string& name) {
+    bleConnected_ = true;
+    window[0] = static_cast<uint8_t>(name.size());
+    std::copy(name.begin(), name.end(), window.begin() + 1);
+    return kStatusSuccess;
+  };
+  auto fail = [&](uint8_t code) {
+    window[0] = code;
+    return kStatusError;
+  };
+  switch (cmd) {
+    case kCommandBleScan: {
+      uint16_t count = 0;
+      for (const std::string& name : blePeers_) {
+        size_t at = 2 + static_cast<size_t>(count) * kDirRecordSize;
+        writeText(name, window, at, kDirNameLen);
+        writeText("", window, at + kDirNameLen, kDirSizeTextLen);
+        std::fill(window.begin() + static_cast<long>(at + kDirNameLen + kDirSizeTextLen),
+                  window.begin() + static_cast<long>(at + kDirRecordSize), 0);
+        count++;
+      }
+      window[0] = static_cast<uint8_t>(count >> 8);
+      window[1] = static_cast<uint8_t>(count);
+      writeText(std::to_string(count) + " FOUND", window, 2 + static_cast<size_t>(count) * kDirRecordSize,
+                kSummaryLineLen);
+      return kStatusSuccess;
+    }
+    case kCommandBleConnect:
+      if (window[0] >= blePeers_.size()) return fail(0);
+      return connected(blePeers_[window[0]]);
+    case kCommandBleConnectName: {
+      std::string wanted = upper(bleNameFromSlot(window));
+      for (const std::string& name : blePeers_)
+        if (upper(name) == wanted) return connected(name);
+      return fail(0);
+    }
+    case kCommandBleDisconnect:
+      bleConnected_ = false;
+      bleXfer_ = BleXfer::kNone;
+      return kStatusSuccess;
+    case kCommandBleText: {
+      if (!bleConnected_) return fail(0);
+      size_t len = (static_cast<size_t>(window[0]) << 8) | window[1];
+      bleText_.append(window.begin() + 2, window.begin() + 2 + static_cast<long>(len));
+      return kStatusSuccess;
+    }
+    case kCommandBleFilePut: {
+      if (!bleConnected_) return fail(0);
+      std::string name = bleNameFromSlot(window);
+      bool overwrite = window[kBleFileArgs + 1] & 0x01;
+      if (bleFiles_.count(name) && !overwrite) return fail(4);
+      bleXfer_ = BleXfer::kPut;
+      bleXferName_ = name;
+      bleXferData_.clear();
+      bleXferFailed_ = false;
+      return kStatusSuccess;
+    }
+    case kCommandBleFileGet: {
+      if (!bleConnected_) return fail(0);
+      auto it = bleFiles_.find(bleNameFromSlot(window));
+      if (it == bleFiles_.end()) return fail(3);
+      bleXfer_ = BleXfer::kGet;
+      bleXferData_ = it->second;
+      bleXferPos_ = 0;
+      bleXferFailed_ = false;
+      window[0] = 0xFF;  // kind unknown: this store doesn't record it
+      return kStatusSuccess;
+    }
+    default:
+      return kStatusNotImplemented;
+  }
+}
+
+uint8_t ExpansionMock::bleWrite(std::vector<uint8_t>& window) {
+  uint16_t len = static_cast<uint16_t>((window[kLengthPortOffset] << 8) | window[kLengthPortOffset + 1]);
+  if (bleXfer_ != BleXfer::kPut || bleXferFailed_ || !bleMoved(len)) return kStatusError;
+  bleXferData_.insert(bleXferData_.end(), window.begin(), window.begin() + len);
+  return kStatusSuccess;
+}
+
+uint8_t ExpansionMock::bleRead(std::vector<uint8_t>& window) {
+  uint16_t want = static_cast<uint16_t>((window[kLengthPortOffset] << 8) | window[kLengthPortOffset + 1]);
+  if (bleXfer_ != BleXfer::kGet || bleXferFailed_) return kStatusError;
+  size_t n = std::min<size_t>(want, bleXferData_.size() - bleXferPos_);
+  if (!bleMoved(n)) return kStatusError;
+  std::copy(bleXferData_.begin() + static_cast<long>(bleXferPos_),
+            bleXferData_.begin() + static_cast<long>(bleXferPos_ + n), window.begin());
+  bleXferPos_ += n;
+  window[kLengthPortOffset] = static_cast<uint8_t>(n >> 8);
+  window[kLengthPortOffset + 1] = static_cast<uint8_t>(n);
+  return kStatusSuccess;
+}
+
+// SUCCESS only if the whole file moved: a failed save leaves nothing behind.
+uint8_t ExpansionMock::bleClose() {
+  bool ok = !bleXferFailed_;
+  if (bleXfer_ == BleXfer::kPut && ok) bleFiles_[bleXferName_] = bleXferData_;
+  if (bleXfer_ == BleXfer::kGet && bleXferPos_ != bleXferData_.size()) ok = false;
+  bleXfer_ = BleXfer::kNone;
+  return ok ? kStatusSuccess : kStatusError;
 }
 
 uint8_t ExpansionMock::getSdFileSize(std::vector<uint8_t>& window) {
@@ -1129,6 +1275,8 @@ void ExpansionMock::processCommand(uint8_t cmd, std::vector<uint8_t>& window,
                                     size_t instructionOffset) {
   if (worker_.joinable()) worker_.join();  // serialize -- see this function's own comment
   window[instructionOffset] = kStatusBusy;
+  commandStartCycles_ = emulatedCycles_;
+  commandStartTime_ = std::chrono::steady_clock::now();
   pendingStatus_.store(kStatusBusy, std::memory_order_relaxed);
   worker_ = std::thread(&ExpansionMock::runCommandAsync, this, cmd, &window, instructionOffset);
 }
@@ -1137,7 +1285,22 @@ void ExpansionMock::runCommandAsync(uint8_t cmd, std::vector<uint8_t>* window,
                                      size_t instructionOffset) {
   uint8_t status = dispatchCommand(cmd, *window);
   (*window)[instructionOffset] = status;
-  pendingStatus_.store(status, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(doneMutex_);
+    pendingStatus_.store(status, std::memory_order_release);
+  }
+  doneCv_.notify_all();
+}
+
+uint8_t ExpansionMock::pollStatusPaced() {
+  uint8_t status = pendingStatus_.load(std::memory_order_acquire);
+  if (status != kStatusBusy) return status;
+  auto emulated = std::chrono::duration<double>(
+      static_cast<double>(emulatedCycles_ - commandStartCycles_) / kCpuHz);
+  auto until = commandStartTime_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(emulated);
+  std::unique_lock<std::mutex> lock(doneMutex_);
+  doneCv_.wait_until(lock, until, [&] { return pendingStatus_.load(std::memory_order_acquire) != kStatusBusy; });
+  return pendingStatus_.load(std::memory_order_acquire);
 }
 
 }  // namespace pc1500

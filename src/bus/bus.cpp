@@ -436,7 +436,7 @@ uint8_t Bus::readME0(uint16_t addr) {
         // what lets a still-in-progress command genuinely read back as
         // BUSY rather than whatever the worker thread's writes have
         // gotten to so far.
-        if (m.hasDataWindow && addr == m.instructionAddr) return expansionMock_.pollStatus();
+        if (m.hasDataWindow && addr == m.instructionAddr) return expansionMock_.pollStatusPaced();
         return v;
       }
     }
@@ -615,6 +615,7 @@ void Bus::applyRelease(Key key) {
 
 void Bus::advanceCycles(int cycles) {
   io_.advanceCycles(cycles);
+  expansionMock_.advanceCycles(cycles);
   if (cursorKeyHeld_) {
     cursorRepeatCycles_ += cycles;
     int threshold = cursorRepeatFired_ ? kCursorRepeatCycles : kCursorInitialDelayCycles;

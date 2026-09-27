@@ -4,9 +4,13 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -117,6 +121,21 @@ class ExpansionMock {
   // to so far. See this class's own .cpp comment for the acquire/release
   // pairing this relies on.
   uint8_t pollStatus() const { return pendingStatus_.load(std::memory_order_acquire); }
+
+  // pollStatus() as the CPU sees it (Bus::readME0()), with the MCU kept to
+  // real time (2026-09-27). The emulated CPU runs far faster than real time
+  // (a test steps it flat out) while the command runs in real time on its
+  // worker thread, so without this a host scheduling delay of a few
+  // milliseconds looked like the MCU taking seconds -- long enough for the
+  // ROM's bounded waits (EC_WAKE's 65535 polls) to give up, and for tests to
+  // fail at random. Here, a BUSY read waits until the command is done or
+  // real time has caught up with the emulated time since it started, so
+  // the two stay in step as on the real board.
+  uint8_t pollStatusPaced();
+
+  // The emulated clock, from Bus::advanceCycles() -- see pollStatusPaced().
+  void advanceCycles(int cycles) { emulatedCycles_ += static_cast<uint64_t>(cycles); }
+  static constexpr double kCpuHz = 1300000.0;
 
   // Test-only: blocks until whatever command processCommand() most
   // recently started has fully finished. Real ROM/CPU code never needs
@@ -235,6 +254,16 @@ class ExpansionMock {
   static constexpr uint8_t kCommandStoreErase = 0x32;
   static constexpr uint8_t kCommandStoreWrite = 0x33;
   static constexpr uint8_t kCommandStoreRead = 0x34;
+  // BLE (2026-09-27) -- RP2350/pc_exp.h's EXP_COMMAND_BLE_*, answered here
+  // by a fake peer (below) instead of a radio.
+  static constexpr uint8_t kCommandBleScan = 0x40;
+  static constexpr uint8_t kCommandBleConnect = 0x41;
+  static constexpr uint8_t kCommandBleConnectName = 0x42;
+  static constexpr uint8_t kCommandBleDisconnect = 0x43;
+  static constexpr uint8_t kCommandBleText = 0x44;
+  static constexpr uint8_t kCommandBleFilePut = 0x45;
+  static constexpr uint8_t kCommandBleFileGet = 0x46;
+  static constexpr int kBleFileArgs = 42;
   static constexpr int kStoreParams = 0x7F0;
 
   static constexpr uint8_t kCommandClearStatus = 0xFF;
@@ -277,6 +306,19 @@ class ExpansionMock {
 
   // Test-only: an MCONF setting's current value (0 = LED, 1 = SLEEPWAIT).
   uint16_t configValue(int id) const { return id >= 0 && id < kConfigCount ? config_[id] : 0; }
+
+  // Test-only: the fake BLE peer the BL* keywords talk to (2026-09-27). It
+  // stands in for the feature-server app: BLSCAN finds the names in
+  // blePeers(), a connection is to one of them, TEXT is appended to
+  // bleText() (lines end in CR, as sent), and files live in bleFiles().
+  // setBleLinkDropAfter(n) makes the link fail once n more file bytes have
+  // moved, to test a transfer that dies part-way.
+  std::vector<std::string>& blePeers() { return blePeers_; }
+  bool bleConnected() const { return bleConnected_; }
+  const std::string& bleText() const { return bleText_; }
+  void clearBleText() { bleText_.clear(); }
+  std::map<std::string, std::vector<uint8_t>>& bleFiles() { return bleFiles_; }
+  void setBleLinkDropAfter(long bytes) { bleDropAfter_ = bytes; }
 
   // Whether the mock GreenPAK's Remap is currently active -- Bus::readME0/
   // writeME0 check this before falling back to the module's own static ROM
@@ -368,6 +410,13 @@ class ExpansionMock {
   void throttleForBytes(uint32_t bytes) const;
 
   std::atomic<uint8_t> pendingStatus_{kStatusReady};
+  // pollStatusPaced(): when the command in flight started, in emulated
+  // cycles and real time; the worker signals doneCv_ when it finishes.
+  uint64_t emulatedCycles_ = 0;
+  uint64_t commandStartCycles_ = 0;
+  std::chrono::steady_clock::time_point commandStartTime_;
+  std::mutex doneMutex_;
+  std::condition_variable doneCv_;
   std::thread worker_;
   uint32_t sdRateLimitBytesPerSec_ = 0;
   uint32_t simulatedFatScanBytes_ = 0;
@@ -432,6 +481,11 @@ class ExpansionMock {
   uint8_t writeToSdFile(std::vector<uint8_t>& window);
   uint8_t readFromSdFile(std::vector<uint8_t>& window);
   uint8_t closeSdFile(std::vector<uint8_t>& window);
+  uint8_t bleCommand(uint8_t cmd, std::vector<uint8_t>& window);
+  uint8_t bleWrite(std::vector<uint8_t>& window);
+  uint8_t bleRead(std::vector<uint8_t>& window);
+  uint8_t bleClose();
+  bool bleMoved(size_t bytes);
   uint8_t getSdFileSize(std::vector<uint8_t>& window);
   uint8_t getSdFileStatus(std::vector<uint8_t>& window);
   uint8_t getSdFileName(std::vector<uint8_t>& window);
@@ -490,6 +544,17 @@ class ExpansionMock {
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
   uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0};  // mcu_config.c's defaults
+  // The fake BLE peer -- see blePeers().
+  std::vector<std::string> blePeers_ = {"MARVIN"};
+  bool bleConnected_ = false;
+  std::string bleText_;
+  std::map<std::string, std::vector<uint8_t>> bleFiles_;
+  enum class BleXfer { kNone, kPut, kGet } bleXfer_ = BleXfer::kNone;
+  std::string bleXferName_;
+  std::vector<uint8_t> bleXferData_;
+  size_t bleXferPos_ = 0;
+  bool bleXferFailed_ = false;
+  long bleDropAfter_ = -1;
   // slot 0: function keys (1 sector), slot 1: state (9 sectors) -- sizes as
   // in the firmware's flash_layout.h; erased flash reads 0xFF
   std::vector<uint8_t> stores_[2] = {std::vector<uint8_t>(4096, 0xFF), std::vector<uint8_t>(9 * 4096, 0xFF)};

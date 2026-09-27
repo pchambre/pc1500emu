@@ -4097,20 +4097,241 @@ void testFnKeysAndStateSaveRestore() {
 }
 }  // namespace
 
+// BLE keywords (2026-09-27, RP2350/BLE_PROTOCOL.md). The mock answers the
+// EXP_COMMAND_BLE_* commands with a fake peer standing in for the
+// feature-server app: BLSCAN finds "MARVIN", BLPRINT/BLLIST text lands in
+// bleText() with CR line ends, BLSAVE/BLLOAD use bleFiles().
+struct BleFixture {
+  std::unique_ptr<BootedMachine> m;
+  pc1500::ExpansionMock* mock = nullptr;
+
+  // The line's error number (0 = none). ERL keeps the last error until
+  // another one, so it's cleared first.
+  int run(const std::string& line) {
+    m->bus.writeME0(kErlAbs, 0);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, line);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+    return m->bus.readME0(kErlAbs);
+  }
+  // A SHOW's text is at 0x8000; a listing's first entry at 0x8002.
+  std::string shown(uint16_t at = 0x8000) {
+    std::string text;
+    for (int i = 0; i < 26; i++) text += static_cast<char>(m->bus.readME0(static_cast<uint16_t>(at + i)));
+    return text.substr(0, text.find_last_not_of(' ') + 1);
+  }
+  void key(pc1500::Key k) {
+    tapKey(*m, k);
+    CHECK(waitForIdle(*m));
+  }
+  std::vector<uint8_t> program() {
+    std::string error;
+    return pc1500::basic::readBasicProgramBytes(m->bus, &error);
+  }
+  bool typeProgram(const std::string& text) {
+    std::string error;
+    bool ok = pc1500::basic::typeBasicProgramText(m->bus, m->cpu, text, kCyclesPerFrame, kCyclesPerTimerTick, &error);
+    if (!ok) std::printf("  typeBasicProgramText: %s\n", error.c_str());
+    return ok;
+  }
+  // Connects with BLCONNECT and clears the text the peer has seen.
+  void connect() {
+    CHECK(run("BLCONNECT \"MARVIN\"") == 0);
+    CHECK(shown() == "CONNECTED: MARVIN");
+    key(pc1500::Key::Ent);
+    mock->clearBleText();
+  }
+};
+
+static std::unique_ptr<BleFixture> bleFixture(const char* testName) {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: %s -- ROM1.BIN and/or rom_8800.bin not found.\n", testName);
+    return nullptr;
+  }
+  auto f = std::make_unique<BleFixture>();
+  f->m = bootAndSettle(rom);
+  loadExpansionRom(*f->m, expRom, makeTempTestDir(testName));
+  f->mock = &f->m->bus.expansionMock();
+  f->run("NEW0");
+  return f;
+}
+
+// BLSCAN lists the peers; L on one connects. BLCONNECT finds one by name
+// in any case; an unknown name, or text with no link, is ERROR 40.
+void testBleScanConnectAndDisconnect() {
+  auto f = bleFixture("testBleScanConnectAndDisconnect");
+  if (!f) return;
+  CHECK(f->run("BLPRINT \"X\"") == 40);  // no link yet
+  CHECK(f->run("BLSCAN") == 0);
+  CHECK(f->shown(0x8002) == "MARVIN");
+  f->key(pc1500::Key::L);
+  CHECK(f->shown() == "CONNECTED: MARVIN");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->mock->bleConnected());
+  CHECK(f->run("BLDISC") == 0);
+  CHECK(!f->mock->bleConnected());
+  CHECK(f->run("BLCONNECT \"marvin\"") == 0);
+  f->key(pc1500::Key::Ent);
+  CHECK(f->mock->bleConnected());
+  f->mock->blePeers().clear();
+  CHECK(f->run("BLSCAN 1") == 0);
+  CHECK(f->shown() == "BLE: NO PEERS FOUND");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->run("BLCONNECT \"NOBODY\"") == 40);
+}
+
+// BLPRINT: ';' runs values together, ',' pads to the next 13-column zone,
+// a trailing separator leaves the line open; each statement's text is sent
+// when it ends. Numbers read exactly as STR$ writes them (the ROM's own
+// conversion), and it works inside a program.
+void testBlePrintText() {
+  auto f = bleFixture("testBlePrintText");
+  if (!f) return;
+  f->connect();
+  CHECK(f->run("BLPRINT \"HELLO WORLD\"") == 0);
+  CHECK(f->mock->bleText() == "HELLO WORLD\r");
+  f->mock->clearBleText();
+  CHECK(f->run("BLPRINT \"A\";1;\"B\"") == 0);
+  CHECK(f->mock->bleText() == "A1B\r");
+  f->mock->clearBleText();
+  CHECK(f->run("BLPRINT \"A\",\"B\"") == 0);
+  CHECK(f->mock->bleText() == "A            B\r");
+  f->mock->clearBleText();
+  CHECK(f->run("BLPRINT \"AB\";") == 0);
+  CHECK(f->run("BLPRINT \"CD\"") == 0);
+  CHECK(f->run("BLPRINT") == 0);
+  CHECK(f->mock->bleText() == "ABCD\r\r");
+
+  // Held in a variable first: STR$ of an expression works from the
+  // unrounded intermediate (1/7 -> ...428), while an evaluated value --
+  // what BLPRINT and PRINT get -- is rounded to 10 digits (...429).
+  for (const char* e : {"1500", "-5", "0", "1", "100000", "9999999999", "-9999999999", "99999999999", "1/3", "-1/3",
+                        "0.5", "-0.5", "0.05", "1/7", "1/70", "0.123456789", "-0.123456789", "0.1234567891",
+                        "1E-9", "-1E-9", "1E-10", "1.5E-9", "0.000000012", "0.0000000123", "2/3*1E-5", "1/7*1E5",
+                        "1/7*1E9", "1/7*1E10", "1E10", "-1E10", "1.234E9", "-1.234E-12", "12345678901", "1/7*1E12",
+                        "0.001", "0.0001234", "123.456", "-0.25", "1E99", "-1E-99", "&FF", "32767*2"}) {
+    std::string expr = e;
+    CHECK(f->run("A=" + expr) == 0);
+    f->mock->clearBleText();
+    int printErl = f->run("BLPRINT A");
+    CHECK(printErl == 0);
+    if (printErl != 0) std::printf("  BLPRINT A (A=%s): ERL %d\n", e, printErl);
+    std::string ours = f->mock->bleText();
+    f->mock->clearBleText();
+    CHECK(f->run("BLPRINT STR$(A)") == 0);
+    std::string rom = f->mock->bleText();
+    CHECK(ours == rom);
+    if (ours != rom) std::printf("  BLPRINT %s: ours [%s], STR$ [%s]\n", e, ours.c_str(), rom.c_str());
+  }
+
+  f->mock->clearBleText();
+  CHECK(f->typeProgram("10 FOR I=1 TO 3\n20 BLPRINT \"LINE \";I\n30 NEXT I\n"));
+  f->key(pc1500::Key::Cl);
+  f->key(pc1500::Key::Mode);  // PRO -> RUN mode; RUN in PRO mode is ERROR 26
+  int erl = f->run("RUN");
+  CHECK(erl == 0);
+  CHECK(f->mock->bleText() == "LINE 1\rLINE 2\rLINE 3\r");
+  if (erl != 0 || f->mock->bleText() != "LINE 1\rLINE 2\rLINE 3\r")
+    std::printf("  RUN: ERL %d, text [%s], program %zu bytes\n", erl, f->mock->bleText().c_str(), f->program().size());
+}
+
+// BLLIST sends the program as text, spaced exactly as pc1500emu's own
+// detokenizer lists a program file; BLLIST from,to limits the lines.
+void testBleListMatchesDetokenizer() {
+  auto f = bleFixture("testBleListMatchesDetokenizer");
+  if (!f) return;
+  f->connect();
+  CHECK(f->typeProgram(
+      "10 PRINT A;\"X Y\":GOTO 10\n20 IF A=1 THEN 30\n30 FOR I=1 TO 10 STEP 2:NEXT I\n"
+      "40 REM HELLO  THERE\n50 A$=STR$(LEN(\"AB\"))+CHR$(65)\n"));
+  CHECK(f->run("BLLIST") == 0);
+  std::string expected, error;
+  CHECK(pc1500::basic::detokenizeBasicProgram(f->program(), &expected, &error));
+  std::string ours = f->mock->bleText();
+  std::replace(ours.begin(), ours.end(), '\r', '\n');
+  CHECK(ours == expected);
+  if (ours != expected) std::printf("  BLLIST:\n%s  detokenizer:\n%s", ours.c_str(), expected.c_str());
+
+  f->mock->clearBleText();
+  CHECK(f->run("BLLIST 20,30") == 0);
+  CHECK(f->mock->bleText().rfind("20 ", 0) == 0);
+  CHECK(f->mock->bleText().find("\r30 ") != std::string::npos);
+  CHECK(f->mock->bleText().find("40 ") == std::string::npos);
+}
+
+// BLSAVE/BLLOAD move the same bytes SDSAVE writes; an existing file asks
+// before overwriting (N keeps it, Y or -Y replaces it); M files carry the
+// [start][call] header. A missing file, or a link that drops part-way,
+// is ERROR 40 and leaves no partial file behind.
+void testBleSaveLoad() {
+  auto f = bleFixture("testBleSaveLoad");
+  if (!f) return;
+  f->connect();
+  CHECK(f->typeProgram("10 PRINT 1\n20 END\n"));
+  std::vector<uint8_t> original = f->program();
+  CHECK(f->run("BLSAVE \"T\"") == 0);
+  CHECK(f->mock->bleFiles()["T"] == original);
+
+  CHECK(f->run("NEW") == 0);
+  CHECK(f->run("BLLOAD \"T\"") == 0);
+  CHECK(f->program() == original);
+
+  CHECK(f->typeProgram("30 BEEP 1\n"));
+  std::vector<uint8_t> changed = f->program();
+  CHECK(f->run("BLSAVE \"T\"") == 0);
+  CHECK(f->shown() == "FILE EXISTS. OVERWRITE Y/N");
+  f->key(pc1500::Key::N);
+  CHECK(f->mock->bleFiles()["T"] == original);
+  CHECK(f->run("BLSAVE \"T\"") == 0);
+  f->key(pc1500::Key::Y);
+  CHECK(f->mock->bleFiles()["T"] == changed);
+  CHECK(f->run("BLSAVE \"T\",-Y") == 0);
+  CHECK(f->mock->bleFiles()["T"] == changed);
+
+  CHECK(f->run("POKE &4400,1,2,3,4") == 0);
+  CHECK(f->run("BLSAVE M \"MC\",&4400,&4403,&4401") == 0);
+  const std::vector<uint8_t> mExpected = {0x44, 0x00, 0x44, 0x01, 1, 2, 3, 4};
+  CHECK(f->mock->bleFiles()["MC"] == mExpected);
+  CHECK(f->run("POKE &4400,0,0,0,0") == 0);
+  f->mock->bleFiles()["MC"] = {0x44, 0x00, 0x00, 0x00, 5, 6, 7, 8};  // no CALL
+  CHECK(f->run("BLLOAD M \"MC\"") == 0);
+  CHECK(f->m->bus.readME0(0x4400) == 5 && f->m->bus.readME0(0x4403) == 8);
+
+  CHECK(f->run("BLLOAD \"NOPE\"") == 40);
+  f->mock->setBleLinkDropAfter(4);
+  CHECK(f->run("BLSAVE \"U\"") == 40);
+  CHECK(f->mock->bleFiles().count("U") == 0);
+  int erl = f->run("BLCONNECT \"MARVIN\"");
+  CHECK(erl == 0);
+  if (erl != 0) std::printf("  BLCONNECT after a drop: ERL %d, shown [%s]\n", erl, f->shown().c_str());
+  f->key(pc1500::Key::Ent);
+  f->mock->setBleLinkDropAfter(4);
+  CHECK(f->run("BLLOAD \"T\"") == 40);
+}
+
+
 int main() {
   testFnKeysAndStateSaveRestore();
   testKeywordsInProgramWithExpressions();
 
   testMconfShowsAndSetsSettings();
+  testBleScanConnectAndDisconnect();
+  testBlePrintText();
+  testBleListMatchesDetokenizer();
+  testBleSaveLoad();
   testMlogmsgLogsLiteralAndStringVariable();
   testBootHookStagesRomThenSkipsOnReset();
   testStageQueryIsRecognizedKeyword();
   testDebugBareWordIsNotAReservedKeyword();
   testStageDebugIsRecognizedKeyword();
   testStageBlockChecksumAlgorithmMatchesIndependentComputation();
-#if 0  // TEMPORARILY narrowed to just the STAGE tests above for a fast
-       // iteration loop -- board owner's own direction, 2026-09-21: restore
-       // before the next real-hardware flash/final confirmation.
   testMlogViewIsRecognized();
   testMlogVerboseIsRecognized();
   testMlogQuietIsRecognized();
@@ -4176,7 +4397,6 @@ int main() {
   testSdskipAdvancesAndRaisesError40PastEnd();
   testSdChannelCommandsRaiseError1OnMalformedArgument();
   testSdinputOverlongStringRaisesError42();
-#endif
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");
