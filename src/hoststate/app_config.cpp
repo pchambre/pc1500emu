@@ -57,6 +57,11 @@ bool loadAppConfig(const std::string& path, AppConfig* out, std::string* error) 
   out->extRam0000Bytes = j.value("extRam0000Bytes", static_cast<size_t>(0));
   out->ce163Enabled = j.value("ce163Enabled", false);
   out->ce155Enabled = j.value("ce155Enabled", false);
+  out->bleHostBluetooth = j.value("bleHostBluetooth", false);
+  if (j.contains("bleFilesDir") && j["bleFilesDir"].is_string()) {
+    out->bleFilesDir = resolveRelative(j["bleFilesDir"].get<std::string>(), confDir);
+  }
+  out->showBluetoothWindow = j.value("showBluetoothWindow", false);
   return true;
 }
 
@@ -72,6 +77,9 @@ bool saveAppConfig(const AppConfig& config, const std::string& path, std::string
   j["extRam0000Bytes"] = config.extRam0000Bytes;
   j["ce163Enabled"] = config.ce163Enabled;
   j["ce155Enabled"] = config.ce155Enabled;
+  j["bleHostBluetooth"] = config.bleHostBluetooth;
+  if (config.bleFilesDir) j["bleFilesDir"] = *config.bleFilesDir;
+  j["showBluetoothWindow"] = config.showBluetoothWindow;
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) {

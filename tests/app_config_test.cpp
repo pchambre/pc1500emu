@@ -49,6 +49,9 @@ void testRoundTrip() {
   config.extRam0000Bytes = 0x4000;
   config.ce163Enabled = true;
   config.ce155Enabled = false;  // deliberately left off -- mutually exclusive with ce163Enabled above
+  config.bleHostBluetooth = true;
+  config.bleFilesDir = "C:/ble/files";
+  config.showBluetoothWindow = true;
 
   std::string path = tempPath("pc1500emu_app_config_test.json");
   std::string err;
@@ -72,6 +75,10 @@ void testRoundTrip() {
   CHECK(loaded.extRam0000Bytes == 0x4000);
   CHECK(loaded.ce163Enabled == true);
   CHECK(loaded.ce155Enabled == false);
+  CHECK(loaded.bleHostBluetooth == true);
+  CHECK(loaded.bleFilesDir.has_value());
+  if (loaded.bleFilesDir) CHECK(*loaded.bleFilesDir == "C:/ble/files");
+  CHECK(loaded.showBluetoothWindow == true);
 
   std::remove(path.c_str());
 }
@@ -96,6 +103,9 @@ void testEmptyConfigRoundTrip() {
   CHECK(loaded.extRam0000Bytes == 0);
   CHECK(loaded.ce163Enabled == false);
   CHECK(loaded.ce155Enabled == false);
+  CHECK(loaded.bleHostBluetooth == false);
+  CHECK(!loaded.bleFilesDir.has_value());
+  CHECK(loaded.showBluetoothWindow == false);
 
   std::remove(path.c_str());
 }
@@ -135,6 +145,8 @@ void testOldConfigMissingNewFieldUsesDefault() {
   CHECK(loaded.extRam0000Bytes == 0);            // absent -- AppConfig{}'s default
   CHECK(loaded.ce163Enabled == false);           // absent -- AppConfig{}'s default
   CHECK(loaded.ce155Enabled == false);           // absent -- AppConfig{}'s default
+  CHECK(loaded.bleHostBluetooth == false);       // absent -- AppConfig{}'s default
+  CHECK(!loaded.bleFilesDir.has_value());        // absent
   std::remove(path.c_str());
 }
 

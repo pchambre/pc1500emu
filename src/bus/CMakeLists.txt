@@ -1,9 +1,12 @@
 add_library(pc1500bus STATIC
   bus.cpp
   expansion_mock.cpp
+  ble_link_core.cpp  # the PC-1500 Link protocol over a host Transport (2026-09-28)
 )
 target_include_directories(pc1500bus PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(pc1500bus PUBLIC lh5801cpu pc1500keyboard)
+# std::thread: the mock's command worker, the BLE core's server thread
+find_package(Threads REQUIRED)
+target_link_libraries(pc1500bus PUBLIC lh5801cpu pc1500keyboard Threads::Threads)
 
 # The expansion board's keyword executor (2026-09-25) is portable C in the
 # PC1500-PSOC5 repo's RP2350/keywords.c -- the mock compiles that same file

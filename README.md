@@ -58,6 +58,15 @@ configure didn't already find SDL2 some other way, fails to find it at
 all. If you hit either of these, delete the `build` directory and
 reconfigure from scratch with the toolchain flag present from the start.
 
+Host Bluetooth (see "Bluetooth" below) is optional and chosen per platform
+at configure time:
+- **Windows**: C++/WinRT, MSVC builds only. A MinGW build compiles without it.
+- **macOS**: CoreBluetooth; nothing to install.
+- **Linux**: BlueZ over D-Bus, via `libsystemd-dev` (found with pkg-config).
+  Without it the emulator still builds, but without host Bluetooth.
+
+Either way, the Bluetooth panel says why host Bluetooth isn't available.
+
 The indicator row (see the Keyboard mapping section below) needs a
 CJK-capable font for its katakana glyphs; Windows ships one
 (`C:\Windows\Fonts\msgothic.ttc`) by default since Windows 8, so nothing
@@ -206,6 +215,12 @@ native OS menu) sits above the display:
   where an accidental real keypress landing on the window would otherwise
   corrupt whatever state is being driven over the FIFO. Toggle from the
   FIFO itself with `automation on` / `automation off`.
+- **Settings > Bluetooth**:
+  - **Fake Peer** / **Host Bluetooth**, the expansion module's BLE backend;
+  - **Advertise as a Server**;
+  - **Show Bluetooth Panel**.
+
+  See "Bluetooth" below.
 
 When "adding" RAM, it is necessary to reset the emulator (Ctrl+F12), then
 press CL and execute NEW0 to update the emulator to be aware of the
@@ -213,6 +228,39 @@ additional memory.
 
 While a menu dialog has keyboard focus, keystrokes go to the dialog's text
 fields, not the emulated PC-1500 keyboard.
+
+### Bluetooth
+
+The emulated expansion module answers the RP2350 firmware's BLE keywords
+(`BLSCAN`, `BLPRINT`, `BLLIST`, `BLCLS`, `BLSAVE`, `BLLOAD`, `BLDISC`) with
+one of two backends.
+
+**Fake Peer** (the default): an in-process pretend server. There's no radio;
+the tests use it.
+
+**Host Bluetooth**: this computer's own Bluetooth. The emulator becomes a
+real BLE peer, speaking the Link protocol in the firmware repo's
+`RP2350/BLE_PROTOCOL.md`. It works both ways:
+- **Connector:** `BLSCAN` in the emulator finds real Link servers nearby,
+  such as the Flutter app on another computer.
+- **Server:** with **Advertise as a Server** on, a real PC-1500 finds the
+  emulator with `BLSCAN` and connects to it with **C**.
+  - `BLPRINT`/`BLLIST` text appears in the Bluetooth panel, and `BLCLS`
+    clears it.
+  - `BLSAVE`/`BLLOAD` files go to `bleFilesDir` in the conf file (default
+    `Documents/PC1500-BLE-emu`).
+
+Notes:
+- The emulator's name on the link is its `MCONF HOSTNAME` (default
+  `PC-1500 EMU`).
+- Windows advertises under the computer's own name, not the emulator's.
+  The PC-1500 matches Link servers by service UUID, so this doesn't
+  matter, but `BLSCAN` lists the computer name.
+- One computer can't connect to itself. Don't run the Flutter app and an
+  advertising emulator on the same machine at the same time.
+- If host Bluetooth can't be used, the Bluetooth panel and `ble status` say
+  why: not built in, no adapter, radio off, or no peripheral role.
+- On macOS the first use asks for Bluetooth permission.
 
 ## Scriptable command interface
 
@@ -279,6 +327,12 @@ Commands:
 - `setce155 <0|1>` — FIFO equivalent of Settings > Extension RAM (0000H) >
   CE-155 (see that section above). Mutually exclusive with `setextram` and
   `setce163`, same as `setce163` above.
+- `ble backend fake|host` / `ble advertise on|off` — the Settings >
+  Bluetooth choices (see "Bluetooth" above).
+- `ble status` — the link's state, or why host Bluetooth isn't in use.
+- `ble text` — console text a connected PC-1500 has sent since the last
+  `ble text`.
+- `ble log` — the link's log, as shown in the Bluetooth panel.
 - `status` — CPU registers/flags and the fixed-segment indicator bits.
 - `display` — the 156x7 dot matrix as ASCII art (`#`/`.`).
 - `displaytext` — the ROM's own LCD text buffer (`7BB0H`-`7BFFH`, per the

@@ -60,6 +60,39 @@ if(WIN32)
   # auto-linked by MSVC the way some system libs are, so all are explicit.
   target_link_libraries(pc1500emu PRIVATE comdlg32 shell32 ole32 uuid)
 endif()
+# Host Bluetooth for the expansion board's BLE link (2026-09-28) -- exactly
+# one backend per build, see ble_host.h. The emulator builds and runs
+# everywhere; without a backend its expansion board keeps the fake BLE peer
+# and the Bluetooth window says why.
+target_sources(pc1500emu PRIVATE ble_host.h)
+if(MSVC)
+  # C++/WinRT from the Windows SDK: MSVC only (the CLion tree's MinGW can't).
+  target_sources(pc1500emu PRIVATE ble_host_winrt.cpp)
+  set_source_files_properties(ble_host_winrt.cpp PROPERTIES COMPILE_OPTIONS "/bigobj")
+  target_link_libraries(pc1500emu PRIVATE WindowsApp)
+elseif(APPLE)
+  target_sources(pc1500emu PRIVATE ble_host_macos.mm)
+  target_link_libraries(pc1500emu PRIVATE "-framework CoreBluetooth" "-framework Foundation")
+  # macOS ends a process that touches Bluetooth without a usage string in
+  # its Info.plist; the emulator is a bare executable, so embed one.
+  target_link_options(pc1500emu PRIVATE
+    "LINKER:-sectcreate,__TEXT,__info_plist,${CMAKE_CURRENT_SOURCE_DIR}/macos_Info.plist")
+else()
+  # Linux: BlueZ over D-Bus through sd-bus (libsystemd; libsystemd-dev to
+  # build), if present -- sd-bus rather than sdbus-c++, whose API changed
+  # incompatibly between releases. Anything else (MinGW on Windows, Linux
+  # without it) gets ble_host_none.cpp.
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(LIBSYSTEMD QUIET IMPORTED_TARGET libsystemd)
+  endif()
+  if(UNIX AND LIBSYSTEMD_FOUND)
+    target_sources(pc1500emu PRIVATE ble_host_bluez.cpp)
+    target_link_libraries(pc1500emu PRIVATE PkgConfig::LIBSYSTEMD)
+  else()
+    target_sources(pc1500emu PRIVATE ble_host_none.cpp)
+  endif()
+endif()
 if(APPLE)
   # mac_activate.mm forces this process to the foreground on launch -- see
   # its own comment for why (running as a bare executable, not a proper

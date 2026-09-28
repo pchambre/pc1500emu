@@ -10,10 +10,13 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "ble_backend.h"
 
 namespace pc1500 {
 
@@ -256,6 +259,8 @@ class ExpansionMock {
   static constexpr uint8_t kCommandStoreRead = 0x34;
   // BLE (2026-09-27) -- RP2350/pc_exp.h's EXP_COMMAND_BLE_*, answered here
   // by a fake peer (below) instead of a radio.
+  static constexpr uint8_t kCommandConfigHostnameGet = 0x35;  // MCONF HOSTNAME
+  static constexpr uint8_t kCommandConfigHostnameSet = 0x36;
   static constexpr uint8_t kCommandBleScan = 0x40;
   static constexpr uint8_t kCommandBleConnect = 0x41;
   static constexpr uint8_t kCommandBleConnectName = 0x42;
@@ -319,6 +324,25 @@ class ExpansionMock {
   void clearBleText() { bleText_.clear(); }
   std::map<std::string, std::vector<uint8_t>>& bleFiles() { return bleFiles_; }
   void setBleLinkDropAfter(long bytes) { bleDropAfter_ = bytes; }
+
+  // A real Bluetooth link in place of the fake peer (2026-09-28): BLE
+  // commands, and a BLE transfer's WRITE/READ/CLOSE_SD_FILE, go to it.
+  // Null (the default) puts the fake peer back. Safe to call while a
+  // command runs; that command finishes with the backend it started with.
+  void setBleBackend(std::shared_ptr<BleBackend> backend) {
+    std::lock_guard<std::mutex> lock(bleBackendMutex_);
+    bleBackend_ = std::move(backend);
+    if (bleBackend_) bleBackend_->setName(hostName_);
+  }
+  // MCONF HOSTNAME -- this emulated PC-1500's name on the BLE link.
+  std::string hostName() const {
+    std::lock_guard<std::mutex> lock(bleBackendMutex_);
+    return hostName_;
+  }
+  std::shared_ptr<BleBackend> bleBackend() const {
+    std::lock_guard<std::mutex> lock(bleBackendMutex_);
+    return bleBackend_;
+  }
 
   // Whether the mock GreenPAK's Remap is currently active -- Bus::readME0/
   // writeME0 check this before falling back to the module's own static ROM
@@ -555,6 +579,9 @@ class ExpansionMock {
   size_t bleXferPos_ = 0;
   bool bleXferFailed_ = false;
   long bleDropAfter_ = -1;
+  mutable std::mutex bleBackendMutex_;
+  std::shared_ptr<BleBackend> bleBackend_;
+  std::string hostName_ = "PC-1500 EMU";  // the firmware's default is "PC-1500"
   // slot 0: function keys (1 sector), slot 1: state (9 sectors) -- sizes as
   // in the firmware's flash_layout.h; erased flash reads 0xFF
   std::vector<uint8_t> stores_[2] = {std::vector<uint8_t>(4096, 0xFF), std::vector<uint8_t>(9 * 4096, 0xFF)};

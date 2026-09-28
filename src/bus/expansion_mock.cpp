@@ -308,6 +308,28 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       }
       return kStatusSuccess;
     }
+    case kCommandConfigHostnameGet: {
+      std::string name = hostName();
+      window[0] = static_cast<uint8_t>(name.size());
+      std::copy(name.begin(), name.end(), window.begin() + 1);
+      return kStatusSuccess;
+    }
+    case kCommandConfigHostnameSet: {
+      // mcu_config_set_hostname()'s rules: 1-15 printable characters, no quotes
+      size_t len = window[0];
+      if (len == 0 || len > 15) return kStatusError;
+      std::string name(window.begin() + 1, window.begin() + 1 + static_cast<long>(len));
+      for (char c : name)
+        if (c < 0x20 || c > 0x7E || c == '"') return kStatusError;
+      std::shared_ptr<BleBackend> ble;
+      {
+        std::lock_guard<std::mutex> lock(bleBackendMutex_);
+        hostName_ = name;
+        ble = bleBackend_;
+      }
+      if (ble) ble->setName(name);
+      return kStatusSuccess;
+    }
     case kCommandBleScan:
     case kCommandBleConnect:
     case kCommandBleConnectName:
@@ -481,6 +503,7 @@ uint8_t ExpansionMock::openSdFileRead(std::vector<uint8_t>& window) {
 // real landmine in the original and has been removed there, 2026 session --
 // not mirrored here either.
 uint8_t ExpansionMock::writeToSdFile(std::vector<uint8_t>& window) {
+  if (auto ble = bleBackend(); ble && ble->transferOpen()) return ble->write(window);
   if (bleXfer_ != BleXfer::kNone) return bleWrite(window);
   if (fileStatus_ != kFileStatusOpenWrite || !openFile_.is_open()) return kStatusError;
   if (window.size() < static_cast<size_t>(kLengthPortOffset) + 2) return kStatusError;
@@ -501,6 +524,7 @@ uint8_t ExpansionMock::writeToSdFile(std::vector<uint8_t>& window) {
 // length moved out of the payload page entirely, so the payload is now the
 // full window[0..kMaxTransferLen-1], not confined to one 256-byte page).
 uint8_t ExpansionMock::readFromSdFile(std::vector<uint8_t>& window) {
+  if (auto ble = bleBackend(); ble && ble->transferOpen()) return ble->read(window);
   if (bleXfer_ != BleXfer::kNone) return bleRead(window);
   if (fileStatus_ != kFileStatusOpenRead || !openFile_.is_open()) return kStatusError;
   if (window.size() < static_cast<size_t>(kLengthPortOffset) + 2) return kStatusError;
@@ -518,6 +542,7 @@ uint8_t ExpansionMock::readFromSdFile(std::vector<uint8_t>& window) {
 }
 
 uint8_t ExpansionMock::closeSdFile(std::vector<uint8_t>& window) {
+  if (auto ble = bleBackend(); ble && ble->transferOpen()) return ble->close();
   if (bleXfer_ != BleXfer::kNone) return bleClose();
   if (!openFile_.is_open() || fileStatus_ == kFileStatusClosed) return kStatusError;
   openFile_.close();
@@ -564,6 +589,7 @@ bool ExpansionMock::bleMoved(size_t bytes) {
 }
 
 uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
+  if (auto ble = bleBackend()) return ble->command(cmd, window);  // a real link
   auto connected = [&](const std::string& name) {
     bleConnected_ = true;
     window[0] = static_cast<uint8_t>(name.size());

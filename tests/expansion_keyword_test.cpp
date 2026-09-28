@@ -3935,8 +3935,20 @@ void testMconfShowsAndSetsSettings() {
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
-  CHECK(run("MCONF") == 0);  // browse: first entry is LED
+  // HOSTNAME (2026-09-28): the BLE name, text rather than a number.
+  CHECK(run("MCONF HOSTNAME") == 0);
+  CHECK(shown() == "HOSTNAME=PC-1500 EMU");  // the emulator's default
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(run("MCONF HOSTNAME=\"DESK PC\"") == 0);
+  CHECK(mock.hostName() == "DESK PC");
+  CHECK(run("A$=\"KITCHEN\"") == 0);
+  CHECK(run("MCONF HOSTNAME=A$") == 0);
+  CHECK(mock.hostName() == "KITCHEN");
+
+  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (4th)
   CHECK(shown(0x8002) == "LED=0");
+  CHECK(shown(0x8002 + 3 * 30) == "HOSTNAME=KITCHEN");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -3948,6 +3960,10 @@ void testMconfShowsAndSetsSettings() {
   CHECK(mock.configValue(1) == 1000);
   CHECK(run("MCONF BLE=1") == 1);          // the BLE spike's setting is gone
   CHECK(mock.configValue(5) == 0);
+  CHECK(run("MCONF HOSTNAME=\"SIXTEEN CHARS 16\"") == 1);  // too long
+  CHECK(run("MCONF HOSTNAME=5") == 1);     // not text
+  CHECK(run("MCONF HOSTNAME=\"\"") == 1);  // empty
+  CHECK(mock.hostName() == "KITCHEN");
 }
 
 

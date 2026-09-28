@@ -52,6 +52,14 @@ struct AppConfig {
   // window) -- mutually exclusive with all three fields above, see
   // Bus::setCe155Enabled's own comment. Same ordering requirement.
   bool ce155Enabled = false;
+  // The expansion board's BLE link (2026-09-28): true = the host computer's
+  // own Bluetooth (src/host/ble_host.h), false = the built-in fake peer.
+  // bleFilesDir: where a connected PC-1500's BLSAVEs land when this
+  // emulator serves it (unset = Documents/PC1500-BLE-emu). See main.cpp's
+  // Settings > Bluetooth menu and Bluetooth window.
+  bool bleHostBluetooth = false;
+  std::optional<std::string> bleFilesDir;
+  bool showBluetoothWindow = false;
 };
 
 // A missing file at `path` is not an error -- returns true with *out left

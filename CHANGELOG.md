@@ -4,6 +4,39 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.8.0] - 2026-09-28
+
+### Added
+- **Host Bluetooth:** the emulated expansion module's BLE keywords can now
+  use this computer's own Bluetooth, which makes the emulator a real BLE
+  peer for a PC-1500 (see the README's "Bluetooth" section).
+  - **Roles:** it can advertise the Link service as a server, which a real
+    PC-1500 has connected to with `BLSCAN`, and it can connect out to other
+    Link servers.
+  - **Platforms:**
+    - Windows: C++/WinRT, MSVC only.
+    - macOS: CoreBluetooth. Not yet built or tested.
+    - Linux: BlueZ over D-Bus via libsystemd. Compile-checked only.
+  - When host Bluetooth isn't available, the Bluetooth panel and
+    `ble status` say why.
+- The protocol core (`src/bus/ble_link_core.*`) sits behind a
+  `BleBackend` seam in `ExpansionMock`. It has loopback tests
+  (`ble_link_core_test`).
+- **BLE fake peer:** the default backend, with no radio, used by the tests.
+- **Settings > Bluetooth menu and Bluetooth panel.**
+- **Pipe commands:** `ble backend|advertise|status|text|log`.
+- **AppConfig fields:** `bleHostBluetooth`, `bleFilesDir`,
+  `showBluetoothWindow`.
+- **`MCONF HOSTNAME`:** the name the PC-1500 gives on the BLE link, in the
+  expansion mock (default `PC-1500 EMU`).
+- **Expansion mock:** runs the board's keyword executor, has flash-backed
+  settings (all six MCONF settings, LOGSIZE) and STAGE remap support.
+
+### Changed
+- `ExpansionMock` commands run on a background thread, paced so the
+  emulated CPU and the mock MCU stay in step with real time.
+- All expansion keyword tests are enabled.
+
 ## [0.7.3] - 2026-08-21
 
 ### Fixed

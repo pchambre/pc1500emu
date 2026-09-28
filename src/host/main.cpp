@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -42,6 +43,8 @@
 #include <vector>
 
 #include "app_config.h"
+#include "ble_host.h"
+#include "ble_link_core.h"
 #include "basic_text.h"
 #include "basic_tokens.h"
 #include "bus.h"
@@ -330,6 +333,61 @@ constexpr int kStatusPanelHeight = 180;
 constexpr int kWindowHNoPanel = pc1500::Lcd::kRows * kScale + kMarginTop + kMarginBottom +
                                  kIndicatorBarHeight + kMenuBarHeight;
 constexpr int kWindowHWithPanel = kWindowHNoPanel + kStatusPanelHeight;
+// The Bluetooth panel (Settings > Bluetooth > Show Bluetooth Panel,
+// 2026-09-28) sits below the status panel when both are shown.
+constexpr int kBluetoothPanelHeight = 300;
+int windowHeight(bool statusPanel, bool bluetoothPanel) {
+  return kWindowHNoPanel + (statusPanel ? kStatusPanelHeight : 0) + (bluetoothPanel ? kBluetoothPanelHeight : 0);
+}
+
+// The expansion board's BLE link on this computer's own Bluetooth
+// (2026-09-28): when Settings > Bluetooth > Host Bluetooth is chosen, the
+// expansion mock's BLE commands go to a LinkCore over this platform's
+// Transport (src/host/ble_host.h) instead of its built-in fake peer. The
+// fake peer stays whenever host Bluetooth isn't wanted or isn't available;
+// `unavailable` says why, for the panel and the pipe.
+std::filesystem::path defaultBleFilesDir() {
+#if defined(_WIN32)
+  const char* home = std::getenv("USERPROFILE");
+#else
+  const char* home = std::getenv("HOME");
+#endif
+  std::filesystem::path base = home ? std::filesystem::path(home) : std::filesystem::temp_directory_path();
+  return base / "Documents" / "PC1500-BLE-emu";
+}
+
+struct HostBle {
+  std::shared_ptr<pc1500::ble::LinkCore> core;
+  std::string unavailable;
+  std::filesystem::path filesDir;
+
+  void apply(pc1500::Bus& bus, bool wanted, const std::filesystem::path& dir) {
+    filesDir = dir;
+    if (!wanted) {
+      bus.expansionMock().setBleBackend(nullptr);  // a command in flight keeps its own reference
+      core.reset();
+      unavailable.clear();
+      return;
+    }
+    if (core) return;
+    std::string why;
+    auto transport = pc1500host::createHostBleTransport(&why);
+    unavailable = why;
+    if (!transport) {
+      bus.expansionMock().setBleBackend(nullptr);
+      return;
+    }
+    core = std::make_shared<pc1500::ble::LinkCore>(std::move(transport), dir, bus.expansionMock().hostName());
+    bus.expansionMock().setBleBackend(core);
+  }
+
+  std::string status(bool wanted) const {
+    if (!wanted) return "fake peer";
+    if (!core) return "host Bluetooth unavailable: " + unavailable;
+    std::string p = core->problem();
+    return core->state() + (p.empty() ? "" : " -- " + p);
+  }
+};
 
 // The fixed set of strings the indicator row can ever show -- rendered
 // once into cached textures at startup rather than every frame.
@@ -1437,6 +1495,12 @@ int main(int argc, char** argv) {
     }
   }
 
+  HostBle hostBle;
+  auto bleFilesDir = [&]() {
+    return appConfig.bleFilesDir ? std::filesystem::path(*appConfig.bleFilesDir) : defaultBleFilesDir();
+  };
+  hostBle.apply(bus, appConfig.bleHostBluetooth, bleFilesDir());
+
   std::string effectiveRomPath =
       !positionalRomPath.empty() ? positionalRomPath : appConfig.romPath.value_or(std::string());
   if (!effectiveRomPath.empty()) {
@@ -1589,7 +1653,7 @@ int main(int argc, char** argv) {
   }
   SDL_Window* window = SDL_CreateWindow(
       "pc1500emu v" PC1500EMU_VERSION, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, kWindowW,
-      appConfig.showStatusPanel ? kWindowHWithPanel : kWindowHNoPanel, SDL_WINDOW_SHOWN);
+      windowHeight(appConfig.showStatusPanel, appConfig.showBluetoothWindow), SDL_WINDOW_SHOWN);
   SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
   Uint32 mainWindowID = SDL_GetWindowID(window);
   // No-op outside macOS -- see mac_activate.h/.mm.
@@ -1895,6 +1959,41 @@ int main(int argc, char** argv) {
       long enabled = 0;
       iss >> std::dec >> enabled;
       bus.setCe155Enabled(enabled != 0);
+    } else if (cmd == "ble") {
+      // FIFO equivalent of Settings > Bluetooth (2026-09-28):
+      //   ble backend fake|host   the fake peer, or this computer's Bluetooth
+      //   ble advertise on|off    host Bluetooth: be a server a PC-1500 can
+      //                           connect to (BLSCAN, then C)
+      //   ble status              the link's state, or why host BLE isn't in use
+      //   ble text                console text a connected PC-1500 has sent
+      //                           since the last `ble text` (FF = BLCLS)
+      //   ble log                 the link's log (as in the Bluetooth panel)
+      std::string sub, arg;
+      iss >> sub >> arg;
+      if (sub == "backend" && (arg == "fake" || arg == "host")) {
+        appConfig.bleHostBluetooth = arg == "host";
+        hostBle.apply(bus, appConfig.bleHostBluetooth, bleFilesDir());
+        writeResponse(hostBle.status(appConfig.bleHostBluetooth));
+      } else if (sub == "advertise" && (arg == "on" || arg == "off")) {
+        if (!hostBle.core) {
+          writeResponse("ERROR: host Bluetooth isn't in use (" + hostBle.status(appConfig.bleHostBluetooth) + ")");
+        } else if (!hostBle.core->setAdvertising(arg == "on")) {
+          writeResponse("ERROR: couldn't advertise -- " + hostBle.status(true));
+        } else {
+          writeResponse("OK");
+        }
+      } else if (sub == "status") {
+        writeResponse(hostBle.status(appConfig.bleHostBluetooth));
+      } else if (sub == "text") {
+        writeResponse(hostBle.core ? hostBle.core->takeConsoleText() : std::string());
+      } else if (sub == "log") {
+        std::string log;
+        if (hostBle.core)
+          for (const std::string& line : hostBle.core->logLines()) log += line + "\n";
+        writeResponse(log);
+      } else {
+        writeResponse("ERROR: ble backend fake|host, ble advertise on|off, ble status, ble text, ble log");
+      }
     } else if (cmd == "dump") {
       long start = 0, end = 0;
       iss >> std::hex >> start >> end;
@@ -2941,7 +3040,7 @@ int main(int argc, char** argv) {
       if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_P, ImGuiInputFlags_RouteGlobal)) {
         appConfig.showStatusPanel = !appConfig.showStatusPanel;
         SDL_SetWindowSize(window, kWindowW,
-                           appConfig.showStatusPanel ? kWindowHWithPanel : kWindowHNoPanel);
+                           windowHeight(appConfig.showStatusPanel, appConfig.showBluetoothWindow));
         persistActiveConf();
       }
       if (ImGui::BeginMenu("File")) {
@@ -3213,6 +3312,34 @@ int main(int argc, char** argv) {
           }
           ImGui::EndMenu();
         }
+        if (ImGui::BeginMenu("Bluetooth")) {
+          // The expansion board's BLE link (2026-09-28) -- see HostBle.
+          if (ImGui::MenuItem("Fake Peer (built in)", nullptr, !appConfig.bleHostBluetooth)) {
+            appConfig.bleHostBluetooth = false;
+            hostBle.apply(bus, false, bleFilesDir());
+            persistActiveConf();
+          }
+          if (ImGui::MenuItem("Host Bluetooth (this computer)", nullptr, appConfig.bleHostBluetooth)) {
+            appConfig.bleHostBluetooth = true;
+            hostBle.apply(bus, true, bleFilesDir());
+            if (!appConfig.showBluetoothWindow) {
+              appConfig.showBluetoothWindow = true;  // so its state (or why it's unavailable) is seen
+              SDL_SetWindowSize(window, kWindowW, windowHeight(appConfig.showStatusPanel, true));
+            }
+            persistActiveConf();
+          }
+          ImGui::Separator();
+          bool advertising = hostBle.core && hostBle.core->advertising();
+          if (ImGui::MenuItem("Advertise as a Server", nullptr, advertising, hostBle.core != nullptr)) {
+            hostBle.core->setAdvertising(!advertising);
+          }
+          if (ImGui::MenuItem("Show Bluetooth Panel", nullptr, appConfig.showBluetoothWindow)) {
+            appConfig.showBluetoothWindow = !appConfig.showBluetoothWindow;
+            SDL_SetWindowSize(window, kWindowW, windowHeight(appConfig.showStatusPanel, appConfig.showBluetoothWindow));
+            persistActiveConf();
+          }
+          ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("Automation Mode (ignore host keyboard)", "Ctrl+Alt+A", automationMode)) {
           automationMode = !automationMode;
         }
@@ -3244,7 +3371,7 @@ int main(int argc, char** argv) {
         if (ImGui::MenuItem("Show Status Panel", "Ctrl+Alt+P", appConfig.showStatusPanel)) {
           appConfig.showStatusPanel = !appConfig.showStatusPanel;
           SDL_SetWindowSize(window, kWindowW,
-                             appConfig.showStatusPanel ? kWindowHWithPanel : kWindowHNoPanel);
+                             windowHeight(appConfig.showStatusPanel, appConfig.showBluetoothWindow));
           persistActiveConf();
         }
         ImGui::EndMenu();
@@ -3491,6 +3618,52 @@ int main(int argc, char** argv) {
         ImGui::CloseCurrentPopup();
       }
       ImGui::EndPopup();
+    }
+
+    // Bluetooth panel (2026-09-28): below the status panel when both are
+    // shown -- the link's state, or why host Bluetooth isn't in use; the
+    // text a connected PC-1500 BLPRINTs/BLLISTs to this emulator; a log.
+    if (appConfig.showBluetoothWindow) {
+      float y = static_cast<float>(kWindowHNoPanel + (appConfig.showStatusPanel ? kStatusPanelHeight : 0));
+      ImGui::SetNextWindowPos(ImVec2(0, y));
+      ImGui::SetNextWindowSize(ImVec2(static_cast<float>(kWindowW), static_cast<float>(kBluetoothPanelHeight)));
+      ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                               ImGuiWindowFlags_NoCollapse;
+      if (ImGui::Begin("##bluetoothpanel", nullptr, flags)) {
+        if (!appConfig.bleHostBluetooth) {
+          ImGui::TextWrapped("Bluetooth: the built-in fake peer. Settings > Bluetooth > Host Bluetooth uses this "
+                             "computer's Bluetooth instead.");
+        } else if (!hostBle.core) {
+          ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "Host Bluetooth unavailable:");
+          ImGui::TextWrapped("%s", hostBle.unavailable.c_str());
+        } else {
+          pc1500::ble::LinkCore& core = *hostBle.core;
+          ImGui::TextWrapped("%s", core.describe().c_str());
+          if (std::string problem = core.problem(); !problem.empty())
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "%s", problem.c_str());
+          ImGui::Text("State: %s", core.state().c_str());
+          ImGui::SameLine();
+          bool advertising = core.advertising();
+          if (ImGui::Checkbox("Advertise as a server", &advertising)) core.setAdvertising(advertising);
+          ImGui::TextDisabled("Files: %s", hostBle.filesDir.string().c_str());
+          if (ImGui::BeginTable("##bletable", 2, ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Console (from the connected PC-1500)");
+            ImGui::BeginChild("##bleconsole", ImVec2(0, 0), ImGuiChildFlags_Borders);
+            ImGui::TextUnformatted(core.consoleText().c_str());
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+            ImGui::EndChild();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted("Log");
+            ImGui::BeginChild("##blelog", ImVec2(0, 0), ImGuiChildFlags_Borders);
+            for (const std::string& line : core.logLines()) ImGui::TextUnformatted(line.c_str());
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+            ImGui::EndChild();
+            ImGui::EndTable();
+          }
+        }
+      }
+      ImGui::End();
     }
 
     ImGui::Render();

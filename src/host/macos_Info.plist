@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Embedded into the pc1500emu executable (__TEXT,__info_plist; see
+     src/host/CMakeLists.txt): macOS ends a process that uses Bluetooth
+     without NSBluetoothAlwaysUsageDescription, and a bare executable has no
+     bundle to carry one. -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>net.pc1500emu.pc1500emu</string>
+  <key>CFBundleName</key>
+  <string>pc1500emu</string>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>pc1500emu uses Bluetooth to link its emulated PC-1500 expansion board with a real PC-1500 or the PC-1500 app.</string>
+</dict>
+</plist>

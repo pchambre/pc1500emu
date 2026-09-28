@@ -30,6 +30,10 @@ add_executable(expansion_keyword_test expansion_keyword_test.cpp)
 target_link_libraries(expansion_keyword_test PRIVATE pc1500basic pc1500bus pc1500keyboard lh5801cpu)
 add_test(NAME expansion_keyword_test COMMAND expansion_keyword_test)
 
+add_executable(ble_link_core_test ble_link_core_test.cpp)
+target_link_libraries(ble_link_core_test PRIVATE pc1500bus)
+add_test(NAME ble_link_core_test COMMAND ble_link_core_test)
+
 add_executable(opcode_table_test opcode_table_test.cpp)
 target_link_libraries(opcode_table_test PRIVATE pc1500disasm)
 add_test(NAME opcode_table_test COMMAND opcode_table_test)
