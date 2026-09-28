@@ -4,6 +4,17 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.9.1] - 2026-09-28
+
+### Added
+- **`SDSAVE` with no name** (the expansion firmware's keywords.c): it saves
+  as the last BASIC program `SDLOAD` loaded, asking before overwriting.
+  With nothing loaded, it's still ERROR 1.
+- `ExpansionMock` calls the firmware's new `kw_reset()` when a module is
+  loaded, so what the keywords remember starts clean, as on a real MCU at
+  power-up (and doesn't leak between tests).
+- Test: `testSdsaveBareSavesAsLastLoaded`.
+
 ## [0.9.0] - 2026-09-28
 
 ### Added

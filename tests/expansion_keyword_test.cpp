@@ -4375,6 +4375,41 @@ void testBleSaveLoad() {
   CHECK(f->run("BLLOAD \"T\"") == 40);
 }
 
+// SDSAVE with no name (2026-09-28): saves as the last BASIC program SDLOAD
+// loaded -- where it was loaded from, even after an SDCD -- asking first,
+// as that file is there. Nothing loaded yet: ERROR 1, as before.
+void testSdsaveBareSavesAsLastLoaded() {
+  auto f = bleFixture("testSdsaveBareSavesAsLastLoaded");
+  if (!f) return;
+  auto onCard = [&](const fs::path& rel) {
+    std::ifstream in(f->sdDir / rel, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  };
+  CHECK(f->run("SDSAVE") == 1);  // nothing loaded yet
+  CHECK(f->typeProgram("10 PRINT 1\n"));
+  CHECK(f->run("SDMKDIR \"SUB\"") == 0);
+  CHECK(f->run("SDSAVE \"SUB/P.BAS\"") == 0);
+  CHECK(f->run("SDCD \"SUB\"") == 0);
+  CHECK(f->run("NEW") == 0);
+  CHECK(f->run("SDLOAD \"P.BAS\"") == 0);  // relative to SUB
+  CHECK(f->run("SDCD \"..\"") == 0);        // and now somewhere else
+  CHECK(f->typeProgram("20 PRINT 2\n"));
+  std::vector<uint8_t> changed = f->program();
+  CHECK(f->run("SDSAVE") == 0);
+  CHECK(f->shown() == "FILE EXISTS. OVERWRITE Y/N");
+  f->key(pc1500::Key::Y);
+  CHECK(onCard("SUB/P.BAS") == changed);
+  CHECK(!fs::exists(f->sdDir / "P.BAS"));
+
+  CHECK(f->typeProgram("30 END\n"));
+  CHECK(f->run("SDSAVE") == 0);
+  CHECK(f->shown() == "FILE EXISTS. OVERWRITE Y/N");
+  f->key(pc1500::Key::N);
+  CHECK(onCard("SUB/P.BAS") == changed);  // N leaves it
+
+  CHECK(f->run("BLSAVE") == 1);  // BLSAVE still needs a name
+}
+
 // Peer-to-peer (2026-09-28, BLE_PROTOCOL.md "Peer-to-peer files"): the fake
 // peer plays the other PC-1500. Its waits count STATUS checks, one per POLL.
 
@@ -4531,6 +4566,7 @@ int main() {
   testSdsaveOverwritePromptYOverwrites();
   testSdsaveDashYSkipsPrompt();
   testSdsaveNoArgsRaisesError1();
+  testSdsaveBareSavesAsLastLoaded();
   testSdsaveMMissingArgsRaisesError1();
   testSdsaveMCallAddressRoundTrip();
   testSdloadFileNotFoundRaisesError40();

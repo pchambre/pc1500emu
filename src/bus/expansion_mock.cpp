@@ -567,6 +567,12 @@ uint8_t ExpansionMock::closeSdFile(std::vector<uint8_t>& window) {
   return kStatusSuccess;
 }
 
+void ExpansionMock::resetKeywords() {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  kw_reset();
+#endif
+}
+
 // ---- BLE (2026-09-27) ----
 //
 // A fake peer in place of the firmware's radio (RP2350/pc_exp.h's

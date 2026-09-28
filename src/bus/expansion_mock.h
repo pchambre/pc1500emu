@@ -309,6 +309,7 @@ class ExpansionMock {
     romCopyBlockIndex_ = 0;
     romStagedVerified_ = false;
     romCopyBeginCount_ = 0;
+    resetKeywords();  // a freshly loaded module: its MCU just powered up
   }
 
   // Mirrors the real firmware's romStagedVerified (monitor.c, 2026-09-24):
@@ -556,6 +557,8 @@ class ExpansionMock {
   uint8_t readFromSdFile(std::vector<uint8_t>& window);
   uint8_t closeSdFile(std::vector<uint8_t>& window);
   uint8_t bleCommand(uint8_t cmd, std::vector<uint8_t>& window);
+  // keywords.c's kw_reset() (what the keywords remember between statements).
+  void resetKeywords();
   uint8_t bleWrite(std::vector<uint8_t>& window);
   uint8_t bleRead(std::vector<uint8_t>& window);
   uint8_t bleClose();
