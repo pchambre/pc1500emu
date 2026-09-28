@@ -4206,6 +4206,20 @@ void testBlePrintText() {
   CHECK(f->run("BLPRINT") == 0);
   CHECK(f->mock->bleText() == "ABCD\r\r");
 
+  // BLCLS: a form feed, which clears the app's console; BLPRINT CHR$(12)
+  // is the same thing spelled out.
+  f->mock->clearBleText();
+  CHECK(f->run("BLCLS") == 0);
+  CHECK(f->mock->bleText() == "\f");
+  CHECK(f->run("BLPRINT CHR$(12);") == 0);
+  CHECK(f->mock->bleText() == "\f\f");
+  CHECK(f->run("BLCLS 1") == 1);
+  // CHR$ leaves C1H, not D0H, in the arithmetic register (TRM p.123); the
+  // ROM hands it over as a string all the same.
+  f->mock->clearBleText();
+  CHECK(f->run("BLPRINT CHR$(65);\"B\"") == 0);
+  CHECK(f->mock->bleText() == "AB\r");
+
   // Held in a variable first: STR$ of an expression works from the
   // unrounded intermediate (1/7 -> ...428), while an evaluated value --
   // what BLPRINT and PRINT get -- is rounded to 10 digits (...429).
