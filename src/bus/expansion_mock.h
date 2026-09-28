@@ -246,7 +246,7 @@ class ExpansionMock {
   // value. The mock keeps them in memory (real firmware: flash).
   static constexpr uint8_t kCommandConfigGet = 0x30;
   static constexpr uint8_t kCommandConfigSet = 0x31;
-  static constexpr int kConfigCount = 6;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, BLE -- mcu_config.h
+  static constexpr int kConfigCount = 6;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused) -- mcu_config.h
 
   // FNSAVE/FNLOAD/STSAVE/STLOAD stores (2026-09-25): the real firmware
   // keeps them in flash (mcu_store.c), the mock in memory. Parameters at

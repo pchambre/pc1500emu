@@ -3929,11 +3929,6 @@ void testMconfShowsAndSetsSettings() {
   CHECK(mock.configValue(0) == 0);
   CHECK(run("MCONF LOGSIZE=512") == 0);
   CHECK(mock.configValue(2) == 512);
-  // BLE is setting 5: the table maps names to ids, not positions.
-  CHECK(run("MCONF BLE=1") == 0);
-  CHECK(mock.configValue(5) == 1);
-  CHECK(run("MCONF BLE=0") == 0);
-  CHECK(mock.configValue(5) == 0);
 
   CHECK(run("MCONF SLEEPWAIT") == 0);
   CHECK(shown() == "SLEEPWAIT=1000");
@@ -3951,7 +3946,7 @@ void testMconfShowsAndSetsSettings() {
   CHECK(run("MCONF COLOUR=1") == 1);       // unknown setting
   CHECK(run("MCONF SLEEPWAIT=") == 1);     // no value
   CHECK(mock.configValue(1) == 1000);
-  CHECK(run("MCONF BLE=2") == 1);          // out of range
+  CHECK(run("MCONF BLE=1") == 1);          // the BLE spike's setting is gone
   CHECK(mock.configValue(5) == 0);
 }
 
@@ -4163,7 +4158,7 @@ static std::unique_ptr<BleFixture> bleFixture(const char* testName) {
   return f;
 }
 
-// BLSCAN lists the peers; L on one connects. BLCONNECT finds one by name
+// BLSCAN lists the peers; C on one connects. BLCONNECT finds one by name
 // in any case; an unknown name, or text with no link, is ERROR 40.
 void testBleScanConnectAndDisconnect() {
   auto f = bleFixture("testBleScanConnectAndDisconnect");
@@ -4171,7 +4166,9 @@ void testBleScanConnectAndDisconnect() {
   CHECK(f->run("BLPRINT \"X\"") == 40);  // no link yet
   CHECK(f->run("BLSCAN") == 0);
   CHECK(f->shown(0x8002) == "MARVIN");
-  f->key(pc1500::Key::L);
+  f->key(pc1500::Key::L);  // L is SDLOAD's key, not this one
+  CHECK(!f->mock->bleConnected());
+  f->key(pc1500::Key::C);
   CHECK(f->shown() == "CONNECTED: MARVIN");
   f->key(pc1500::Key::Ent);
   CHECK(f->mock->bleConnected());
