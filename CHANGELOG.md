@@ -4,6 +4,33 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.9.0] - 2026-09-28
+
+### Added
+- **Peer-to-peer files between two PC-1500s** (the expansion firmware's
+  BLE milestone 2; `RP2350/BLE_PROTOCOL.md` "Peer-to-peer files"): the
+  emulated module answers the new BLE commands for `BLADV`, `BLPUT` and
+  `BLGET`, so the emulator can be the second PC-1500 to a real one.
+  - The protocol core (`ble_link_core`) holds and answers `FILE_OFFER` /
+    `FILE_ANSWER` in both roles, and takes the emulated PC-1500's own
+    keywords while another PC-1500 is connected to it.
+  - The fake peer can play a PC-1500 in tests: it connects to a `BLADV`,
+    answers a `BLPUT`'s offer, and offers files to `BLGET`.
+  - Tests: keyword tests for all three keywords, and a loopback test of
+    offers and transfers in both directions.
+- **`MCONF AUTOSTAGE`** in the mock (default 0: the boot hook stages the
+  ROM only when it's 1), plus the MCU executor's other changes: `BLCONNECT`
+  is now `BLCON`, and BLE transfers show `SENDING...` / `RECEIVING...` /
+  `SAVING...` / `LOADING...`.
+
+### Fixed
+- **Windows host Bluetooth:** a link the peer ended left the emulator's
+  connector session open (with `MaintainConnection` on). A later link as
+  the advertiser then sent every frame down the dead one ("The object has
+  been closed"), and Windows kept holding on to the device.
+- A failed connect now says whether the peer's services couldn't be read
+  (with the GATT status) or the Link service wasn't among them.
+
 ## [0.8.0] - 2026-09-28
 
 ### Added

@@ -92,6 +92,15 @@ class Strand {
     cv_.notify_all();
     return result.get();
   }
+  // Queues `f` without waiting for it -- for WinRT's own callbacks, which
+  // mustn't block on the strand.
+  void post(std::function<void()> f) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      jobs_.push_back(std::move(f));
+    }
+    cv_.notify_all();
+  }
 
  private:
   void loop() {
@@ -257,7 +266,13 @@ bool WinRtTransport::connect(const pc1500::ble::Peer& peer) {
       session_ = GattSession::FromDeviceIdAsync(device_.BluetoothDeviceId()).get();
       session_.MaintainConnection(true);
       auto services = device_.GetGattServicesForUuidAsync(kService, BluetoothCacheMode::Uncached).get();
-      if (services.Status() != GattCommunicationStatus::Success || services.Services().Size() == 0) {
+      if (services.Status() != GattCommunicationStatus::Success) {
+        // 1 = unreachable, 2 = protocol error, 3 = access denied
+        say("Couldn't read the peer's services (GATT status " +
+            std::to_string(static_cast<int>(services.Status())) + ")");
+        return false;
+      }
+      if (services.Services().Size() == 0) {
         say("The peer doesn't offer the Link service");
         return false;
       }
@@ -274,7 +289,15 @@ bool WinRtTransport::connect(const pc1500::ble::Peer& peer) {
         if (onFrame) onFrame(fromBuffer(args.CharacteristicValue()));
       });
       statusChanged_ = device_.ConnectionStatusChanged([this](BluetoothLEDevice const& d, auto const&) {
-        if (d.ConnectionStatus() == BluetoothConnectionStatus::Disconnected && onLink) onLink(false, false);
+        if (d.ConnectionStatus() != BluetoothConnectionStatus::Disconnected) return;
+        // The peer ended it (2026-09-28): close the session like our own
+        // disconnect does. Left open, MaintainConnection kept Windows after
+        // the device, and the stale rx_ made send() write to it even once
+        // this emulator was advertising ("The object has been closed").
+        strand_.post([this, gone = d] {
+          if (device_ && device_ == gone) closeCentralLocked();  // not a newer connection's
+        });
+        if (onLink) onLink(false, false);
       });
       auto cccd = tx_.WriteClientCharacteristicConfigurationDescriptorAsync(
                          GattClientCharacteristicConfigurationDescriptorValue::Notify)
@@ -398,7 +421,7 @@ void WinRtTransport::stopAdvertisingLocked() {
 bool WinRtTransport::send(const std::vector<uint8_t>& frame) {
   return strand_.run([&] {
     try {
-      if (rx_) {  // connector: write RX without response
+      if (rx_) {  // connector: write RX without response (cleared when that link ends)
         return rx_.WriteValueWithResultAsync(toBuffer(frame), GattWriteOption::WriteWithoutResponse).get().Status() ==
                GattCommunicationStatus::Success;
       }

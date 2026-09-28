@@ -66,7 +66,7 @@ class Transport {
 };
 
 // The keywords' side of the link (a BleBackend), in both roles:
-// - connector: BLSCAN/BLCONNECT/BLPRINT/BLSAVE/BLLOAD from the emulated
+// - connector: BLSCAN/BLCON/BLPRINT/BLSAVE/BLLOAD from the emulated
 //   PC-1500, exactly as the firmware's ble_link.c does them;
 // - advertiser: another device (a real PC-1500) connects to this emulator
 //   and uses it as a feature server, as the laptop app is used -- console
@@ -77,7 +77,8 @@ class LinkCore : public BleBackend {
   ~LinkCore() override;
 
   uint8_t command(uint8_t cmd, std::vector<uint8_t>& window) override;
-  bool transferOpen() const override { return xfer_ != Xfer::kNone; }
+  // Only a routed transfer takes over the SD file commands (pc_exp.h).
+  bool transferOpen() const override { return xfer_ != Xfer::kNone && routed_; }
   uint8_t write(std::vector<uint8_t>& window) override;
   uint8_t read(std::vector<uint8_t>& window) override;
   uint8_t close() override;
@@ -123,7 +124,15 @@ class LinkCore : public BleBackend {
   uint8_t filePut(std::vector<uint8_t>& w);
   uint8_t fileGet(std::vector<uint8_t>& w);
 
-  // advertiser (server)
+  // peer-to-peer (2026-09-28, BLE_PROTOCOL.md "Peer-to-peer files")
+  uint8_t status(std::vector<uint8_t>& w);
+  uint8_t offer(std::vector<uint8_t>& w);
+  uint8_t offerGet(std::vector<uint8_t>& w);
+  uint8_t answerOffer(std::vector<uint8_t>& w);
+  uint8_t sendAccepted(std::vector<uint8_t>& w);
+
+  // advertiser (server), and the frames that may come in either role while
+  // no command is waiting for them (offers, their answers)
   void serverLoop();
   void serve(const Frame& f);
   void serveFileGet(const Frame& f);
@@ -145,10 +154,21 @@ class LinkCore : public BleBackend {
   // in flight, and the peer's own frames -- queued for the server thread
   bool answerReady_ = false;
   uint8_t answerType_ = 0, answerSeq_ = 0, answerCode_ = 0;
-  std::deque<Frame> incoming_;
+  std::deque<Frame> incoming_;  // for the command waiting (receive())
+  std::deque<Frame> toServe_;   // for the server thread (serve())
+  bool helloDone_ = false;      // HELLOs exchanged: STATUS's "linked"
 
-  // a connector transfer in progress
+  // peer-to-peer: the offer the peer made us (until BLGET takes it), ours
+  // (until the peer answers), as BLE_PROTOCOL.md sec.5 describes
+  bool offerIn_ = false;
+  uint8_t offerInKind_ = 0;
+  uint32_t offerInSize_ = 0;
+  std::string offerInName_;
+  bool offerOut_ = false, answered_ = false, accepted_ = false;
+
+  // a transfer in progress (a routed one owns WRITE/READ/CLOSE_SD_FILE)
   Xfer xfer_ = Xfer::kNone;
+  bool routed_ = true;
   bool xferFailed_ = false;
   bool getEnded_ = false;
   std::vector<uint8_t> getBuf_;

@@ -249,7 +249,8 @@ class ExpansionMock {
   // value. The mock keeps them in memory (real firmware: flash).
   static constexpr uint8_t kCommandConfigGet = 0x30;
   static constexpr uint8_t kCommandConfigSet = 0x31;
-  static constexpr int kConfigCount = 6;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused) -- mcu_config.h
+  static constexpr int kConfigCount = 7;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE -- mcu_config.h
+  static constexpr int kConfigAutostage = 6;
 
   // FNSAVE/FNLOAD/STSAVE/STLOAD stores (2026-09-25): the real firmware
   // keeps them in flash (mcu_store.c), the mock in memory. Parameters at
@@ -268,6 +269,20 @@ class ExpansionMock {
   static constexpr uint8_t kCommandBleText = 0x44;
   static constexpr uint8_t kCommandBleFilePut = 0x45;
   static constexpr uint8_t kCommandBleFileGet = 0x46;
+  // Peer-to-peer (2026-09-28) -- pc_exp.h's EXP_COMMAND_BLE_ADVERTISE..DATA_CLOSE.
+  static constexpr uint8_t kCommandBleAdvertise = 0x47;
+  static constexpr uint8_t kCommandBleStatus = 0x48;
+  static constexpr uint8_t kCommandBleOffer = 0x49;
+  static constexpr uint8_t kCommandBleWithdraw = 0x4A;
+  static constexpr uint8_t kCommandBleOfferGet = 0x4B;
+  static constexpr uint8_t kCommandBleAnswer = 0x4C;
+  static constexpr uint8_t kCommandBleSend = 0x4D;
+  static constexpr uint8_t kCommandBleDataWrite = 0x4E;
+  static constexpr uint8_t kCommandBleDataRead = 0x4F;
+  static constexpr uint8_t kCommandBleDataClose = 0x50;
+  // EXP_BLE_STATUS_*
+  static constexpr uint8_t kBleStatusLinked = 0x01, kBleStatusAdvertising = 0x02, kBleStatusOfferIn = 0x04,
+                           kBleStatusAnswered = 0x08, kBleStatusAccepted = 0x10;
   static constexpr int kBleFileArgs = 42;
   static constexpr int kStoreParams = 0x7F0;
 
@@ -311,6 +326,10 @@ class ExpansionMock {
 
   // Test-only: an MCONF setting's current value (0 = LED, 1 = SLEEPWAIT).
   uint16_t configValue(int id) const { return id >= 0 && id < kConfigCount ? config_[id] : 0; }
+  // Test-only: sets one, as if MCONF had saved it before this boot.
+  void setConfigValue(int id, uint16_t value) {
+    if (id >= 0 && id < kConfigCount) config_[id] = value;
+  }
 
   // Test-only: the fake BLE peer the BL* keywords talk to (2026-09-27). It
   // stands in for the feature-server app: BLSCAN finds the names in
@@ -324,6 +343,37 @@ class ExpansionMock {
   void clearBleText() { bleText_.clear(); }
   std::map<std::string, std::vector<uint8_t>>& bleFiles() { return bleFiles_; }
   void setBleLinkDropAfter(long bytes) { bleDropAfter_ = bytes; }
+
+  // Test-only, peer-to-peer (2026-09-28): the fake peer as another PC-1500.
+  // Its waits are counted in STATUS checks (one per POLL of the keyword
+  // waiting); -1 = never.
+  struct BleOffer {
+    uint8_t kind = 0;
+    uint32_t size = 0;
+    std::string name;
+    std::vector<uint8_t> data;
+  };
+  // BLADV: `name` connects to us after `polls` STATUS checks.
+  void setBlePeerConnectsAfter(int polls, std::string name) {
+    bleConnectAfter_ = polls;
+    bleConnectName_ = std::move(name);
+  }
+  bool bleAdvertising() const { return bleAdvertising_; }
+  // BLPUT: the peer answers our offer after `polls` STATUS checks...
+  void setBlePeerAnswer(bool accept, int polls) {
+    bleAnswerAccept_ = accept;
+    bleAnswerAfter_ = polls;
+  }
+  // ...and what it got: our offer, and (once FILE_END) the bytes.
+  const BleOffer& bleReceived() const { return bleReceived_; }
+  bool bleWithdrawn() const { return bleWithdrawn_; }
+  // BLGET: the peer offers us a file.
+  void bleOfferToUs(uint8_t kind, std::string name, std::vector<uint8_t> data) {
+    bleOfferIn_ = true;
+    bleOfferInFile_ = BleOffer{kind, static_cast<uint32_t>(data.size()), std::move(name), std::move(data)};
+  }
+  bool bleOfferPending() const { return bleOfferIn_; }
+  bool bleOfferRefused() const { return bleRefused_; }
 
   // A real Bluetooth link in place of the fake peer (2026-09-28): BLE
   // commands, and a BLE transfer's WRITE/READ/CLOSE_SD_FILE, go to it.
@@ -567,7 +617,7 @@ class ExpansionMock {
   int romCopyBeginCount_ = 0;
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
-  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0};  // mcu_config.c's defaults
+  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0};  // mcu_config.c's defaults
   // The fake BLE peer -- see blePeers().
   std::vector<std::string> blePeers_ = {"MARVIN"};
   bool bleConnected_ = false;
@@ -579,6 +629,23 @@ class ExpansionMock {
   size_t bleXferPos_ = 0;
   bool bleXferFailed_ = false;
   long bleDropAfter_ = -1;
+  // Peer-to-peer (see the test-only accessors above). A routed transfer
+  // takes over WRITE/READ/CLOSE_SD_FILE (pc_exp.h); an unrouted one moves
+  // its bytes with the BLE DATA_* commands.
+  bool bleRouted_ = true;
+  bool bleXferP2p_ = false;  // a BLPUT's transfer: lands in bleReceived_
+  std::string bleLinkedName_;
+  bool bleAdvertising_ = false;
+  int bleConnectAfter_ = -1;
+  std::string bleConnectName_;
+  bool bleOfferOut_ = false, bleAnswered_ = false, bleAccepted_ = false;
+  bool bleAnswerAccept_ = false;
+  int bleAnswerAfter_ = -1;
+  BleOffer bleReceived_;
+  bool bleWithdrawn_ = false;
+  bool bleOfferIn_ = false;
+  BleOffer bleOfferInFile_;
+  bool bleRefused_ = false;
   mutable std::mutex bleBackendMutex_;
   std::shared_ptr<BleBackend> bleBackend_;
   std::string hostName_ = "PC-1500 EMU";  // the firmware's default is "PC-1500"

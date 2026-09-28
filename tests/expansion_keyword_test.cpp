@@ -3790,6 +3790,12 @@ void testBootHookStagesRomThenSkipsOnReset() {
     CHECK(waitForIdle(*m));
   };
 
+  // MCONF AUTOSTAGE (2026-09-28) defaults to 0: the hook stages nothing.
+  resetAndBoot();
+  CHECK(mock.romCopyBeginCount() == 0);
+  CHECK(!mock.remapActive());
+
+  m->bus.expansionMock().setConfigValue(pc1500::ExpansionMock::kConfigAutostage, 1);
   resetAndBoot();
   CHECK(mock.romCopyBeginCount() == 1);
   CHECK(mock.remapActive());
@@ -3929,6 +3935,10 @@ void testMconfShowsAndSetsSettings() {
   CHECK(mock.configValue(0) == 0);
   CHECK(run("MCONF LOGSIZE=512") == 0);
   CHECK(mock.configValue(2) == 512);
+  // AUTOSTAGE (2026-09-28): "AUTO" + BASIC's TO token + "STAGE" on the wire.
+  CHECK(mock.configValue(6) == 0);
+  CHECK(run("MCONF AUTOSTAGE=1") == 0);
+  CHECK(mock.configValue(6) == 1);
 
   CHECK(run("MCONF SLEEPWAIT") == 0);
   CHECK(shown() == "SLEEPWAIT=1000");
@@ -3946,15 +3956,18 @@ void testMconfShowsAndSetsSettings() {
   CHECK(run("MCONF HOSTNAME=A$") == 0);
   CHECK(mock.hostName() == "KITCHEN");
 
-  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (4th)
+  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (5th)
   CHECK(shown(0x8002) == "LED=0");
-  CHECK(shown(0x8002 + 3 * 30) == "HOSTNAME=KITCHEN");
+  CHECK(shown(0x8002 + 3 * 30) == "AUTOSTAGE=1");
+  CHECK(shown(0x8002 + 4 * 30) == "HOSTNAME=KITCHEN");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
   // Errors last -- ERL keeps the last error rather than resetting.
   CHECK(run("MCONF LED=2") == 1);          // out of range
   CHECK(mock.configValue(0) == 0);
+  CHECK(run("MCONF AUTOSTAGE=2") == 1);    // 0 or 1 only
+  CHECK(mock.configValue(6) == 1);
   CHECK(run("MCONF COLOUR=1") == 1);       // unknown setting
   CHECK(run("MCONF SLEEPWAIT=") == 1);     // no value
   CHECK(mock.configValue(1) == 1000);
@@ -3965,6 +3978,7 @@ void testMconfShowsAndSetsSettings() {
   CHECK(run("MCONF HOSTNAME=\"\"") == 1);  // empty
   CHECK(mock.hostName() == "KITCHEN");
 }
+
 
 
 // Keywords in a running program, with BASIC expressions as arguments
@@ -4115,6 +4129,23 @@ void testFnKeysAndStateSaveRestore() {
 struct BleFixture {
   std::unique_ptr<BootedMachine> m;
   pc1500::ExpansionMock* mock = nullptr;
+  fs::path sdDir;
+
+  // Starts `line`, lets it get into its wait, then presses BREAK the way
+  // the host's F12 does (2026-09-28: BLADV/BLPUT/BLGET). Returns ERL.
+  int runThenBreak(const std::string& line) {
+    m->bus.writeME0(kErlAbs, 0);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, line);
+    tapKey(*m, pc1500::Key::Ent);
+    for (long i = 0; i < 200'000; i++) stepOne(*m);
+    m->cpu.pressOnKey();
+    m->bus.ioPort().setOnKeyLine(true);
+    m->cpu.requestMI();
+    m->bus.ioPort().setOnKeyLine(false);
+    CHECK(waitForIdle(*m, 20'000'000));
+    return m->bus.readME0(kErlAbs);
+  }
 
   // The line's error number (0 = none). ERL keeps the last error until
   // another one, so it's cleared first.
@@ -4146,9 +4177,9 @@ struct BleFixture {
     if (!ok) std::printf("  typeBasicProgramText: %s\n", error.c_str());
     return ok;
   }
-  // Connects with BLCONNECT and clears the text the peer has seen.
+  // Connects with BLCON and clears the text the peer has seen.
   void connect() {
-    CHECK(run("BLCONNECT \"MARVIN\"") == 0);
+    CHECK(run("BLCON \"MARVIN\"") == 0);
     CHECK(shown() == "CONNECTED: MARVIN");
     key(pc1500::Key::Ent);
     mock->clearBleText();
@@ -4168,13 +4199,14 @@ static std::unique_ptr<BleFixture> bleFixture(const char* testName) {
   }
   auto f = std::make_unique<BleFixture>();
   f->m = bootAndSettle(rom);
-  loadExpansionRom(*f->m, expRom, makeTempTestDir(testName));
+  f->sdDir = makeTempTestDir(testName);
+  loadExpansionRom(*f->m, expRom, f->sdDir);
   f->mock = &f->m->bus.expansionMock();
   f->run("NEW0");
   return f;
 }
 
-// BLSCAN lists the peers; C on one connects. BLCONNECT finds one by name
+// BLSCAN lists the peers; C on one connects. BLCON finds one by name
 // in any case; an unknown name, or text with no link, is ERROR 40.
 void testBleScanConnectAndDisconnect() {
   auto f = bleFixture("testBleScanConnectAndDisconnect");
@@ -4190,14 +4222,14 @@ void testBleScanConnectAndDisconnect() {
   CHECK(f->mock->bleConnected());
   CHECK(f->run("BLDISC") == 0);
   CHECK(!f->mock->bleConnected());
-  CHECK(f->run("BLCONNECT \"marvin\"") == 0);
+  CHECK(f->run("BLCON \"marvin\"") == 0);
   f->key(pc1500::Key::Ent);
   CHECK(f->mock->bleConnected());
   f->mock->blePeers().clear();
   CHECK(f->run("BLSCAN 1") == 0);
   CHECK(f->shown() == "BLE: NO PEERS FOUND");
   f->key(pc1500::Key::Ent);
-  CHECK(f->run("BLCONNECT \"NOBODY\"") == 40);
+  CHECK(f->run("BLCON \"NOBODY\"") == 40);
 }
 
 // BLPRINT: ';' runs values together, ',' pads to the next 13-column zone,
@@ -4335,12 +4367,129 @@ void testBleSaveLoad() {
   f->mock->setBleLinkDropAfter(4);
   CHECK(f->run("BLSAVE \"U\"") == 40);
   CHECK(f->mock->bleFiles().count("U") == 0);
-  int erl = f->run("BLCONNECT \"MARVIN\"");
+  int erl = f->run("BLCON \"MARVIN\"");
   CHECK(erl == 0);
-  if (erl != 0) std::printf("  BLCONNECT after a drop: ERL %d, shown [%s]\n", erl, f->shown().c_str());
+  if (erl != 0) std::printf("  BLCON after a drop: ERL %d, shown [%s]\n", erl, f->shown().c_str());
   f->key(pc1500::Key::Ent);
   f->mock->setBleLinkDropAfter(4);
   CHECK(f->run("BLLOAD \"T\"") == 40);
+}
+
+// Peer-to-peer (2026-09-28, BLE_PROTOCOL.md "Peer-to-peer files"): the fake
+// peer plays the other PC-1500. Its waits count STATUS checks, one per POLL.
+
+static std::vector<uint8_t> testBytes(size_t n) {
+  std::vector<uint8_t> v(n);
+  for (size_t i = 0; i < n; i++) v[i] = static_cast<uint8_t>(i * 7 + 3);
+  return v;
+}
+
+// BLADV waits (POLLing) until a peer connects, then says who; BREAK stops
+// the wait and the advertising.
+void testBleAdvertiseWaitsForPeer() {
+  auto f = bleFixture("testBleAdvertiseWaitsForPeer");
+  if (!f) return;
+  f->mock->setBlePeerConnectsAfter(3, "ZAPHOD");
+  CHECK(f->run("BLADV") == 0);
+  CHECK(f->shown() == "CONNECTED: ZAPHOD");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->mock->bleConnected());
+  CHECK(f->run("BLDISC") == 0);
+
+  f->mock->setBlePeerConnectsAfter(-1, "");
+  CHECK(f->runThenBreak("BLADV") == 0);
+  CHECK(!f->mock->bleAdvertising());
+  CHECK(!f->mock->bleConnected());
+  CHECK(f->run("BLADV 1") == 1);  // no arguments
+}
+
+// BLPUT offers the program, memory, or a card file; the peer's answer
+// decides. Each form's bytes are what the matching SDSAVE would write.
+void testBlePutToPeer() {
+  auto f = bleFixture("testBlePutToPeer");
+  if (!f) return;
+  CHECK(f->run("BLPUT") == 40);  // no link
+  f->connect();
+  CHECK(f->typeProgram("10 PRINT 1\n20 END\n"));
+  std::vector<uint8_t> program = f->program();
+
+  f->mock->setBlePeerAnswer(true, 2);
+  CHECK(f->run("BLPUT") == 0);
+  CHECK(f->mock->bleReceived().kind == 0);
+  CHECK(f->mock->bleReceived().name.empty());
+  CHECK(f->mock->bleReceived().data == program);
+
+  CHECK(f->run("POKE &4400,1,2,3,4") == 0);
+  f->mock->setBlePeerAnswer(true, 1);
+  CHECK(f->run("BLPUT M &4400,&4403,&4401") == 0);
+  const std::vector<uint8_t> mExpected = {0x44, 0x00, 0x44, 0x01, 1, 2, 3, 4};
+  CHECK(f->mock->bleReceived().kind == 1);
+  CHECK(f->mock->bleReceived().size == 8);
+  CHECK(f->mock->bleReceived().data == mExpected);
+
+  std::vector<uint8_t> file = testBytes(3000);  // several 1K pieces
+  {
+    std::ofstream out(f->sdDir / "F.BIN", std::ios::binary);
+    out.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+  }
+  f->mock->setBlePeerAnswer(true, 1);
+  CHECK(f->run("BLPUT SD M \"F.BIN\"") == 0);
+  CHECK(f->mock->bleReceived().kind == 1);
+  CHECK(f->mock->bleReceived().name == "F.BIN");
+  CHECK(f->mock->bleReceived().data == file);
+  f->mock->setBlePeerAnswer(true, 1);
+  CHECK(f->run("BLPUT SD \"F.BIN\"") == 0);
+  CHECK(f->mock->bleReceived().kind == 0);
+  CHECK(f->run("BLPUT SD \"NOPE.BIN\"") == 40);
+
+  f->mock->setBlePeerAnswer(false, 1);
+  CHECK(f->run("BLPUT") == 0);
+  CHECK(f->shown() == "BLPUT: REFUSED");
+  f->key(pc1500::Key::Ent);
+
+  f->mock->setBlePeerAnswer(true, -1);  // never answers
+  CHECK(f->runThenBreak("BLPUT") == 0);
+  CHECK(f->mock->bleWithdrawn());
+}
+
+// BLGET takes the peer's offer: into memory (a BASIC file as the program,
+// an M file at its header's address), or onto the card under its own name.
+void testBleGetFromPeer() {
+  auto f = bleFixture("testBleGetFromPeer");
+  if (!f) return;
+  CHECK(f->run("BLGET") == 40);  // no link
+  f->connect();
+  CHECK(f->typeProgram("10 PRINT 2\n20 END\n"));
+  std::vector<uint8_t> program = f->program();
+  CHECK(f->run("NEW") == 0);
+  f->mock->bleOfferToUs(0, "", program);
+  CHECK(f->run("BLGET") == 0);
+  CHECK(f->program() == program);
+
+  f->mock->bleOfferToUs(1, "", {0x44, 0x00, 0x00, 0x00, 5, 6, 7, 8});
+  CHECK(f->run("BLGET") == 0);
+  CHECK(f->m->bus.readME0(0x4400) == 5 && f->m->bus.readME0(0x4403) == 8);
+
+  std::vector<uint8_t> file = testBytes(3000);
+  auto onCard = [&](const char* name) {
+    std::ifstream in(f->sdDir / name, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  };
+  f->mock->bleOfferToUs(1, "THEIRS.BIN", file);
+  CHECK(f->run("BLGET \"G.BIN\"") == 0);
+  CHECK(onCard("G.BIN") == file);
+
+  std::vector<uint8_t> other = testBytes(10);
+  f->mock->bleOfferToUs(0, "", other);
+  CHECK(f->run("BLGET \"G.BIN\"") == 0);
+  CHECK(f->shown() == "FILE EXISTS. OVERWRITE Y/N");
+  f->key(pc1500::Key::N);
+  CHECK(f->mock->bleOfferPending());  // still the peer's to withdraw or resend
+  CHECK(onCard("G.BIN") == file);
+  CHECK(f->run("BLGET \"G.BIN\",-Y") == 0);
+  CHECK(onCard("G.BIN") == other);
+
+  CHECK(f->runThenBreak("BLGET") == 0);  // nothing offered: waits until BREAK
 }
 
 
@@ -4350,6 +4499,9 @@ int main() {
 
   testMconfShowsAndSetsSettings();
   testBleScanConnectAndDisconnect();
+  testBleAdvertiseWaitsForPeer();
+  testBlePutToPeer();
+  testBleGetFromPeer();
   testBlePrintText();
   testBleListMatchesDetokenizer();
   testBleSaveLoad();

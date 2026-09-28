@@ -16,6 +16,7 @@ namespace {
 // BLE_PROTOCOL.md sec.5
 constexpr uint8_t kHello = 0x01, kBye = 0x02, kText = 0x10;
 constexpr uint8_t kFilePut = 0x20, kFileData = 0x21, kFileEnd = 0x22, kFileGet = 0x23, kFileAbort = 0x24;
+constexpr uint8_t kFileOffer = 0x25, kFileAnswer = 0x26;  // peer-to-peer (2026-09-28)
 constexpr uint8_t kAck = 0x7E, kErr = 0x7F;
 constexpr uint8_t kErrBadFrame = 1, kErrUnsupported = 2, kErrNotFound = 3, kErrExists = 4, kErrIo = 5,
                   kErrBusy = 6, kErrAborted = 7;
@@ -26,6 +27,12 @@ constexpr uint32_t kSizeUnknown = 0xFFFFFFFFu;
 constexpr uint8_t kStatusSuccess = 2, kStatusError = 128, kStatusNotImplemented = 64;
 constexpr uint8_t kCmdScan = 0x40, kCmdConnect = 0x41, kCmdConnectName = 0x42, kCmdDisconnect = 0x43,
                   kCmdText = 0x44, kCmdFilePut = 0x45, kCmdFileGet = 0x46;
+constexpr uint8_t kCmdAdvertise = 0x47, kCmdStatus = 0x48, kCmdOffer = 0x49, kCmdWithdraw = 0x4A,
+                  kCmdOfferGet = 0x4B, kCmdAnswer = 0x4C, kCmdSend = 0x4D, kCmdDataWrite = 0x4E,
+                  kCmdDataRead = 0x4F, kCmdDataClose = 0x50;
+// EXP_BLE_STATUS_*
+constexpr uint8_t kStatusLinked = 0x01, kStatusAdvertising = 0x02, kStatusOfferIn = 0x04, kStatusAnswered = 0x08,
+                  kStatusAccepted = 0x10;
 constexpr size_t kFileArgs = 42;      // EXP_BLE_FILE_ARGS: after the name slot
 constexpr size_t kLengthPort = 0x7FD; // EXP_LENGTH_PORT_PAGE/ADDRESS
 constexpr size_t kPathMax = 40;       // EXP_PATH_ARG_LEN
@@ -102,13 +109,18 @@ void LinkCore::onFrame(const std::vector<uint8_t>& f) {
   }
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    Frame frame{f[0], f[1], std::vector<uint8_t>(f.begin() + 4, f.end())};
     if (f[0] == kAck || f[0] == kErr) {
       answerType_ = f[0];
       answerSeq_ = f[1];
       answerCode_ = f.size() > 4 ? f[4] : 0;
       answerReady_ = true;
+    } else if (f[0] == kFileOffer || f[0] == kFileAnswer || (f[0] == kFileAbort && xfer_ == Xfer::kNone)) {
+      toServe_.push_back(std::move(frame));  // may come while no command runs, in either role
+    } else if (xfer_ != Xfer::kNone || !asServer_) {
+      incoming_.push_back(std::move(frame));  // a transfer's, or the connector's command's
     } else {
-      incoming_.push_back(Frame{f[0], f[1], std::vector<uint8_t>(f.begin() + 4, f.end())});
+      toServe_.push_back(std::move(frame));  // a peer using this emulator as its server
     }
   }
   cv_.notify_all();
@@ -122,6 +134,9 @@ void LinkCore::onLink(bool connected, bool asAdvertiser) {
     txSeq_ = 0;
     answerReady_ = false;
     incoming_.clear();
+    toServe_.clear();
+    helloDone_ = false;
+    offerIn_ = offerOut_ = answered_ = false;  // sec.5: a dropped link drops them
     if (!connected) {
       peerName_.clear();
       putActive_ = false;
@@ -232,9 +247,47 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
     std::lock_guard<std::mutex> lock(mutex_);
     server = asServer_;
   }
-  if (cmd == kCmdDisconnect) {
-    disconnectLink();
-    return kStatusSuccess;
+  switch (cmd) {  // peer-to-peer, and the rest that work in either role
+    case kCmdDisconnect:
+      if (advertising_) setAdvertising(false);
+      disconnectLink();
+      return kStatusSuccess;
+    case kCmdAdvertise:
+      if (!w[0]) {
+        if (advertising_) setAdvertising(false);
+        return kStatusSuccess;
+      }
+      if (isLinked()) return kStatusSuccess;
+      return setAdvertising(true) ? kStatusSuccess : fail(0);
+    case kCmdStatus:
+      return status(w);
+    case kCmdOffer:
+      return offer(w);
+    case kCmdWithdraw: {
+      bool out;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        out = offerOut_;
+        offerOut_ = answered_ = false;
+      }
+      if (out && isLinked()) request(kFileAbort, {});
+      return kStatusSuccess;
+    }
+    case kCmdOfferGet:
+      return offerGet(w);
+    case kCmdAnswer:
+      return answerOffer(w);
+    case kCmdSend:
+      return sendAccepted(w);
+    case kCmdDataWrite:
+      return write(w);
+    case kCmdDataRead:
+      return read(w);
+    case kCmdDataClose:
+      if (w[0]) xferFailed_ = true;  // abandoned
+      return close();
+    default:
+      break;
   }
   if (server) {  // a peer is using this emulator as its server
     log("Busy: a peer is connected to this emulator");
@@ -319,6 +372,7 @@ uint8_t LinkCore::connectTo(const Peer& peer, std::vector<uint8_t>& w) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     peerName_.assign(f.payload.begin() + 3, f.payload.begin() + 3 + f.payload[2]);
+    helloDone_ = true;
   }
   log("Connected to " + peerName_);
   w[0] = static_cast<uint8_t>(peerName_.size());
@@ -368,6 +422,7 @@ uint8_t LinkCore::filePut(std::vector<uint8_t>& w) {
     return kStatusError;
   }
   xfer_ = Xfer::kPut;
+  routed_ = true;
   xferFailed_ = false;
   return kStatusSuccess;
 }
@@ -390,6 +445,7 @@ uint8_t LinkCore::fileGet(std::vector<uint8_t>& w) {
   answer(f.seq);
   w[0] = f.payload[1];  // kind
   xfer_ = Xfer::kGet;
+  routed_ = true;
   xferFailed_ = getEnded_ = false;
   getBuf_.clear();
   getPos_ = 0;
@@ -463,6 +519,88 @@ uint8_t LinkCore::close() {
   return ok ? kStatusSuccess : kStatusError;
 }
 
+// ---- peer-to-peer: the emulated PC-1500's BLADV/BLPUT/BLGET ----
+
+uint8_t LinkCore::status(std::vector<uint8_t>& w) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  uint8_t flags = 0;
+  if (linked_ && helloDone_) flags |= kStatusLinked;
+  if (advertising_ && !linked_) flags |= kStatusAdvertising;
+  if (offerIn_) flags |= kStatusOfferIn;
+  if (offerOut_ && answered_) flags |= kStatusAnswered | (accepted_ ? kStatusAccepted : 0);
+  std::string name = peerName_.substr(0, 16);
+  w[0] = flags;
+  w[1] = static_cast<uint8_t>(name.size());
+  std::copy(name.begin(), name.end(), w.begin() + 2);
+  return kStatusSuccess;
+}
+
+uint8_t LinkCore::offer(std::vector<uint8_t>& w) {
+  const uint8_t* a = &w[kFileArgs];
+  std::vector<uint8_t> p{a[0]};  // kind
+  putU32(p, static_cast<uint32_t>(a[2]) << 24 | a[3] << 16 | a[4] << 8 | a[5]);
+  std::vector<uint8_t> n = str8(nameFromSlot(w));
+  p.insert(p.end(), n.begin(), n.end());
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    offerOut_ = true;  // before sending: the answer may come back at once
+    answered_ = accepted_ = false;
+  }
+  int r = request(kFileOffer, p);
+  if (r == 0) return kStatusSuccess;
+  std::lock_guard<std::mutex> lock(mutex_);
+  offerOut_ = false;
+  w[0] = r > 0 ? static_cast<uint8_t>(r) : 0;
+  return kStatusError;
+}
+
+uint8_t LinkCore::offerGet(std::vector<uint8_t>& w) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!offerIn_) return kStatusError;
+  w[0] = 0;
+  w[1] = static_cast<uint8_t>(offerInName_.size());
+  std::copy(offerInName_.begin(), offerInName_.end(), w.begin() + 2);
+  uint8_t* a = &w[kFileArgs];
+  a[0] = offerInKind_;
+  a[1] = 0;
+  for (int i = 0; i < 4; i++) a[2 + i] = static_cast<uint8_t>(offerInSize_ >> (24 - 8 * i));
+  return kStatusSuccess;
+}
+
+// Answers the held offer; accepting opens the receiving transfer first (the
+// sender's FILE_DATA may follow the answer at once).
+uint8_t LinkCore::answerOffer(std::vector<uint8_t>& w) {
+  uint8_t accept = w[0] ? 1 : 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!offerIn_) return kStatusError;
+    offerIn_ = false;
+    if (accept) {
+      routed_ = w[1] != 0;
+      xferFailed_ = getEnded_ = false;
+      getBuf_.clear();
+      getPos_ = 0;
+      incoming_.clear();
+      xfer_ = Xfer::kGet;
+    }
+  }
+  int r = request(kFileAnswer, {accept});
+  if (r == 0) return kStatusSuccess;
+  xfer_ = Xfer::kNone;
+  w[0] = r > 0 ? static_cast<uint8_t>(r) : 0;
+  return kStatusError;
+}
+
+uint8_t LinkCore::sendAccepted(std::vector<uint8_t>& w) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!offerOut_ || !answered_ || !accepted_ || !linked_) return kStatusError;
+  offerOut_ = answered_ = false;
+  routed_ = w[0] != 0;
+  xferFailed_ = false;
+  xfer_ = Xfer::kPut;
+  return kStatusSuccess;
+}
+
 // ---- advertiser: this emulator as a peer's feature server ----
 
 bool LinkCore::setAdvertising(bool on) {
@@ -480,10 +618,10 @@ bool LinkCore::setAdvertising(bool on) {
 void LinkCore::serverLoop() {
   std::unique_lock<std::mutex> lock(mutex_);
   for (;;) {
-    cv_.wait(lock, [&] { return stopping_ || (asServer_ && !incoming_.empty()); });
+    cv_.wait(lock, [&] { return stopping_ || !toServe_.empty(); });
     if (stopping_) return;
-    Frame f = std::move(incoming_.front());
-    incoming_.pop_front();
+    Frame f = std::move(toServe_.front());
+    toServe_.pop_front();
     lock.unlock();
     serve(f);
     lock.lock();
@@ -501,8 +639,39 @@ void LinkCore::serve(const Frame& f) {
       }
       log("HELLO from " + peerName_);
       answer(f.seq);
-      if (request(kHello, hello()) != 0) log("Our HELLO wasn't answered");
+      if (request(kHello, hello()) != 0) return log("Our HELLO wasn't answered");
+      std::lock_guard<std::mutex> lock(mutex_);
+      helloDone_ = true;
       return;
+    }
+    case kFileOffer: {  // held for the emulated PC-1500's BLGET (sec.5)
+      if (p.size() < 6 || 6u + p[5] > p.size()) return answer(f.seq, kErrBadFrame);
+      std::string what;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!offerIn_ && xfer_ == Xfer::kNone) {
+          offerInKind_ = p[0];
+          offerInSize_ = getU32(&p[1]);
+          offerInName_.assign(p.begin() + 6, p.begin() + 6 + std::min<size_t>(p[5], kPathMax));
+          offerIn_ = true;
+          what = offerInName_.empty() ? std::string("a program") : offerInName_;
+        }
+      }
+      if (what.empty()) return answer(f.seq, kErrBusy);
+      log("Offered " + what + " by " + peerName_);
+      return answer(f.seq);
+    }
+    case kFileAnswer: {  // to our BLPUT's offer
+      bool ok;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ok = offerOut_ && !answered_ && !p.empty();
+        if (ok) {
+          accepted_ = p[0] == 1;
+          answered_ = true;
+        }
+      }
+      return answer(f.seq, ok ? 0 : kErrBadFrame);
     }
     case kBye:
       log("BYE");
@@ -562,6 +731,15 @@ void LinkCore::serve(const Frame& f) {
     case kFileAbort:
       if (putActive_) log("Save of " + putName_ + " abandoned");
       putActive_ = false;
+      {
+        bool held;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          held = offerIn_;
+          offerIn_ = false;  // the sender withdrew its offer
+        }
+        if (held) log("The offer was withdrawn");
+      }
       return answer(f.seq);
     case kFileGet:
       return serveFileGet(f);

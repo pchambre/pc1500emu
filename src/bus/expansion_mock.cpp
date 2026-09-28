@@ -337,6 +337,16 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandBleText:
     case kCommandBleFilePut:
     case kCommandBleFileGet:
+    case kCommandBleAdvertise:
+    case kCommandBleStatus:
+    case kCommandBleOffer:
+    case kCommandBleWithdraw:
+    case kCommandBleOfferGet:
+    case kCommandBleAnswer:
+    case kCommandBleSend:
+    case kCommandBleDataWrite:
+    case kCommandBleDataRead:
+    case kCommandBleDataClose:
       return bleCommand(cmd, window);
     case kCommandLogClear:
       return kStatusSuccess;
@@ -504,7 +514,7 @@ uint8_t ExpansionMock::openSdFileRead(std::vector<uint8_t>& window) {
 // not mirrored here either.
 uint8_t ExpansionMock::writeToSdFile(std::vector<uint8_t>& window) {
   if (auto ble = bleBackend(); ble && ble->transferOpen()) return ble->write(window);
-  if (bleXfer_ != BleXfer::kNone) return bleWrite(window);
+  if (bleXfer_ != BleXfer::kNone && bleRouted_) return bleWrite(window);
   if (fileStatus_ != kFileStatusOpenWrite || !openFile_.is_open()) return kStatusError;
   if (window.size() < static_cast<size_t>(kLengthPortOffset) + 2) return kStatusError;
   uint16_t dataLen = (static_cast<uint16_t>(window[kLengthPortOffset]) << 8) |
@@ -525,7 +535,7 @@ uint8_t ExpansionMock::writeToSdFile(std::vector<uint8_t>& window) {
 // full window[0..kMaxTransferLen-1], not confined to one 256-byte page).
 uint8_t ExpansionMock::readFromSdFile(std::vector<uint8_t>& window) {
   if (auto ble = bleBackend(); ble && ble->transferOpen()) return ble->read(window);
-  if (bleXfer_ != BleXfer::kNone) return bleRead(window);
+  if (bleXfer_ != BleXfer::kNone && bleRouted_) return bleRead(window);
   if (fileStatus_ != kFileStatusOpenRead || !openFile_.is_open()) return kStatusError;
   if (window.size() < static_cast<size_t>(kLengthPortOffset) + 2) return kStatusError;
   uint16_t requestLen = (static_cast<uint16_t>(window[kLengthPortOffset]) << 8) |
@@ -543,7 +553,7 @@ uint8_t ExpansionMock::readFromSdFile(std::vector<uint8_t>& window) {
 
 uint8_t ExpansionMock::closeSdFile(std::vector<uint8_t>& window) {
   if (auto ble = bleBackend(); ble && ble->transferOpen()) return ble->close();
-  if (bleXfer_ != BleXfer::kNone) return bleClose();
+  if (bleXfer_ != BleXfer::kNone && bleRouted_) return bleClose();
   if (!openFile_.is_open() || fileStatus_ == kFileStatusClosed) return kStatusError;
   openFile_.close();
   fileStatus_ = kFileStatusClosed;
@@ -592,6 +602,8 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
   if (auto ble = bleBackend()) return ble->command(cmd, window);  // a real link
   auto connected = [&](const std::string& name) {
     bleConnected_ = true;
+    bleLinkedName_ = name;
+    bleAdvertising_ = false;
     window[0] = static_cast<uint8_t>(name.size());
     std::copy(name.begin(), name.end(), window.begin() + 1);
     return kStatusSuccess;
@@ -628,6 +640,8 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
     }
     case kCommandBleDisconnect:
       bleConnected_ = false;
+      bleAdvertising_ = false;
+      bleOfferOut_ = bleOfferIn_ = false;
       bleXfer_ = BleXfer::kNone;
       return kStatusSuccess;
     case kCommandBleText: {
@@ -645,6 +659,8 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       bleXferName_ = name;
       bleXferData_.clear();
       bleXferFailed_ = false;
+      bleRouted_ = true;
+      bleXferP2p_ = false;
       return kStatusSuccess;
     }
     case kCommandBleFileGet: {
@@ -655,9 +671,91 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       bleXferData_ = it->second;
       bleXferPos_ = 0;
       bleXferFailed_ = false;
+      bleRouted_ = true;
       window[0] = 0xFF;  // kind unknown: this store doesn't record it
       return kStatusSuccess;
     }
+
+    // ---- peer-to-peer (2026-09-28): the peer plays another PC-1500 ----
+    case kCommandBleAdvertise:
+      bleAdvertising_ = window[0] != 0 && !bleConnected_;
+      return kStatusSuccess;
+    case kCommandBleStatus: {
+      // Each check is a POLL of the waiting keyword: the peer's countdowns.
+      if (bleAdvertising_ && bleConnectAfter_ >= 0 && bleConnectAfter_-- == 0) {
+        bleConnected_ = true;
+        bleLinkedName_ = bleConnectName_;
+        bleAdvertising_ = false;
+      }
+      if (bleOfferOut_ && !bleAnswered_ && bleAnswerAfter_ >= 0 && bleAnswerAfter_-- == 0) {
+        bleAnswered_ = true;
+        bleAccepted_ = bleAnswerAccept_;
+      }
+      uint8_t flags = 0;
+      if (bleConnected_) flags |= kBleStatusLinked;
+      if (bleAdvertising_) flags |= kBleStatusAdvertising;
+      if (bleOfferIn_ && bleConnected_) flags |= kBleStatusOfferIn;
+      if (bleOfferOut_ && bleAnswered_) flags |= kBleStatusAnswered | (bleAccepted_ ? kBleStatusAccepted : 0);
+      window[0] = flags;
+      window[1] = static_cast<uint8_t>(bleLinkedName_.size());
+      std::copy(bleLinkedName_.begin(), bleLinkedName_.end(), window.begin() + 2);
+      return kStatusSuccess;
+    }
+    case kCommandBleOffer: {
+      if (!bleConnected_) return fail(0);
+      const uint8_t* a = &window[kBleFileArgs];
+      bleReceived_ = BleOffer{a[0], static_cast<uint32_t>(a[2] << 24 | a[3] << 16 | a[4] << 8 | a[5]),
+                              bleNameFromSlot(window), {}};
+      bleOfferOut_ = true;
+      bleAnswered_ = bleAccepted_ = false;
+      bleWithdrawn_ = false;
+      return kStatusSuccess;
+    }
+    case kCommandBleWithdraw:
+      if (bleOfferOut_) bleWithdrawn_ = true;
+      bleOfferOut_ = bleAnswered_ = false;
+      return kStatusSuccess;
+    case kCommandBleOfferGet: {
+      if (!bleOfferIn_) return kStatusError;
+      const BleOffer& o = bleOfferInFile_;
+      window[0] = 0;
+      window[1] = static_cast<uint8_t>(o.name.size());
+      std::copy(o.name.begin(), o.name.end(), window.begin() + 2);
+      uint8_t* a = &window[kBleFileArgs];
+      a[0] = o.kind;
+      a[1] = 0;
+      for (int i = 0; i < 4; i++) a[2 + i] = static_cast<uint8_t>(o.size >> (24 - 8 * i));
+      return kStatusSuccess;
+    }
+    case kCommandBleAnswer:
+      if (!bleOfferIn_ || !bleConnected_) return fail(0);
+      bleOfferIn_ = false;
+      if (!window[0]) {
+        bleRefused_ = true;
+        return kStatusSuccess;
+      }
+      bleXfer_ = BleXfer::kGet;
+      bleXferData_ = bleOfferInFile_.data;
+      bleXferPos_ = 0;
+      bleXferFailed_ = false;
+      bleRouted_ = window[1] != 0;
+      return kStatusSuccess;
+    case kCommandBleSend:
+      if (!bleOfferOut_ || !bleAnswered_ || !bleAccepted_ || !bleConnected_) return kStatusError;
+      bleOfferOut_ = bleAnswered_ = false;
+      bleXfer_ = BleXfer::kPut;
+      bleXferData_.clear();
+      bleXferFailed_ = false;
+      bleXferP2p_ = true;
+      bleRouted_ = window[0] != 0;
+      return kStatusSuccess;
+    case kCommandBleDataWrite:
+      return bleWrite(window);
+    case kCommandBleDataRead:
+      return bleRead(window);
+    case kCommandBleDataClose:
+      if (window[0]) bleXferFailed_ = true;  // abandoned
+      return bleClose();
     default:
       return kStatusNotImplemented;
   }
@@ -685,8 +783,10 @@ uint8_t ExpansionMock::bleRead(std::vector<uint8_t>& window) {
 
 // SUCCESS only if the whole file moved: a failed save leaves nothing behind.
 uint8_t ExpansionMock::bleClose() {
-  bool ok = !bleXferFailed_;
-  if (bleXfer_ == BleXfer::kPut && ok) bleFiles_[bleXferName_] = bleXferData_;
+  bool ok = !bleXferFailed_ && bleXfer_ != BleXfer::kNone;
+  if (bleXfer_ == BleXfer::kPut && ok && bleXferP2p_) bleReceived_.data = bleXferData_;  // BLPUT's
+  else if (bleXfer_ == BleXfer::kPut && ok) bleFiles_[bleXferName_] = bleXferData_;
+  bleXferP2p_ = false;
   if (bleXfer_ == BleXfer::kGet && bleXferPos_ != bleXferData_.size()) ok = false;
   bleXfer_ = BleXfer::kNone;
   return ok ? kStatusSuccess : kStatusError;
@@ -1224,9 +1324,10 @@ uint8_t ExpansionMock::romCopyFinish(std::vector<uint8_t>& window) {
 }
 
 uint8_t ExpansionMock::romGetMode(std::vector<uint8_t>& window) {
-  if (window.size() < 2) return kStatusError;
+  if (window.size() < 3) return kStatusError;
   window[0] = remapActive_ ? 1 : 0;
   window[1] = (remapActive_ && romStagedVerified_) ? 1 : 0;
+  window[2] = config_[kConfigAutostage] ? 1 : 0;  // MCONF AUTOSTAGE: the boot hook's go-ahead
   return kStatusSuccess;
 }
 

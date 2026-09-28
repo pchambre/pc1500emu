@@ -2,6 +2,7 @@
 // connects, the other advertises and serves, as a real PC-1500 and this
 // emulator would over Bluetooth. Driven through the same windows the
 // firmware's keywords.c builds (RP2350/pc_exp.h's EXP_COMMAND_BLE_*).
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -9,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ble_link_core.h"
@@ -267,11 +269,127 @@ void testPeerGoesQuiet() {
   CHECK(!fs::exists(p.dir[1] / "Q"));
 }
 
+// Peer-to-peer (2026-09-28, BLE_PROTOCOL.md "Peer-to-peer files"), both
+// cores playing PC-1500s: BLADV, then offers and answers each way.
+constexpr uint8_t kLinked = 0x01, kAdvertising = 0x02, kOfferIn = 0x04, kAnswered = 0x08, kAccepted = 0x10;
+
+// STATUS's flags once all of `flags` are set (offers arrive on the other
+// core's server thread), or whatever they are after a second.
+uint8_t waitStatus(LinkCore& core, uint8_t flags, bool clear = false) {
+  uint8_t s = 0;
+  for (int i = 0; i < 100; i++) {
+    auto w = window();
+    core.command(0x48, w);
+    s = w[0];
+    if (clear ? (s & flags) == 0 : (s & flags) == flags) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return s;
+}
+
+uint8_t offerFrom(LinkCore& core, const std::string& name, uint8_t kind, uint32_t size, uint8_t* err = nullptr) {
+  auto w = window();
+  nameSlot(w, name);
+  w[42] = kind;
+  for (int i = 0; i < 4; i++) w[44 + i] = static_cast<uint8_t>(size >> (24 - 8 * i));
+  uint8_t s = core.command(0x49, w);
+  if (err) *err = w[0];
+  return s;
+}
+
+uint8_t answerWith(LinkCore& core, bool accept, bool routed) {
+  auto w = window();
+  w[0] = accept;
+  w[1] = routed;
+  return core.command(0x4C, w);
+}
+
+void testPeerToPeer() {
+  Pair p("ble_core_p2p");
+  auto w = window();
+  w[0] = 1;
+  CHECK(p.server->command(0x47, w) == kOk);  // BLADV
+  CHECK(waitStatus(*p.server, kAdvertising) & kAdvertising);
+  w = window();
+  nameSlot(w, "PC-1500 EMU");
+  CHECK(p.pc->command(0x42, w) == kOk);  // the other PC-1500's BLCON
+  CHECK(waitStatus(*p.server, kLinked) & kLinked);
+  w = window();
+  p.server->command(0x48, w);
+  CHECK(std::string(w.begin() + 2, w.begin() + 2 + w[1]) == "PC-1500");
+  CHECK(!(w[0] & kAdvertising));
+
+  // BLPUT SD on one side, BLGET "name" on the other: unrouted both ends.
+  std::vector<uint8_t> data(700);
+  for (size_t i = 0; i < data.size(); i++) data[i] = static_cast<uint8_t>(i * 5 + 1);
+  CHECK(offerFrom(*p.pc, "F.BIN", 1, 700) == kOk);
+  CHECK(waitStatus(*p.server, kOfferIn) & kOfferIn);
+  auto gw = window();
+  CHECK(p.server->command(0x4B, gw) == kOk);  // OFFER_GET
+  CHECK(std::string(gw.begin() + 2, gw.begin() + 2 + gw[1]) == "F.BIN");
+  CHECK(gw[42] == 1 && gw[46] == 0x02 && gw[47] == 0xBC);  // kind M, 700 bytes
+  CHECK(answerWith(*p.server, true, false) == kOk);
+  CHECK((waitStatus(*p.pc, kAnswered | kAccepted) & (kAnswered | kAccepted)) == (kAnswered | kAccepted));
+  w = window();
+  CHECK(p.pc->command(0x4D, w) == kOk);  // SEND, unrouted
+  CHECK(!p.pc->transferOpen() && !p.server->transferOpen());
+  uint8_t sentClose = 0;
+  std::thread sender([&] {  // each FILE_DATA waits for the receiver's ACK
+    auto dw = window();
+    std::copy(data.begin(), data.end(), dw.begin());
+    dw[kLengthPort] = static_cast<uint8_t>(data.size() >> 8);
+    dw[kLengthPort + 1] = static_cast<uint8_t>(data.size());
+    p.pc->command(0x4E, dw);
+    auto cw = window();
+    sentClose = p.pc->command(0x50, cw);
+  });
+  std::vector<uint8_t> got;
+  for (;;) {
+    auto rw = window();
+    rw[kLengthPort] = 0x04;
+    if (p.server->command(0x4F, rw) != kOk) break;
+    size_t n = static_cast<size_t>(rw[kLengthPort] << 8 | rw[kLengthPort + 1]);
+    if (n == 0) break;
+    got.insert(got.end(), rw.begin(), rw.begin() + static_cast<long>(n));
+  }
+  auto cw = window();
+  CHECK(p.server->command(0x50, cw) == kOk);
+  sender.join();
+  CHECK(sentClose == kOk);
+  CHECK(got == data);
+
+  // The other way, refused.
+  CHECK(offerFrom(*p.server, "", 0, 0xFFFFFFFFu) == kOk);
+  CHECK(waitStatus(*p.pc, kOfferIn) & kOfferIn);
+  CHECK(answerWith(*p.pc, false, true) == kOk);
+  uint8_t s = waitStatus(*p.server, kAnswered);
+  CHECK((s & kAnswered) && !(s & kAccepted));
+  w = window();
+  CHECK(p.server->command(0x4D, w) == kError);  // nothing to send
+
+  // Withdrawn while held; and one held offer at a time.
+  CHECK(offerFrom(*p.pc, "W", 0, 1) == kOk);
+  CHECK(waitStatus(*p.server, kOfferIn) & kOfferIn);
+  w = window();
+  CHECK(p.pc->command(0x4A, w) == kOk);  // WITHDRAW
+  CHECK(!(waitStatus(*p.server, kOfferIn, true) & kOfferIn));
+  CHECK(offerFrom(*p.pc, "A", 0, 1) == kOk);
+  CHECK(waitStatus(*p.server, kOfferIn) & kOfferIn);
+  uint8_t err = 0;
+  CHECK(offerFrom(*p.pc, "B", 0, 1, &err) == kError && err == 6);  // BUSY
+
+  // A dropped link drops the offers.
+  w = window();
+  CHECK(p.pc->command(0x43, w) == kOk);
+  CHECK(!(waitStatus(*p.server, kOfferIn | kLinked, true) & (kOfferIn | kLinked)));
+}
+
 int main() {
   testScanConnectDisconnect();
   testText();
   testSaveLoad();
   testPeerGoesQuiet();
+  testPeerToPeer();
   if (g_failures == 0) {
     std::printf("All tests passed.\n");
     return 0;
