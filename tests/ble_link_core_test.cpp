@@ -384,12 +384,70 @@ void testPeerToPeer() {
   CHECK(!(waitStatus(*p.server, kOfferIn | kLinked, true) & (kOfferIn | kLinked)));
 }
 
+// Peer messaging (2026-09-29, BLE_PROTOCOL.md "Peer messaging"): MSGs into
+// the other side's 8-message inbox, in either role.
+uint8_t msgSend(LinkCore& core, const std::vector<uint8_t>& chunks, uint8_t* err = nullptr) {
+  auto w = window();
+  w[0] = static_cast<uint8_t>(chunks.size() >> 8);
+  w[1] = static_cast<uint8_t>(chunks.size());
+  std::copy(chunks.begin(), chunks.end(), w.begin() + 2);
+  uint8_t s = core.command(0x51, w);
+  if (err) *err = w[0];
+  return s;
+}
+
+std::pair<int, int> msgCount(LinkCore& core) {  // waiting, linked
+  auto w = window();
+  core.command(0x54, w);
+  return {w[0], w[1]};
+}
+
+void testMessages() {
+  Pair p("ble_core_msg");
+  p.server->setAdvertising(true);
+  auto w = window();
+  nameSlot(w, "PC-1500 EMU");
+  CHECK(p.pc->command(0x42, w) == kOk);
+  CHECK(waitStatus(*p.server, kLinked) & kLinked);
+
+  const std::vector<uint8_t> hi = {'S', 2, 'H', 'I'};
+  CHECK(msgSend(*p.pc, hi) == kOk);  // ACKed once stored
+  CHECK(msgCount(*p.server) == std::make_pair(1, 1));
+  w = window();
+  CHECK(p.server->command(0x53, w) == kOk);  // MSG_RECV
+  CHECK(w[0] == 0 && w[1] == 4 && std::vector<uint8_t>(w.begin() + 2, w.begin() + 6) == hi);
+  w = window();  // MSG_WAIT 0 s: an empty inbox is "time's up" at once
+  CHECK(p.server->command(0x52, w) == kOk);
+  CHECK(p.server->command(0x53, w) == kError && w[0] == 1);
+  w = window();
+  w[0] = w[1] = 0xFF;  // for ever: "keep waiting"
+  p.server->command(0x52, w);
+  CHECK(p.server->command(0x53, w) == kError && w[0] == 0);
+
+  // The other way, up to a full inbox.
+  for (int i = 0; i < 8; i++) CHECK(msgSend(*p.server, hi) == kOk);
+  uint8_t err = 0;
+  CHECK(msgSend(*p.server, hi, &err) == kError && err == 6);  // BUSY
+  CHECK(msgCount(*p.pc).first == 8);
+  CHECK(msgSend(*p.server, {'X'}, &err) == kError && err == 1);  // BAD_FRAME
+
+  // A new link empties the inbox; a dropped one keeps it.
+  w = window();
+  CHECK(p.pc->command(0x43, w) == kOk);
+  CHECK(msgCount(*p.pc) == std::make_pair(8, 0));
+  w = window();
+  nameSlot(w, "PC-1500 EMU");
+  CHECK(p.pc->command(0x42, w) == kOk);
+  CHECK(msgCount(*p.pc) == std::make_pair(0, 1));
+}
+
 int main() {
   testScanConnectDisconnect();
   testText();
   testSaveLoad();
   testPeerGoesQuiet();
   testPeerToPeer();
+  testMessages();
   if (g_failures == 0) {
     std::printf("All tests passed.\n");
     return 0;

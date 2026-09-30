@@ -3820,12 +3820,21 @@ void testBootHookStagesRomThenSkipsOnReset() {
   CHECK(mock.romCopyBeginCount() == 1);  // verified copy already there -- skipped
   CHECK(mock.remapActive());
 
+  // STAGE RAM with a copy already staged refreshes it (2026-09-29), from
+  // the ROM region it's replacing: an out-of-date byte (as after a firmware
+  // update) is put right. The image's last byte is the end of
+  // STAGE_IS_STAGED, which only the boot hook runs.
+  size_t last = expRom.size() - 1;
+  m->bus.expansionMock().setSramByte(last, static_cast<uint8_t>(expRom[last] ^ 0xFF));
   tapKey(*m, pc1500::Key::Cl);
   typeText(*m, "STAGE RAM");
   tapKey(*m, pc1500::Key::Ent);
-  CHECK(waitForIdle(*m));                // STAGE_SHOW_OK's own KEYSCAN_WAIT
+  CHECK(waitForIdle(*m, 200'000'000));   // STAGE_SHOW_OK's own KEYSCAN_WAIT
   CHECK(m->bus.readME0(kErlAbs) == 0);
-  CHECK(mock.romCopyBeginCount() == 1);  // early exit, no copy
+  CHECK(mock.romCopyBeginCount() == 2);  // copied again
+  CHECK(mock.remapActive());
+  CHECK(mock.romStagedVerified());
+  CHECK(mock.sramByte(last) == expRom[last]);
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 }
@@ -4410,6 +4419,136 @@ void testSdsaveBareSavesAsLastLoaded() {
   CHECK(f->run("BLSAVE") == 1);  // BLSAVE still needs a name
 }
 
+// Peer messaging (2026-09-29, BLE_PROTOCOL.md "Peer messaging"): BLSEND
+// sends one message of value chunks, BLRECV takes the oldest into
+// variables, and the function BLSTAT counts what's waiting. The fake peer
+// plays the other PC-1500. Values are checked by BLPRINTing them to it.
+void testBleMessaging() {
+  auto f = bleFixture("testBleMessaging");
+  if (!f) return;
+  auto said = [&](const std::string& expr) {  // what BLPRINT expr shows the peer
+    f->mock->clearBleText();
+    CHECK(f->run("BLPRINT " + expr) == 0);
+    std::string t = f->mock->bleText();
+    return t.empty() ? t : t.substr(0, t.size() - 1);  // without the CR
+  };
+  CHECK(f->run("BLSEND 1") == 40);  // no link
+  // BLSTAT is a function, like MEM (2026-09-29).
+  CHECK(f->run("S=BLSTAT") == 0);
+  f->connect();
+  CHECK(said("S") == "-1");  // no link then, nothing waiting
+  CHECK(said("BLSTAT") == "0");  // evaluated inside another keyword
+
+  // BLSEND: any expressions, as one message of chunks.
+  CHECK(f->run("A=5") == 0);
+  CHECK(f->run("B$=\"HI\"") == 0);
+  CHECK(f->run("BLSEND A*2,B$+\"!\",3") == 0);
+  CHECK(f->mock->bleMessagesSent().size() == 1);
+  std::vector<uint8_t> msg = f->mock->bleMessagesSent().back();
+  CHECK(msg.size() == 9 + 5 + 9);
+  if (msg.size() != 23) return;
+  CHECK(msg[0] == 'N' && msg[9] == 'S' && msg[10] == 3 && msg[14] == 'N');
+  CHECK(std::string(msg.begin() + 11, msg.begin() + 14) == "HI!");
+
+  // BLRECV: back into variables, in order.
+  f->mock->bleMessageToUs(msg);
+  CHECK(f->run("S=BLSTAT*10+1") == 0);
+  CHECK(said("S") == "11");
+  // In a running program too (IF ... THEN LET: LET is needed after THEN).
+  CHECK(f->typeProgram("10 T=0:IF BLSTAT>0 THEN LET T=BLSTAT+4\n20 END\n"));
+  f->key(pc1500::Key::Mode);  // PRO -> RUN mode; RUN in PRO mode is ERROR 26
+  CHECK(f->run("RUN") == 0);
+  CHECK(said("T") == "5");
+  // Alone at the prompt it's shown, as MEM is. The number goes straight
+  // to the LCD, which 7BB0H doesn't hold (MEM leaves only its token there
+  // too), so only "no error" is checked here.
+  CHECK(f->run("BLSTAT") == 0);
+  CHECK(f->run("BLRECV X,Y$,Z") == 0);
+  CHECK(said("X;Y$;Z") == "10HI!3");
+  // Fewer values than variables: the rest become 0 / blank.
+  std::vector<uint8_t> number(msg.begin(), msg.begin() + 9), text(msg.begin() + 9, msg.begin() + 14);
+  CHECK(f->run("Q$=\"X\"") == 0);
+  CHECK(f->run("R=9") == 0);
+  f->mock->bleMessageToUs(number);
+  CHECK(f->run("BLRECV P,Q$,R") == 0);
+  CHECK(said("P;\"/\";Q$;\"/\";R") == "10//0");  // (no | on the PC-1500's keyboard)
+  // A string for a number: ERROR 42.
+  f->mock->bleMessageToUs(text);
+  CHECK(f->run("BLRECV P") == 42);
+
+  // Waiting: a message that only arrives a few polls later...
+  f->mock->bleMessageToUs(number, 5);
+  CHECK(f->run("BLRECV V") == 0);
+  CHECK(said("V") == "10");
+  // ...#0 with nothing waiting leaves the variable alone...
+  CHECK(f->run("V=7") == 0);
+  CHECK(f->run("BLRECV #0,V") == 0);
+  CHECK(said("V") == "7");
+  // ...and with nothing coming, BLRECV waits until BREAK, and leaves it too.
+  CHECK(f->runThenBreak("BLRECV V") == 0);
+  CHECK(said("V") == "7");
+
+  // The peer's inbox is full: BLSEND waits and gets through, or BREAK.
+  f->mock->setBlePeerInboxFullFor(3);
+  CHECK(f->run("BLSEND 1") == 0);
+  CHECK(f->mock->bleMessagesSent().size() == 2);
+  f->mock->setBlePeerInboxFullFor(1000000000);
+  CHECK(f->runThenBreak("BLSEND 1") == 0);
+  CHECK(f->mock->bleMessagesSent().size() == 2);
+  f->mock->setBlePeerInboxFullFor(0);
+
+  int bare = f->run("BLSEND");
+  CHECK(bare == 1);
+  if (bare != 1) {
+    std::printf("  bare BLSEND: ERL %d, sent %zu; DISP_BUFFER:", bare, f->mock->bleMessagesSent().size());
+    for (uint16_t a = 0x7BB0; a < 0x7BC0; a++) std::printf(" %02X", f->m->bus.readME0(a));
+    std::printf("\n");
+  }
+  CHECK(f->run("BLRECV") == 1);
+  // Too long for one message (27 numbers x 9 bytes > 240): ERROR 40.
+  std::string many = "BLSEND A";
+  for (int i = 1; i < 27; i++) many += ",A";
+  CHECK(f->run(many) == 40);
+  CHECK(f->mock->bleMessagesSent().size() == 2);
+}
+
+// SDEOF(n) (2026-09-30): a function of one argument (code E170, ABS's low
+// byte), evaluated by BASIC before the call -- 1 once channel n has nothing
+// left for SDINPUT#, so a read loop can stop at the end of the file. Values
+// are checked by BLPRINTing them to the fake peer.
+void testSdeofEndsReadLoop() {
+  auto f = bleFixture("testSdeofEndsReadLoop");
+  if (!f) return;
+  auto said = [&](const std::string& expr) {
+    f->mock->clearBleText();
+    CHECK(f->run("BLPRINT " + expr) == 0);
+    std::string t = f->mock->bleText();
+    return t.empty() ? t : t.substr(0, t.size() - 1);
+  };
+  f->connect();
+  CHECK(f->run("SDOPEN \"D.DAT\" AS 1") == 0);
+  CHECK(f->run("SDPRINT #1,10,20,30") == 0);
+  CHECK(said("SDEOF(1)") == "0");  // inside another keyword
+  CHECK(f->run("C=1") == 0);
+  CHECK(f->run("E=SDEOF(C)+5") == 0);  // an expression argument, in an expression
+  if (said("E") != "5") {
+    CHECK(false);
+    return;  // a broken SDEOF would make the read loop below endless
+  }
+
+  CHECK(f->typeProgram("10 N=0:S=0\n20 IF SDEOF(1) THEN 50\n30 SDINPUT #1,X\n40 N=N+1:S=S+X:GOTO 20\n50 END\n"));
+  f->key(pc1500::Key::Mode);  // PRO -> RUN mode
+  CHECK(f->run("RUN") == 0);
+  CHECK(said("N;\"/\";S") == "3/60");  // read all three, then stopped
+  CHECK(said("SDEOF(1)") == "1");
+
+  // Errors come back through UH, as the evaluator expects.
+  CHECK(f->run("E=SDEOF(2)") == 40);  // not open
+  CHECK(f->run("E=SDEOF(17)") == 1);  // not a channel
+  CHECK(f->run("E=SDEOF(0)") == 1);
+  CHECK(f->run("SDCLOSE ALL") == 0);
+}
+
 // Peer-to-peer (2026-09-28, BLE_PROTOCOL.md "Peer-to-peer files"): the fake
 // peer plays the other PC-1500. Its waits count STATUS checks, one per POLL.
 
@@ -4537,6 +4676,8 @@ int main() {
   testBleAdvertiseWaitsForPeer();
   testBlePutToPeer();
   testBleGetFromPeer();
+  testBleMessaging();
+  testSdeofEndsReadLoop();
   testBlePrintText();
   testBleListMatchesDetokenizer();
   testBleSaveLoad();

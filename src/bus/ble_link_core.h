@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -165,6 +166,11 @@ class LinkCore : public BleBackend {
   uint32_t offerInSize_ = 0;
   std::string offerInName_;
   bool offerOut_ = false, answered_ = false, accepted_ = false;
+
+  // peer messaging (2026-09-29): up to 8 MSGs, oldest first, for BLRECV
+  std::deque<std::vector<uint8_t>> inbox_;
+  bool recvHasDeadline_ = false;
+  std::chrono::steady_clock::time_point recvDeadline_;
 
   // a transfer in progress (a routed one owns WRITE/READ/CLOSE_SD_FILE)
   Xfer xfer_ = Xfer::kNone;

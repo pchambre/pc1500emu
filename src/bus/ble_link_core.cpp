@@ -17,6 +17,8 @@ namespace {
 constexpr uint8_t kHello = 0x01, kBye = 0x02, kText = 0x10;
 constexpr uint8_t kFilePut = 0x20, kFileData = 0x21, kFileEnd = 0x22, kFileGet = 0x23, kFileAbort = 0x24;
 constexpr uint8_t kFileOffer = 0x25, kFileAnswer = 0x26;  // peer-to-peer (2026-09-28)
+constexpr uint8_t kMsg = 0x30;                             // peer messaging (2026-09-29)
+constexpr size_t kMsgMax = 240, kInboxMax = 8;             // EXP_BLE_MSG_MAX, EXP_BLE_MSG_INBOX
 constexpr uint8_t kAck = 0x7E, kErr = 0x7F;
 constexpr uint8_t kErrBadFrame = 1, kErrUnsupported = 2, kErrNotFound = 3, kErrExists = 4, kErrIo = 5,
                   kErrBusy = 6, kErrAborted = 7;
@@ -30,6 +32,7 @@ constexpr uint8_t kCmdScan = 0x40, kCmdConnect = 0x41, kCmdConnectName = 0x42, k
 constexpr uint8_t kCmdAdvertise = 0x47, kCmdStatus = 0x48, kCmdOffer = 0x49, kCmdWithdraw = 0x4A,
                   kCmdOfferGet = 0x4B, kCmdAnswer = 0x4C, kCmdSend = 0x4D, kCmdDataWrite = 0x4E,
                   kCmdDataRead = 0x4F, kCmdDataClose = 0x50;
+constexpr uint8_t kCmdMsgSend = 0x51, kCmdMsgWait = 0x52, kCmdMsgRecv = 0x53, kCmdMsgCount = 0x54;
 // EXP_BLE_STATUS_*
 constexpr uint8_t kStatusLinked = 0x01, kStatusAdvertising = 0x02, kStatusOfferIn = 0x04, kStatusAnswered = 0x08,
                   kStatusAccepted = 0x10;
@@ -75,6 +78,19 @@ bool plainName(const std::string& n) {
   return true;
 }
 
+// A MSG's payload: whole value chunks ('N' + 8 bytes, 'S' + length +
+// characters), at least one.
+bool validChunks(const std::vector<uint8_t>& p) {
+  size_t i = 0;
+  if (p.empty()) return false;
+  while (i < p.size()) {
+    if (p[i] == 'N') i += 9;
+    else if (p[i] == 'S' && i + 1 < p.size()) i += 2 + p[i + 1];
+    else return false;
+  }
+  return i == p.size();
+}
+
 void writeText(std::vector<uint8_t>& w, size_t at, const std::string& text, size_t len) {
   for (size_t i = 0; i < len; i++) w[at + i] = i < text.size() ? static_cast<uint8_t>(text[i]) : ' ';
 }
@@ -115,7 +131,8 @@ void LinkCore::onFrame(const std::vector<uint8_t>& f) {
       answerSeq_ = f[1];
       answerCode_ = f.size() > 4 ? f[4] : 0;
       answerReady_ = true;
-    } else if (f[0] == kFileOffer || f[0] == kFileAnswer || (f[0] == kFileAbort && xfer_ == Xfer::kNone)) {
+    } else if (f[0] == kFileOffer || f[0] == kFileAnswer || f[0] == kMsg ||
+               (f[0] == kFileAbort && xfer_ == Xfer::kNone)) {
       toServe_.push_back(std::move(frame));  // may come while no command runs, in either role
     } else if (xfer_ != Xfer::kNone || !asServer_) {
       incoming_.push_back(std::move(frame));  // a transfer's, or the connector's command's
@@ -137,6 +154,7 @@ void LinkCore::onLink(bool connected, bool asAdvertiser) {
     toServe_.clear();
     helloDone_ = false;
     offerIn_ = offerOut_ = answered_ = false;  // sec.5: a dropped link drops them
+    if (connected) inbox_.clear();             // a new link empties the inbox; a drop doesn't
     if (!connected) {
       peerName_.clear();
       putActive_ = false;
@@ -286,6 +304,39 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
     case kCmdDataClose:
       if (w[0]) xferFailed_ = true;  // abandoned
       return close();
+    case kCmdMsgSend: {  // BLSEND: SUCCESS once the peer stored it
+      size_t len = (static_cast<size_t>(w[0]) << 8) | w[1];
+      if (len == 0 || len > kMsgMax) return fail(kErrBadFrame);
+      int r = request(kMsg, std::vector<uint8_t>(w.begin() + 2, w.begin() + 2 + static_cast<long>(len)));
+      return r == 0 ? kStatusSuccess : fail(r);
+    }
+    case kCmdMsgWait: {
+      uint16_t s = static_cast<uint16_t>(w[0] << 8 | w[1]);
+      std::lock_guard<std::mutex> lock(mutex_);
+      recvHasDeadline_ = s != 0xFFFF;
+      recvDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(s);
+      return kStatusSuccess;
+    }
+    case kCmdMsgRecv: {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (inbox_.empty()) {
+        if (recvHasDeadline_ && std::chrono::steady_clock::now() >= recvDeadline_) w[0] = 1;
+        else w[0] = (linked_ && helloDone_) ? 0 : 2;
+        return kStatusError;
+      }
+      const std::vector<uint8_t>& m = inbox_.front();
+      w[0] = static_cast<uint8_t>(m.size() >> 8);
+      w[1] = static_cast<uint8_t>(m.size());
+      std::copy(m.begin(), m.end(), w.begin() + 2);
+      inbox_.pop_front();
+      return kStatusSuccess;
+    }
+    case kCmdMsgCount: {
+      std::lock_guard<std::mutex> lock(mutex_);
+      w[0] = static_cast<uint8_t>(inbox_.size());
+      w[1] = (linked_ && helloDone_) ? 1 : 0;
+      return kStatusSuccess;
+    }
     default:
       break;
   }
@@ -660,6 +711,18 @@ void LinkCore::serve(const Frame& f) {
       if (what.empty()) return answer(f.seq, kErrBusy);
       log("Offered " + what + " by " + peerName_);
       return answer(f.seq);
+    }
+    case kMsg: {  // into the inbox for the emulated PC-1500's BLRECV
+      if (p.size() > kMsgMax || !validChunks(p)) return answer(f.seq, kErrBadFrame);
+      bool stored = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (inbox_.size() < kInboxMax) {
+          inbox_.push_back(p);
+          stored = true;
+        }
+      }
+      return answer(f.seq, stored ? 0 : kErrBusy);
     }
     case kFileAnswer: {  // to our BLPUT's offer
       bool ok;

@@ -214,6 +214,15 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       return readSdValue(window);
     case kCommandSdSkipValues:
       return skipSdValues(window);
+    case kCommandSdChannelEof: {  // nothing left past SDINPUT#'s own position
+      uint8_t channel = window[0];
+      if (channel < 1 || channel > kMaxSdChannels || !channels_[channel - 1].isOpen) return kStatusError;
+      SdChannel& ch = channels_[channel - 1];
+      ch.file.clear();
+      ch.file.seekg(0, std::ios::end);
+      window[0] = static_cast<uint32_t>(ch.file.tellg()) <= ch.readPos ? 1 : 0;
+      return kStatusSuccess;
+    }
     case kCommandValidateSdName:
       return validateAndFoldSdName(window);
     case kCommandRomFromMcu:
@@ -266,6 +275,15 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       if (window.size() < 2048) return kStatusError;
       kwWindow_ = &window;
       return kw_command(cmd, window.data(), &ExpansionMock::runKeywordCommand, this);
+#else
+      return kStatusNotImplemented;
+#endif
+    case kCommandFnBlstat:  // keywords as BASIC functions (2026-09-29): BLSTAT, SDEOF(n)
+    case kCommandFnSdeof:
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+      if (window.size() < 2048) return kStatusError;
+      kwWindow_ = &window;
+      return kw_function(cmd, window.data(), &ExpansionMock::runKeywordCommand, this);
 #else
       return kStatusNotImplemented;
 #endif
@@ -347,6 +365,10 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandBleDataWrite:
     case kCommandBleDataRead:
     case kCommandBleDataClose:
+    case kCommandBleMsgSend:
+    case kCommandBleMsgWait:
+    case kCommandBleMsgRecv:
+    case kCommandBleMsgCount:
       return bleCommand(cmd, window);
     case kCommandLogClear:
       return kStatusSuccess;
@@ -609,6 +631,7 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
   auto connected = [&](const std::string& name) {
     bleConnected_ = true;
     bleLinkedName_ = name;
+    bleInbox_.clear();  // a new link empties the inbox (BLE_PROTOCOL.md)
     bleAdvertising_ = false;
     window[0] = static_cast<uint8_t>(name.size());
     std::copy(name.begin(), name.end(), window.begin() + 1);
@@ -692,6 +715,7 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
         bleConnected_ = true;
         bleLinkedName_ = bleConnectName_;
         bleAdvertising_ = false;
+        bleInbox_.clear();
       }
       if (bleOfferOut_ && !bleAnswered_ && bleAnswerAfter_ >= 0 && bleAnswerAfter_-- == 0) {
         bleAnswered_ = true;
@@ -762,8 +786,55 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
     case kCommandBleDataClose:
       if (window[0]) bleXferFailed_ = true;  // abandoned
       return bleClose();
+
+    // ---- peer messaging (2026-09-29) ----
+    case kCommandBleMsgSend: {
+      if (!bleConnected_) return fail(0);
+      if (bleBusyFor_ > 0) {
+        bleBusyFor_--;
+        return fail(6);  // ERR BUSY: its inbox is full
+      }
+      size_t len = (static_cast<size_t>(window[0]) << 8) | window[1];
+      bleSent_.emplace_back(window.begin() + 2, window.begin() + 2 + static_cast<long>(len));
+      return kStatusSuccess;
+    }
+    case kCommandBleMsgWait: {
+      uint16_t s = static_cast<uint16_t>(window[0] << 8 | window[1]);
+      bleRecvHasDeadline_ = s != 0xFFFF;
+      bleRecvDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(s);
+      return kStatusSuccess;
+    }
+    case kCommandBleMsgRecv: {
+      bleDeliver();
+      if (bleInbox_.empty()) {
+        if (bleRecvHasDeadline_ && std::chrono::steady_clock::now() >= bleRecvDeadline_) window[0] = 1;
+        else window[0] = bleConnected_ ? 0 : 2;
+        return kStatusError;
+      }
+      const std::vector<uint8_t>& m = bleInbox_.front();
+      window[0] = static_cast<uint8_t>(m.size() >> 8);
+      window[1] = static_cast<uint8_t>(m.size());
+      std::copy(m.begin(), m.end(), window.begin() + 2);
+      bleInbox_.pop_front();
+      return kStatusSuccess;
+    }
+    case kCommandBleMsgCount:
+      bleDeliver();
+      window[0] = static_cast<uint8_t>(bleInbox_.size());
+      window[1] = bleConnected_ ? 1 : 0;
+      return kStatusSuccess;
     default:
       return kStatusNotImplemented;
+  }
+}
+
+// Messages in transit arrive after their polls; the inbox holds 8.
+void ExpansionMock::bleDeliver() {
+  for (auto& m : bleIncoming_)
+    if (m.first > 0) m.first--;
+  while (!bleIncoming_.empty() && bleIncoming_.front().first == 0 && bleInbox_.size() < 8) {
+    bleInbox_.push_back(std::move(bleIncoming_.front().second));
+    bleIncoming_.pop_front();
   }
 }
 

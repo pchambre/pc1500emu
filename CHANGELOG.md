@@ -4,6 +4,30 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.10.0] - 2026-09-30
+
+### Added
+- **BLE messaging** (the expansion firmware's `BLSEND`/`BLRECV`, `MSG` frames).
+  - The mock's fake peer can send messages (optionally a few polls late),
+    record what was sent, and fake a full inbox.
+  - `LinkCore` keeps the 8-message inbox in both roles over host
+    Bluetooth: a new link empties it, a dropped one doesn't.
+- **Keywords as BASIC functions:** `BLSTAT` (messages waiting) and
+  `SDEOF(n)` (end of an SD channel). The mock routes their `FN_*`
+  commands to the firmware's `kw_function()`, and answers
+  `SD_CHANNEL_EOF` from its own channels.
+- Tests:
+  - `testBleMessaging` and `testSdeofEndsReadLoop`: expressions, inside
+    another keyword, in a running program (`IF ... THEN LET`), error
+    numbers;
+  - `ble_link_core_test`'s `testMessages`.
+- The boot-hook test now checks that `STAGE RAM` refreshes a copy that's
+  already staged, while a reset still skips it.
+
+### Note
+- `expansion_keyword_test` takes about 11 minutes: the mock keeps the MCU
+  to real time.
+
 ## [0.9.1] - 2026-09-28
 
 ### Added

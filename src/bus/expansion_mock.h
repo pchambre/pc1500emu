@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -192,6 +193,7 @@ class ExpansionMock {
   static constexpr uint8_t kCommandSdWriteValue = 27;
   static constexpr uint8_t kCommandSdReadValue = 28;
   static constexpr uint8_t kCommandSdSkipValues = 29;
+  static constexpr uint8_t kCommandSdChannelEof = 31;  // SDEOF(n) (2026-09-30)
   // Validates+uppercase-folds, in place, the length-prefixed raw name
   // SD_PARSE_QUOTED_NAME (rom.asm) has already staged at window offset 0
   // -- ported from the LH5801 state machine that used to live there (see
@@ -280,6 +282,13 @@ class ExpansionMock {
   static constexpr uint8_t kCommandBleDataWrite = 0x4E;
   static constexpr uint8_t kCommandBleDataRead = 0x4F;
   static constexpr uint8_t kCommandBleDataClose = 0x50;
+  // Peer messaging (2026-09-29) -- EXP_COMMAND_BLE_MSG_SEND..COUNT.
+  static constexpr uint8_t kCommandBleMsgSend = 0x51;
+  static constexpr uint8_t kCommandBleMsgWait = 0x52;
+  static constexpr uint8_t kCommandBleMsgRecv = 0x53;
+  static constexpr uint8_t kCommandBleMsgCount = 0x54;
+  static constexpr uint8_t kCommandFnBlstat = 0x55;  // the BLSTAT function's value
+  static constexpr uint8_t kCommandFnSdeof = 0x56;   // SDEOF(n)'s value
   // EXP_BLE_STATUS_*
   static constexpr uint8_t kBleStatusLinked = 0x01, kBleStatusAdvertising = 0x02, kBleStatusOfferIn = 0x04,
                            kBleStatusAnswered = 0x08, kBleStatusAccepted = 0x10;
@@ -375,6 +384,17 @@ class ExpansionMock {
   }
   bool bleOfferPending() const { return bleOfferIn_; }
   bool bleOfferRefused() const { return bleRefused_; }
+
+  // Test-only, peer messaging (2026-09-29). A message is value chunks.
+  // The peer sends us one, which reaches the inbox after `polls` more
+  // MSG_RECV/MSG_COUNT checks (0 = at once) -- a BLRECV that has to wait.
+  void bleMessageToUs(std::vector<uint8_t> chunks, int polls = 0) {
+    bleIncoming_.push_back({polls, std::move(chunks)});
+  }
+  // What our BLSENDs sent it, oldest first.
+  const std::vector<std::vector<uint8_t>>& bleMessagesSent() const { return bleSent_; }
+  // Its inbox is full (ERR BUSY) for the next `sends` BLSEND attempts.
+  void setBlePeerInboxFullFor(long sends) { bleBusyFor_ = sends; }
 
   // A real Bluetooth link in place of the fake peer (2026-09-28): BLE
   // commands, and a BLE transfer's WRITE/READ/CLOSE_SD_FILE, go to it.
@@ -649,6 +669,14 @@ class ExpansionMock {
   bool bleOfferIn_ = false;
   BleOffer bleOfferInFile_;
   bool bleRefused_ = false;
+  // peer messaging: in transit (polls to go), the inbox, what we sent
+  std::deque<std::pair<int, std::vector<uint8_t>>> bleIncoming_;
+  std::deque<std::vector<uint8_t>> bleInbox_;
+  std::vector<std::vector<uint8_t>> bleSent_;
+  long bleBusyFor_ = 0;
+  bool bleRecvHasDeadline_ = false;
+  std::chrono::steady_clock::time_point bleRecvDeadline_;
+  void bleDeliver();  // moves arrived messages from bleIncoming_ to the inbox
   mutable std::mutex bleBackendMutex_;
   std::shared_ptr<BleBackend> bleBackend_;
   std::string hostName_ = "PC-1500 EMU";  // the firmware's default is "PC-1500"
