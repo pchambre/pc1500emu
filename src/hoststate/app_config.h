@@ -60,6 +60,9 @@ struct AppConfig {
   bool bleHostBluetooth = false;
   std::optional<std::string> bleFilesDir;
   bool showBluetoothWindow = false;
+  // The plotter panel (showPrinterPanel, its setting name since 2026-09-30) (2026-09-30): the CE-150 stand-in's paper, right of
+  // everything else.
+  bool showPrinterPanel = false;
 };
 
 // A missing file at `path` is not an error -- returns true with *out left

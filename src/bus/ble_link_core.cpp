@@ -9,6 +9,10 @@
 #include <fstream>
 #include <iterator>
 
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+#include "plotter.h"  // PLOT's frame splitting, shared with the firmware
+#endif
+
 namespace pc1500::ble {
 
 namespace {
@@ -33,6 +37,8 @@ constexpr uint8_t kCmdAdvertise = 0x47, kCmdStatus = 0x48, kCmdOffer = 0x49, kCm
                   kCmdOfferGet = 0x4B, kCmdAnswer = 0x4C, kCmdSend = 0x4D, kCmdDataWrite = 0x4E,
                   kCmdDataRead = 0x4F, kCmdDataClose = 0x50;
 constexpr uint8_t kCmdMsgSend = 0x51, kCmdMsgWait = 0x52, kCmdMsgRecv = 0x53, kCmdMsgCount = 0x54;
+constexpr uint8_t kCmdPlot = 0x57;  // the CE-150 stand-in's drawing (2026-09-30)
+constexpr uint8_t kPlot = 0x40;
 // EXP_BLE_STATUS_*
 constexpr uint8_t kStatusLinked = 0x01, kStatusAdvertising = 0x02, kStatusOfferIn = 0x04, kStatusAnswered = 0x08,
                   kStatusAccepted = 0x10;
@@ -363,6 +369,22 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
     }
     case kCmdText:
       return text(w);
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+    case kCmdPlot: {  // a PLOT payload (RP2350/plotter.h) as frames, each ACKed
+      uint16_t len = static_cast<uint16_t>(std::min<size_t>((static_cast<size_t>(w[0]) << 8) | w[1], 1000));
+      std::vector<uint8_t> frame(transport_->frameMax() - 4);
+      plot_split_t split;
+      plot_split_start(&split, &w[2], len);
+      while (uint16_t n = plot_split_next(&split, &w[2], len, frame.data(), static_cast<uint16_t>(frame.size()))) {
+        int r = request(kPlot, std::vector<uint8_t>(frame.begin(), frame.begin() + n));
+        if (r != 0) {
+          log(r == kErrUnsupported ? "The peer has no plotter" : "Plot failed");
+          return fail(r);
+        }
+      }
+      return kStatusSuccess;
+    }
+#endif
     case kCmdFilePut:
       return filePut(w);
     case kCmdFileGet:
@@ -756,6 +778,8 @@ void LinkCore::serve(const Frame& f) {
       }
       return answer(f.seq);
     }
+    case kPlot:  // the PC-1500's CE-150 stand-in drawing here (2026-09-30)
+      return answer(f.seq, paper_.addPayload(p.data(), p.size()) ? 0 : kErrBadFrame);
     case kFilePut: {
       if (p.size() < 8 || 8u + p[7] > p.size()) return answer(f.seq, kErrBadFrame);
       if (p[0] != kTargetServer) return answer(f.seq, kErrUnsupported);

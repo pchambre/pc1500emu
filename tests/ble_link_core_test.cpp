@@ -187,6 +187,43 @@ void testText() {
   CHECK(p.server->consoleText() == "AFTER\n");
 }
 
+// PLOT (2026-09-30): a payload split into frames at the 64-byte frame size,
+// each starting from where the last left off, lands on the server's paper
+// as the same lines.
+void testPlot() {
+  Pair p("ble_core_plot");
+  p.server->setAdvertising(true);
+  auto w = window();
+  nameSlot(w, "PC-1500 EMU");
+  CHECK(p.pc->command(0x42, w) == kOk);
+  // pen 2 at (10, -5), then 30 short DRAW_RELs (3 bytes each: several frames)
+  std::vector<uint8_t> payload = {2, 10, 0, 0xFB, 0xFF, 0xFF, 0xFF};
+  for (int i = 0; i < 30; i++) payload.insert(payload.end(), {0x04, 5, static_cast<uint8_t>(i % 2 ? 0xFF : 1)});
+  auto pw = window();
+  pw[0] = static_cast<uint8_t>(payload.size() >> 8);
+  pw[1] = static_cast<uint8_t>(payload.size());
+  std::copy(payload.begin(), payload.end(), pw.begin() + 2);
+  CHECK(p.pc->command(0x57, pw) == kOk);
+  std::vector<pc1500::PlotPaper::Line> lines = p.server->paper().lines();
+  CHECK(lines.size() == 30);
+  bool joined = true;
+  for (size_t i = 0; i < lines.size(); i++) {
+    const auto& l = lines[i];
+    if (l.pen != 2 || l.x1 - l.x0 != 5 || l.x0 != 10 + 5 * static_cast<int32_t>(i)) joined = false;
+    if (l.y0 != (i % 2 ? -4 : -5) || l.y1 != (i % 2 ? -5 : -4)) joined = false;
+  }
+  CHECK(joined);
+  CHECK(p.server->paper().penX() == 160 && p.server->paper().penY() == -5);
+  // a malformed payload (an unknown op): the splitter sends only what it
+  // could read -- here just where the pen is -- so nothing more is drawn
+  std::vector<uint8_t> bad = {0, 0, 0, 0, 0, 0, 0, 0x09};
+  pw = window();
+  pw[1] = static_cast<uint8_t>(bad.size());
+  std::copy(bad.begin(), bad.end(), pw.begin() + 2);
+  CHECK(p.pc->command(0x57, pw) == kOk);  // the splitter drops what it can't read: an empty frame
+  CHECK(p.server->paper().lineCount() == 30);
+}
+
 // BLSAVE then BLLOAD through WRITE/READ/CLOSE, as the ROM drives them.
 void testSaveLoad() {
   Pair p("ble_core_files");
@@ -444,6 +481,7 @@ void testMessages() {
 int main() {
   testScanConnectDisconnect();
   testText();
+  testPlot();
   testSaveLoad();
   testPeerGoesQuiet();
   testPeerToPeer();

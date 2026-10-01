@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "ble_backend.h"
+#include "plot_paper.h"
 
 namespace pc1500::ble {
 
@@ -93,6 +94,8 @@ class LinkCore : public BleBackend {
   std::string state() const;             // "idle", "advertising", "connected to X"
   std::string takeConsoleText();         // text received as a server, since last taken
   std::string consoleText() const;       // everything since the last FF
+  // What a connected PC-1500's CE-150 stand-in drew here (PLOT frames).
+  PlotPaper& paper() { return paper_; }
   std::vector<std::string> logLines() const;
 
   // Shortened for the tests (BLE_PROTOCOL.md sec.4 says 5 s).
@@ -186,6 +189,7 @@ class LinkCore : public BleBackend {
   std::vector<uint8_t> putData_;
   bool putActive_ = false;
 
+  PlotPaper paper_;
   std::string console_;      // since the last FF
   std::string consoleNew_;   // not yet taken
   std::deque<std::string> log_;

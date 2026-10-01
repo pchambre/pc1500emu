@@ -9,7 +9,9 @@
 #include <thread>
 
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+#include "basic_xlate.h"
 #include "keywords.h"
+#include "plotter.h"
 #endif
 
 namespace pc1500 {
@@ -168,12 +170,46 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       return createSdFile(window);
     case kCommandOpenSdFileRead:
       return openSdFileRead(window);
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+    // A BASIC program's SAVE/LOAD passes through the firmware's own
+    // basic_xlate (2026-10-01): files hold the CE-150's E6xx codes, the
+    // program in memory this module's E1Cx ones unless a CE-150 is there.
+    case kCommandWriteToSdFile: {
+      if (basic_xlate_mode() != BASIC_XLATE_OFF) {
+        uint16_t n = static_cast<uint16_t>(window[kLengthPortOffset] << 8 | window[kLengthPortOffset + 1]);
+        n = basic_xlate_write(window.data(), n);
+        window[kLengthPortOffset] = static_cast<uint8_t>(n >> 8);
+        window[kLengthPortOffset + 1] = static_cast<uint8_t>(n);
+        if (n == 0) return kStatusSuccess;  // held back for the next chunk
+      }
+      return writeToSdFile(window);
+    }
+    case kCommandReadFromSdFile: {
+      uint8_t status = readFromSdFile(window);
+      if (status == kStatusSuccess && basic_xlate_mode() == BASIC_XLATE_LOAD) {
+        uint16_t n = static_cast<uint16_t>(window[kLengthPortOffset] << 8 | window[kLengthPortOffset + 1]);
+        n = basic_xlate_read(window.data(), n);
+        window[kLengthPortOffset] = static_cast<uint8_t>(n >> 8);
+        window[kLengthPortOffset + 1] = static_cast<uint8_t>(n);
+      }
+      return status;
+    }
+    case kCommandCloseSdFile:
+      if (basic_xlate_flush(window.data())) {
+        window[kLengthPortOffset] = 0;
+        window[kLengthPortOffset + 1] = 1;
+        writeToSdFile(window);
+      }
+      basic_xlate_end();
+      return closeSdFile(window);
+#else
     case kCommandWriteToSdFile:
       return writeToSdFile(window);
     case kCommandReadFromSdFile:
       return readFromSdFile(window);
     case kCommandCloseSdFile:
       return closeSdFile(window);
+#endif
     case kCommandGetSdFileSize:
       return getSdFileSize(window);
     case kCommandGetSdFileStatus:
@@ -369,6 +405,7 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandBleMsgWait:
     case kCommandBleMsgRecv:
     case kCommandBleMsgCount:
+    case kCommandBlePlot:
       return bleCommand(cmd, window);
     case kCommandLogClear:
       return kStatusSuccess;
@@ -823,6 +860,22 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       window[0] = static_cast<uint8_t>(bleInbox_.size());
       window[1] = bleConnected_ ? 1 : 0;
       return kStatusSuccess;
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+    case kCommandBlePlot: {  // as frames, each drawn as the app would
+      if (!bleConnected_) return fail(0);
+      if (!blePeerPlots_) return fail(2);  // ERR UNSUPPORTED
+      uint16_t len = static_cast<uint16_t>((window[0] << 8) | window[1]);
+      const uint8_t* payload = &window[2];
+      uint8_t frame[244];
+      plot_split_t split;
+      plot_split_start(&split, payload, len);
+      while (uint16_t n = plot_split_next(&split, payload, len, frame, sizeof frame)) {
+        if (!blePaper_.addPayload(frame, n)) return fail(1);  // ERR BAD_FRAME
+        blePlotFrames_++;
+      }
+      return kStatusSuccess;
+    }
+#endif
     default:
       return kStatusNotImplemented;
   }

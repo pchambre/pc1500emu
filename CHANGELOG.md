@@ -4,6 +4,41 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.11.0] - 2026-10-01
+
+### Added
+- **The CE-150 printer/plotter, as the expansion firmware stands in for it**
+  (`COLOR`, `CSIZE`, `GRAPH`, `GLCURSOR`, `LCURSOR`, `LF`, `LINE`, `LLIST`,
+  `LPRINT`, `RLINE`, `ROTATE`, `SORGN`, `TAB`, `TEST`, `TEXT`), drawn over BLE
+  as `PLOT` frames:
+  - the mock compiles the firmware's `plotter.c`, `plot_text.c` and
+    `hershey_simplex.c`; its fake peer draws the frames on a `PlotPaper`;
+  - `LinkCore` sends `PLOT` as a connector and draws the frames it
+    receives as a server;
+  - a plotter panel (Settings > Bluetooth > Show Plotter Panel) shows the
+    paper: from a connected PC-1500 with host Bluetooth, otherwise from the
+    emulated one;
+  - the detokenizer knows the module's E1C0-E1C6 codes for the CE-150's
+    seven E6xx keywords;
+  - a BASIC program's `SAVE`/`LOAD` passes through the firmware's
+    `basic_xlate.c`, so files hold the CE-150's codes.
+- Tests:
+  - `testBasicXlateChunks`;
+  - `testCe150CodesSaveLoadAndHandOver`, with the real `CE-150.ROM`
+    attached at A000H;
+  - `LLIST "label"`, `LPRINT USING` and GRAPH mode's bare `LPRINT`, in
+    `testCe150Plotter`.
+- Tests:
+  - `testCe150Plotter`;
+  - `testCe150Globe`, which runs `GLOBE.BAS` end to end, only when asked for
+    by name;
+  - `ble_link_core_test`'s `testPlot`.
+- `expansion_keyword_test [name]` runs only the tests whose names contain it.
+
+### Changed
+- The expansion keyword tests run on a machine with the 26K of RAM the
+  module adds (16K at 0000H, 10K at 4800H).
+
 ## [0.10.0] - 2026-09-30
 
 ### Added

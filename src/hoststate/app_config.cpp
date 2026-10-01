@@ -62,6 +62,7 @@ bool loadAppConfig(const std::string& path, AppConfig* out, std::string* error) 
     out->bleFilesDir = resolveRelative(j["bleFilesDir"].get<std::string>(), confDir);
   }
   out->showBluetoothWindow = j.value("showBluetoothWindow", false);
+  out->showPrinterPanel = j.value("showPrinterPanel", false);
   return true;
 }
 
@@ -80,6 +81,7 @@ bool saveAppConfig(const AppConfig& config, const std::string& path, std::string
   j["bleHostBluetooth"] = config.bleHostBluetooth;
   if (config.bleFilesDir) j["bleFilesDir"] = *config.bleFilesDir;
   j["showBluetoothWindow"] = config.showBluetoothWindow;
+  j["showPrinterPanel"] = config.showPrinterPanel;
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) {

@@ -339,6 +339,75 @@ constexpr int kBluetoothPanelHeight = 300;
 int windowHeight(bool statusPanel, bool bluetoothPanel) {
   return kWindowHNoPanel + (statusPanel ? kStatusPanelHeight : 0) + (bluetoothPanel ? kBluetoothPanelHeight : 0);
 }
+// The plotter panel (Settings > Bluetooth > Show Plotter Panel, 2026-09-30)
+// runs down the right of everything else, and makes the window at least
+// kPrinterPanelMinHeight tall: a paper roll needs the length.
+constexpr int kPrinterPanelWidth = 340;
+constexpr int kPrinterPanelMinHeight = 640;
+int windowWidth(const pc1500host::AppConfig& c) { return kWindowW + (c.showPrinterPanel ? kPrinterPanelWidth : 0); }
+int windowHeight(const pc1500host::AppConfig& c) {
+  int h = windowHeight(c.showStatusPanel, c.showBluetoothWindow);
+  return c.showPrinterPanel && h < kPrinterPanelMinHeight ? kPrinterPanelMinHeight : h;
+}
+
+// The plotter panel's paper: the CE-150's 58 mm roll, its pen's 43.2 mm
+// travel (x 0-860 quarter steps) starting 5 mm in from the left edge, the
+// newest output at the bottom. Follows the output while scrolled to the end.
+void drawPrinterPanel(pc1500::PlotPaper& paper, const char* source, float x, float y, float w, float h) {
+  constexpr float kPaperQ = 58.0f * 20.0f;  // the roll's width in quarter steps (20 per mm)
+  constexpr float kLeftQ = 5.0f * 20.0f;    // the left margin
+  static const ImU32 kPens[4] = {IM_COL32(20, 20, 20, 255), IM_COL32(30, 60, 220, 255),
+                                 IM_COL32(20, 140, 40, 255), IM_COL32(210, 30, 30, 255)};
+  static uint64_t shownVersion = ~0ull;
+  ImGui::SetNextWindowPos(ImVec2(x, y));
+  ImGui::SetNextWindowSize(ImVec2(w, h));
+  ImGuiWindowFlags flags =
+      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse;
+  if (ImGui::Begin("##printerpanel", nullptr, flags)) {
+    ImGui::TextUnformatted("Plotter (CE-150)");
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - 50);
+    if (ImGui::SmallButton("Clear")) paper.clear();
+    ImGui::TextDisabled("%s", source);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(90, 90, 95, 255));
+    ImGui::BeginChild("##paper", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    const float innerW = ImGui::GetContentRegionAvail().x;
+    const float margin = 8.0f;
+    const float s = (innerW - 2 * margin) / kPaperQ;  // pixels per quarter step
+    int32_t top = 0, bottom = 0;
+    paper.extent(&top, &bottom);
+    const float lead = 20.0f * 20.0f;  // 20 mm of paper above and below what's drawn
+    const float length = (static_cast<float>(top - bottom) + 2 * lead) * s;
+    const uint64_t version = paper.version();
+    const bool atEnd = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f;
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(innerW, length < ImGui::GetContentRegionAvail().y ? ImGui::GetContentRegionAvail().y : length));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float left = origin.x + margin;
+    auto px = [&](int32_t qx) { return left + (kLeftQ + static_cast<float>(qx)) * s; };
+    auto py = [&](int32_t qy) { return origin.y + (static_cast<float>(top - qy) + lead) * s; };
+    dl->AddRectFilled(ImVec2(left, origin.y), ImVec2(left + kPaperQ * s, origin.y + ImGui::GetItemRectSize().y),
+                      IM_COL32(252, 250, 240, 255));
+    const float thick = std::max(1.0f, 0.3f * 20.0f * s);  // a 0.3 mm pen
+    const float clipTop = ImGui::GetWindowPos().y, clipBottom = clipTop + ImGui::GetWindowHeight();
+    for (const pc1500::PlotPaper::Line& l : paper.lines()) {
+      float y0 = py(l.y0), y1 = py(l.y1);
+      if (std::max(y0, y1) < clipTop || std::min(y0, y1) > clipBottom) continue;
+      if (l.x0 == l.x1 && l.y0 == l.y1)  // a dot
+        dl->AddCircleFilled(ImVec2(px(l.x0), y0), thick * 0.5f, kPens[l.pen & 3]);
+      else
+        dl->AddLine(ImVec2(px(l.x0), y0), ImVec2(px(l.x1), y1), kPens[l.pen & 3], thick);
+    }
+    if (paper.penKnown())  // where the pen rests
+      dl->AddCircle(ImVec2(px(paper.penX()), py(paper.penY())), 3.0f, kPens[paper.pen() & 3]);
+    if (version != shownVersion) {
+      if (atEnd || shownVersion == ~0ull) ImGui::SetScrollY(ImGui::GetScrollMaxY() + length);
+      shownVersion = version;
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+  }
+  ImGui::End();
+}
 
 // The expansion board's BLE link on this computer's own Bluetooth
 // (2026-09-28): when Settings > Bluetooth > Host Bluetooth is chosen, the
@@ -1652,8 +1721,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   SDL_Window* window = SDL_CreateWindow(
-      "pc1500emu v" PC1500EMU_VERSION, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, kWindowW,
-      windowHeight(appConfig.showStatusPanel, appConfig.showBluetoothWindow), SDL_WINDOW_SHOWN);
+      "pc1500emu v" PC1500EMU_VERSION, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, windowWidth(appConfig),
+      windowHeight(appConfig), SDL_WINDOW_SHOWN);
   SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
   Uint32 mainWindowID = SDL_GetWindowID(window);
   // No-op outside macOS -- see mac_activate.h/.mm.
@@ -3039,8 +3108,7 @@ int main(int argc, char** argv) {
       }
       if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Alt | ImGuiKey_P, ImGuiInputFlags_RouteGlobal)) {
         appConfig.showStatusPanel = !appConfig.showStatusPanel;
-        SDL_SetWindowSize(window, kWindowW,
-                           windowHeight(appConfig.showStatusPanel, appConfig.showBluetoothWindow));
+        SDL_SetWindowSize(window, windowWidth(appConfig), windowHeight(appConfig));
         persistActiveConf();
       }
       if (ImGui::BeginMenu("File")) {
@@ -3324,7 +3392,7 @@ int main(int argc, char** argv) {
             hostBle.apply(bus, true, bleFilesDir());
             if (!appConfig.showBluetoothWindow) {
               appConfig.showBluetoothWindow = true;  // so its state (or why it's unavailable) is seen
-              SDL_SetWindowSize(window, kWindowW, windowHeight(appConfig.showStatusPanel, true));
+              SDL_SetWindowSize(window, windowWidth(appConfig), windowHeight(appConfig));
             }
             persistActiveConf();
           }
@@ -3335,7 +3403,12 @@ int main(int argc, char** argv) {
           }
           if (ImGui::MenuItem("Show Bluetooth Panel", nullptr, appConfig.showBluetoothWindow)) {
             appConfig.showBluetoothWindow = !appConfig.showBluetoothWindow;
-            SDL_SetWindowSize(window, kWindowW, windowHeight(appConfig.showStatusPanel, appConfig.showBluetoothWindow));
+            SDL_SetWindowSize(window, windowWidth(appConfig), windowHeight(appConfig));
+            persistActiveConf();
+          }
+          if (ImGui::MenuItem("Show Plotter Panel", nullptr, appConfig.showPrinterPanel)) {
+            appConfig.showPrinterPanel = !appConfig.showPrinterPanel;
+            SDL_SetWindowSize(window, windowWidth(appConfig), windowHeight(appConfig));
             persistActiveConf();
           }
           ImGui::EndMenu();
@@ -3370,8 +3443,7 @@ int main(int argc, char** argv) {
         }
         if (ImGui::MenuItem("Show Status Panel", "Ctrl+Alt+P", appConfig.showStatusPanel)) {
           appConfig.showStatusPanel = !appConfig.showStatusPanel;
-          SDL_SetWindowSize(window, kWindowW,
-                             windowHeight(appConfig.showStatusPanel, appConfig.showBluetoothWindow));
+          SDL_SetWindowSize(window, windowWidth(appConfig), windowHeight(appConfig));
           persistActiveConf();
         }
         ImGui::EndMenu();
@@ -3664,6 +3736,19 @@ int main(int argc, char** argv) {
         }
       }
       ImGui::End();
+    }
+
+    // Plotter panel (2026-09-30): the paper the expansion board's CE-150
+    // stand-in draws on (RP2350/plotter.h, BLE_PROTOCOL.md "Plotter") --
+    // what a real PC-1500 connected to this emulator drew, with host
+    // Bluetooth; otherwise what the emulated PC-1500 drew on the fake peer.
+    if (appConfig.showPrinterPanel) {
+      const bool host = appConfig.bleHostBluetooth && hostBle.core;
+      drawPrinterPanel(host ? hostBle.core->paper() : bus.expansionMock().blePaper(),
+                       host ? "From the connected PC-1500" : "From this PC-1500 (fake peer)",
+                       static_cast<float>(kWindowW), static_cast<float>(kMenuBarHeight),
+                       static_cast<float>(kPrinterPanelWidth),
+                       static_cast<float>(windowHeight(appConfig) - kMenuBarHeight));
     }
 
     ImGui::Render();

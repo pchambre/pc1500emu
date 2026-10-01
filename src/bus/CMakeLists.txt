@@ -2,6 +2,7 @@ add_library(pc1500bus STATIC
   bus.cpp
   expansion_mock.cpp
   ble_link_core.cpp  # the PC-1500 Link protocol over a host Transport (2026-09-28)
+  plot_paper.cpp     # what PLOT frames drew: the CE-150 stand-in's paper (2026-09-30)
 )
 target_include_directories(pc1500bus PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # std::thread: the mock's command worker, the BLE core's server thread
@@ -18,7 +19,14 @@ set(PC1500_EXPANSION_FIRMWARE_DIR
     "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/RP2350"
     CACHE PATH "PC1500-PSOC5 RP2350 firmware directory (keywords.c, pc_exp.h)")
 if(EXISTS "${PC1500_EXPANSION_FIRMWARE_DIR}/keywords.c")
-  target_sources(pc1500bus PRIVATE "${PC1500_EXPANSION_FIRMWARE_DIR}/keywords.c")
+  target_sources(pc1500bus PRIVATE
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/keywords.c"
+    # the CE-150 stand-in's geometry and lettering (2026-09-30)
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/plotter.c"
+    # a BASIC program's CE-150 codes, as it's saved and loaded (2026-10-01)
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/basic_xlate.c"
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/plot_text.c"
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/hershey_simplex.c")
   target_include_directories(pc1500bus PRIVATE "${PC1500_EXPANSION_FIRMWARE_DIR}")
   target_compile_definitions(pc1500bus PRIVATE PC1500_HAVE_EXPANSION_KEYWORDS=1)
 else()

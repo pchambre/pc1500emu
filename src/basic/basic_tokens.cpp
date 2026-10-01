@@ -51,6 +51,12 @@ const TokenEntry kTokenTable[] = {
     {0xF1B1, "TO"},       {0xE885, "TRANSMIT"}, {0xF1B0, "TROFF"},
     {0xF1AF, "TRON"},     {0xF1B6, "UNLOCK"},   {0xF085, "USING"},
     {0xF162, "VAL"},      {0xF1B3, "WAIT"},     {0xF0B4, "ZONE"},
+
+    // The PC1500-PSOC5 expansion module's own codes for the CE-150's seven
+    // E6xx keywords (2026-09-30, its keywords.c): its stand-in plotter.
+    {0xE1C0, "CSIZE"},    {0xE1C1, "GRAPH"},    {0xE1C2, "GLCURSOR"},
+    {0xE1C3, "LCURSOR"},  {0xE1C4, "SORGN"},    {0xE1C5, "ROTATE"},
+    {0xE1C6, "TEXT"},
 };
 // clang-format on
 

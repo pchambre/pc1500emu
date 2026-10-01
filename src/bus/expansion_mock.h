@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "ble_backend.h"
+#include "plot_paper.h"
 
 namespace pc1500 {
 
@@ -289,6 +290,7 @@ class ExpansionMock {
   static constexpr uint8_t kCommandBleMsgCount = 0x54;
   static constexpr uint8_t kCommandFnBlstat = 0x55;  // the BLSTAT function's value
   static constexpr uint8_t kCommandFnSdeof = 0x56;   // SDEOF(n)'s value
+  static constexpr uint8_t kCommandBlePlot = 0x57;   // the CE-150 stand-in's drawing (2026-09-30)
   // EXP_BLE_STATUS_*
   static constexpr uint8_t kBleStatusLinked = 0x01, kBleStatusAdvertising = 0x02, kBleStatusOfferIn = 0x04,
                            kBleStatusAnswered = 0x08, kBleStatusAccepted = 0x10;
@@ -395,6 +397,26 @@ class ExpansionMock {
   const std::vector<std::vector<uint8_t>>& bleMessagesSent() const { return bleSent_; }
   // Its inbox is full (ERR BUSY) for the next `sends` BLSEND attempts.
   void setBlePeerInboxFullFor(long sends) { bleBusyFor_ = sends; }
+
+  // The CE-150 stand-in (2026-09-30): the fake peer's paper, what it drew
+  // from our PLOT frames -- the emulator's plotter panel shows it while no
+  // host Bluetooth link is in use. The frames are split at a 244-byte
+  // payload, as the firmware's link does at its MTU.
+  PlotPaper& blePaper() { return blePaper_; }
+  // Test-only: the same, as lines in quarter steps (RP2350/plotter.h) and
+  // where the pen rests; with setBlePeerPlots(false) the peer answers PLOT
+  // with ERR UNSUPPORTED.
+  using BlePlotLine = PlotPaper::Line;
+  std::vector<BlePlotLine> blePlotLines() const { return blePaper_.lines(); }
+  void clearBlePlot() {
+    blePaper_.clear();
+    blePlotFrames_ = 0;
+  }
+  int blePlotFrames() const { return blePlotFrames_; }
+  int32_t blePlotX() const { return blePaper_.penX(); }
+  int32_t blePlotY() const { return blePaper_.penY(); }
+  uint8_t blePlotPen() const { return blePaper_.pen(); }
+  void setBlePeerPlots(bool plots) { blePeerPlots_ = plots; }
 
   // A real Bluetooth link in place of the fake peer (2026-09-28): BLE
   // commands, and a BLE transfer's WRITE/READ/CLOSE_SD_FILE, go to it.
@@ -677,6 +699,10 @@ class ExpansionMock {
   bool bleRecvHasDeadline_ = false;
   std::chrono::steady_clock::time_point bleRecvDeadline_;
   void bleDeliver();  // moves arrived messages from bleIncoming_ to the inbox
+  // the CE-150 stand-in's drawing (see blePaper())
+  PlotPaper blePaper_;
+  int blePlotFrames_ = 0;
+  bool blePeerPlots_ = true;
   mutable std::mutex bleBackendMutex_;
   std::shared_ptr<BleBackend> bleBackend_;
   std::string hostName_ = "PC-1500 EMU";  // the firmware's default is "PC-1500"

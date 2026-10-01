@@ -26,6 +26,7 @@
 // matching every other ROM-dependent test here.
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <deque>
 #include <filesystem>
@@ -38,6 +39,9 @@
 #include "basic_text.h"
 #include "bus.h"
 #include "keyboard.h"
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+#include "basic_xlate.h"  // the firmware's own (testBasicXlateChunks)
+#endif
 #include "lh5801.h"
 #include "text_loader.h"
 
@@ -130,13 +134,14 @@ void stepOne(BootedMachine& m) {
   }
 }
 
-// extRam0000Bytes/extRamExtBytes/variant let a test approximate a
-// RAM-expanded machine (e.g. a CE-155-shaped 10K config on a PC-1500) --
+// extRam0000Bytes/extRamExtBytes/variant set the machine's RAM. The default
+// is the 26K the expansion module itself adds (16K at 0000H, 10K at 4800H):
+// every test here is of that module, so none runs on a bare machine. They
 // must be set before cpu.reset() so BASIC's own boot-time RAM scan sees
 // them, matching AppConfig::isPC1500A/extRamExtBytes's own documented
 // ordering requirement (src/hoststate/app_config.h).
 std::unique_ptr<BootedMachine> bootAndSettle(
-    const std::vector<uint8_t>& rom, size_t extRam0000Bytes = 0, size_t extRamExtBytes = 0,
+    const std::vector<uint8_t>& rom, size_t extRam0000Bytes = 0x4000, size_t extRamExtBytes = 0x2800,
     pc1500::Bus::MachineVariant variant = pc1500::Bus::MachineVariant::PC1500) {
   auto m = std::make_unique<BootedMachine>();
   m->bus.ioPort().useManualRtcClock();
@@ -1653,7 +1658,7 @@ void testSdloadUsesLiveProgramStartPointer() {
     f.write(reinterpret_cast<const char*>(kFixture.data()), static_cast<std::streamsize>(kFixture.size()));
   }
 
-  auto m = bootAndSettle(rom, /*extRam0000Bytes=*/16384, /*extRamExtBytes=*/6144);
+  auto m = bootAndSettle(rom, /*extRam0000Bytes=*/16384, /*extRamExtBytes=*/10240);
   loadExpansionRom(*m, expRom, sdDir);
 
   tapKey(*m, pc1500::Key::Cl);
@@ -4195,7 +4200,9 @@ struct BleFixture {
   }
 };
 
-static std::unique_ptr<BleFixture> bleFixture(const char* testName) {
+// extRam0000Bytes/extRamExtBytes: expansion RAM, as bootAndSettle().
+static std::unique_ptr<BleFixture> bleFixture(const char* testName, size_t extRam0000Bytes = 0x4000,
+                                              size_t extRamExtBytes = 0x2800) {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
@@ -4207,7 +4214,7 @@ static std::unique_ptr<BleFixture> bleFixture(const char* testName) {
     return nullptr;
   }
   auto f = std::make_unique<BleFixture>();
-  f->m = bootAndSettle(rom);
+  f->m = bootAndSettle(rom, extRam0000Bytes, extRamExtBytes);
   f->sdDir = makeTempTestDir(testName);
   loadExpansionRom(*f->m, expRom, f->sdDir);
   f->mock = &f->m->bus.expansionMock();
@@ -4286,7 +4293,9 @@ void testBlePrintText() {
                         "1/7*1E9", "1/7*1E10", "1E10", "-1E10", "1.234E9", "-1.234E-12", "12345678901", "1/7*1E12",
                         "0.001", "0.0001234", "123.456", "-0.25", "1E99", "-1E-99", "&FF", "32767*2"}) {
     std::string expr = e;
-    CHECK(f->run("A=" + expr) == 0);
+    int setErl = f->run("A=" + expr);
+    CHECK(setErl == 0);
+    if (setErl != 0) std::printf("  A=%s: ERL %d\n", e, setErl);
     f->mock->clearBleText();
     int printErl = f->run("BLPRINT A");
     CHECK(printErl == 0);
@@ -4666,93 +4675,508 @@ void testBleGetFromPeer() {
   CHECK(f->runThenBreak("BLGET") == 0);  // nothing offered: waits until BREAK
 }
 
+// The CE-150 printer/plotter's keywords (2026-09-30), drawn on the fake
+// peer as PLOT lines -- in quarter steps (RP2350/plotter.h: 4 per CE-150
+// step), y up the paper. No link is ERROR 27; out-of-range values ERROR 19,
+// the wrong mode ERROR 73, as the CE-150's own ROM.
+void testCe150Plotter() {
+  auto f = bleFixture("testCe150Plotter");
+  if (!f) return;
+  using Line = pc1500::ExpansionMock::BlePlotLine;
+  auto lines = [&]() { return f->mock->blePlotLines(); };
+  auto same = [](const Line& l, int pen, int x0, int y0, int x1, int y1) {
+    bool ok = l.pen == pen && l.x0 == x0 && l.y0 == y0 && l.x1 == x1 && l.y1 == y1;
+    if (!ok)
+      std::printf("  line pen %d (%d,%d)-(%d,%d), expected pen %d (%d,%d)-(%d,%d)\n", l.pen, l.x0, l.y0, l.x1, l.y1,
+                  pen, x0, y0, x1, y1);
+    return ok;
+  };
 
-int main() {
-  testFnKeysAndStateSaveRestore();
-  testKeywordsInProgramWithExpressions();
+  CHECK(f->run("GRAPH") == 27);  // no printer
+  CHECK(f->run("LPRINT 1") == 27);
+  f->connect();
 
-  testMconfShowsAndSetsSettings();
-  testBleScanConnectAndDisconnect();
-  testBleAdvertiseWaitsForPeer();
-  testBlePutToPeer();
-  testBleGetFromPeer();
-  testBleMessaging();
-  testSdeofEndsReadLoop();
-  testBlePrintText();
-  testBleListMatchesDetokenizer();
-  testBleSaveLoad();
-  testMlogmsgLogsLiteralAndStringVariable();
-  testBootHookStagesRomThenSkipsOnReset();
-  testStageQueryIsRecognizedKeyword();
-  testDebugBareWordIsNotAReservedKeyword();
-  testStageDebugIsRecognizedKeyword();
-  testStageBlockChecksumAlgorithmMatchesIndependentComputation();
-  testMlogViewIsRecognized();
-  testMlogVerboseIsRecognized();
-  testMlogQuietIsRecognized();
-  testMlogResetIsRecognized();
-  testSlsExitThenTypingDoesNotConcatenate();
-  testSdlsHidesBlinkingCursorDuringBrowse();
-  testSdlsScrollUpDoesNotCorruptEntryPastScratchOffset();
-  testStrayEnterAfterSlsExitDoesNotRedispatch();
-  testSdloadSelectsAndLoadsFile();
-  testSdloadDirectFilenameLoad();
-  testSdloadMHeaderBrowseSelectsFile();
-  testSdloadMDirectHeaderAddress();
-  testSdloadMExplicitAddressDecimal();
-  testSdloadMExplicitAddressHex();
-  testSdsaveBasicRoundTrip();
-  testSdsaveSdloadWidenedChunkRoundTrip();
-  testSdsaveOverwritePromptNAborts();
-  testSdsaveOverwritePromptYOverwrites();
-  testSdsaveDashYSkipsPrompt();
-  testSdsaveNoArgsRaisesError1();
-  testSdsaveBareSavesAsLastLoaded();
-  testSdsaveMMissingArgsRaisesError1();
-  testSdsaveMCallAddressRoundTrip();
-  testSdloadFileNotFoundRaisesError40();
-  testSdloadUsesLiveProgramStartPointer();
-  testSaveLoadBasicProgramUsesLiveProgramStartPointer();
-  testSdmkdirCreatesDirectory();
-  testSdmkdirFailsIfDirectoryAlreadyExists();
-  testSdrmdirRemovesEmptyDirectory();
-  testSdrmdirFailsOnNonEmptyDirectory();
-  testSdcdAffectsSubsequentFileCommands();
-  testSdlsListsDirectoriesWithDirMarker();
-  testSdpwdStagesCurrentDirectoryResponse();
-  testSdDirectoryCommandsRaiseError1WithoutArgument();
-  testSdloadUppercasesLowercaseFilename();
-  testSdmkdirRejectsNon83ShapedNames();
-  testSdcdDotAndDotDotStillWork();
-  testSdcdMultiSegmentPathValidatesEachSegment();
-  testSdPlusTildeTranslation();
-  testSdrmDeletesWithConfirmation();
-  testSdrmNAbortsDeletion();
-  testSdrmDashYSkipsPrompt();
-  testSdrmMissingFilenameRaisesError1();
-  testSdrmCannotRemoveDirectory();
-  testSdcpCopiesFile();
-  testSdcpMissingSourceRaisesError40();
-  testSdmvMovesFile();
-  testSddfDisplaysFreeAndTotalSpace();
-  testSdmvIntoExistingDirectory();
-  testSdcpIntoExistingDirectory();
-  testSdmvWithDotDotRelativeSource();
-  testSdcpWithAbsoluteDestinationPath();
-  testSdcpOverwritePromptNAborts();
-  testSdcpOverwritePromptYOverwrites();
-  testSdcpDashYSkipsPrompt();
-  testSdmvOverwritePromptNAborts();
-  testSdloadFromAbsolutePath();
-  testSdopenCreatesFileAndListsChannel();
-  testSdopenReusingChannelClosesPrevious();
-  testSdcloseClosesOneAndAll();
-  testSdprintSdinputNumericRoundTrip();
-  testSdprintSdinputStringRoundTrip();
-  testSdinputEofFillsZeroAndBlank();
-  testSdskipAdvancesAndRaisesError40PastEnd();
-  testSdChannelCommandsRaiseError1OnMalformedArgument();
-  testSdinputOverlongStringRaisesError42();
+  // The E6 group has this module's own codes, the F0 group the CE-150's.
+  CHECK(f->typeProgram("10 CSIZE 1:COLOR 0:TEXT\n"));
+  std::vector<uint8_t> program = f->program();
+  auto has = [&](uint8_t hi, uint8_t lo) {
+    for (size_t i = 0; i + 1 < program.size(); i++)
+      if (program[i] == hi && program[i + 1] == lo) return true;
+    return false;
+  };
+  CHECK(has(0xE1, 0xC0));  // CSIZE
+  CHECK(has(0xF0, 0xB5));  // COLOR
+  CHECK(has(0xE1, 0xC6));  // TEXT
+  f->key(pc1500::Key::Cl);
+  f->key(pc1500::Key::Mode);  // PRO -> RUN mode
+  CHECK(f->run("RUN") == 0);
+
+  // TEXT mode: a string from the left, then the next line (12 steps at CSIZE 1).
+  CHECK(f->run("TEXT") == 0);
+  CHECK(f->run("CSIZE 1") == 0);
+  f->mock->clearBlePlot();
+  CHECK(f->run("LPRINT \"AB\"") == 0);
+  CHECK(!lines().empty());
+  int32_t minX = 9999, maxX = -9999;
+  for (const Line& l : lines()) {
+    minX = std::min({minX, l.x0, l.x1});
+    maxX = std::max({maxX, l.x0, l.x1});
+  }
+  CHECK(minX >= 0 && maxX < 48);  // two 24-quarter-step cells
+  CHECK(f->mock->blePlotX() == 0);
+  int32_t y = f->mock->blePlotY();
+  CHECK(y == -48);
+  // A number alone is right-justified: "12" in columns 34-35 of 36.
+  f->mock->clearBlePlot();
+  CHECK(f->run("LPRINT 12") == 0);
+  minX = 9999;
+  for (const Line& l : lines()) minX = std::min({minX, l.x0, l.x1});
+  CHECK(minX >= 34 * 24 && minX < 35 * 24);
+  CHECK(f->mock->blePlotY() == y - 48);
+  CHECK(f->run("CSIZE 9") == 0);
+  CHECK(f->run("LPRINT 12345") == 76);  // wider than CSIZE 9's 4 columns
+  CHECK(f->run("CSIZE 0") == 19);
+  CHECK(f->run("LCURSOR 4") == 19);
+  CHECK(f->run("LCURSOR 3") == 0);
+  CHECK(f->run("ROTATE 1") == 73);  // GRAPH only
+  CHECK(f->run("SORGN") == 73);
+
+  // GRAPH mode: the pen goes to the left edge, which is the origin.
+  CHECK(f->run("GRAPH") == 0);
+  CHECK(f->run("LF 1") == 73);  // TEXT only
+  CHECK(f->mock->blePlotX() == 0);
+  int32_t oy = f->mock->blePlotY();
+  f->mock->clearBlePlot();
+  CHECK(f->run("LINE (0,0)-(100,0)") == 0);
+  CHECK(lines().size() == 1 && same(lines()[0], 0, 0, oy, 400, oy));
+  CHECK(f->run("LINE -(100,100),0,2") == 0);  // from the pen, in pen 2
+  CHECK(lines().size() == 2 && same(lines()[1], 2, 400, oy, 400, oy + 400));
+  CHECK(f->run("RLINE -(-50,0)") == 0);  // relative; pen 2 still
+  CHECK(lines().size() == 3 && same(lines()[2], 2, 400, oy + 400, 200, oy + 400));
+  f->mock->clearBlePlot();
+  CHECK(f->run("LINE (10,10)-(20,20),0,1,B") == 0);  // a box: across, up, back, down
+  CHECK(lines().size() == 4);
+  if (lines().size() == 4) {
+    CHECK(same(lines()[0], 1, 40, oy + 40, 80, oy + 40));
+    CHECK(same(lines()[1], 1, 80, oy + 40, 80, oy + 80));
+    CHECK(same(lines()[2], 1, 80, oy + 80, 40, oy + 80));
+    CHECK(same(lines()[3], 1, 40, oy + 80, 40, oy + 40));
+  }
+  f->mock->clearBlePlot();
+  CHECK(f->run("LINE (0,0)-(100,0),1") == 0);  // 2-step dashes: 25 in 100 steps
+  CHECK(lines().size() == 25);
+  f->mock->clearBlePlot();
+  CHECK(f->run("LINE (0,0)-(50,50),9") == 0);  // pen up
+  CHECK(lines().empty());
+  CHECK(f->mock->blePlotX() == 200 && f->mock->blePlotY() == oy + 200);
+  CHECK(f->run("LINE (0,0)-(300,0),0") == 0);  // off the paper: stops at its side
+  CHECK(!lines().empty() && same(lines().back(), 1, 0, oy, 860, oy));
+  CHECK(f->mock->blePlotX() == 860);
+  // SORGN makes the pen's position the origin.
+  CHECK(f->run("GLCURSOR (100,100)") == 0);
+  CHECK(f->run("SORGN") == 0);
+  f->mock->clearBlePlot();
+  CHECK(f->run("LINE (0,0)-(10,0)") == 0);
+  CHECK(lines().size() == 1 && same(lines()[0], 1, 400, oy + 400, 440, oy + 400));
+  CHECK(f->run("COLOR 4") == 19);
+  CHECK(f->run("ROTATE 4") == 19);
+  CHECK(f->run("LINE (3000,0)") == 19);
+  CHECK(f->run("LINE (0,0)-(1,1),,,B,1") == 1);
+
+  // In a program, with expressions, as GLOBE.BAS draws (its lines replace
+  // the program above).
+  f->key(pc1500::Key::Cl);
+  f->key(pc1500::Key::Mode);  // RUN -> PRO, to type it
+  CHECK(f->typeProgram("10 GRAPH:X=50:Y=-20:T=0\n20 LINE -(X,Y),T\n"));
+  f->key(pc1500::Key::Cl);
+  f->key(pc1500::Key::Mode);
+  f->mock->clearBlePlot();
+  CHECK(f->run("RUN") == 0);
+  CHECK(lines().size() == 1 && same(lines()[0], 1, 0, oy + 400, 200, oy + 320));  // GRAPH keeps the pen
+
+  // TEST: a box in each pen.
+  f->mock->clearBlePlot();
+  CHECK(f->run("TEST") == 0);
+  CHECK(lines().size() == 16);
+  if (lines().size() == 16)
+    for (int i = 0; i < 16; i++) CHECK(lines()[i].pen == i / 4);
+
+  // LLIST: two lines at CSIZE 2, 24 steps apart.
+  f->key(pc1500::Key::Cl);
+  f->key(pc1500::Key::Mode);  // RUN -> PRO
+  CHECK(f->typeProgram("10 REM HI\n20 END\n"));
+  y = f->mock->blePlotY();
+  f->mock->clearBlePlot();
+  CHECK(f->run("LLIST") == 0);
+  CHECK(!lines().empty());
+  CHECK(f->mock->blePlotY() == y - 2 * 96);
+
+  // LLIST "label" (2026-10-01): the line that starts with it, or from it on.
+  CHECK(f->typeProgram("10 \"A\" REM 1\n20 \"B\" REM 2\n30 REM 3\n"));
+  y = f->mock->blePlotY();
+  CHECK(f->run("LLIST \"B\"") == 0);
+  CHECK(f->mock->blePlotY() == y - 96);
+  CHECK(f->run("LLIST \"B\",") == 0);
+  CHECK(f->mock->blePlotY() == y - 3 * 96);
+  CHECK(f->run("LLIST \"Z\"") == 11);
+
+  // LPRINT USING (GRAPH mode only): each drawn exactly as LPRINT draws the
+  // text the manual's rules give (pp.80-83).
+  CHECK(f->run("LPRINT USING \"##\";1") == 73);  // TEXT mode
+  CHECK(f->run("GRAPH") == 0);
+  auto drawn = [&](const std::string& statement, int* erl) {
+    CHECK(f->run("GLCURSOR (0,-300)") == 0);
+    f->mock->clearBlePlot();
+    *erl = f->run(statement);
+    return f->mock->blePlotLines();
+  };
+  auto sameAs = [&](const std::string& statement, const std::string& text) {
+    int e1, e2;
+    auto got = drawn(statement, &e1);
+    auto want = drawn("LPRINT USING;\"" + text + "\"", &e2);  // with no format (formats last)
+    bool same = e1 == 0 && e2 == 0 && got.size() == want.size() && !got.empty();
+    for (size_t i = 0; same && i < got.size(); i++)
+      same = got[i].x0 == want[i].x0 && got[i].y0 == want[i].y0 && got[i].x1 == want[i].x1 && got[i].y1 == want[i].y1;
+    if (!same) {
+      std::printf("  %s: not drawn as \"%s\" (ERL %d, %zu lines, %zu expected)\n", statement.c_str(), text.c_str(), e1,
+                  got.size(), want.size());
+      for (size_t i = 0; i < got.size() && i < want.size(); i++)
+        if (got[i].x0 != want[i].x0 || got[i].y0 != want[i].y0) {
+          std::printf("  first difference, line %zu: (%d,%d) vs (%d,%d)\n", i, got[i].x0, got[i].y0, want[i].x0,
+                      want[i].y0);
+          break;
+        }
+    }
+    return same;
+  };
+  CHECK(sameAs("LPRINT USING \"####.##\";3.14159", "   3.14"));  // decimals cut, not rounded
+  CHECK(sameAs("LPRINT USING \"###.###\";-3.14159", " -3.141"));
+  CHECK(sameAs("LPRINT USING \"*######\";1234", " **1234"));
+  CHECK(sameAs("LPRINT USING \"+###.##^\";3.14159", "+3.14E 00"));
+  CHECK(sameAs("LPRINT USING \"###,###,###\";246813", "  246,813"));
+  CHECK(sameAs("LPRINT USING \"&&&\";\"ABCDEF\"", "ABC"));
+  CHECK(sameAs("LPRINT USING \"&&&&###\";\"AB\";12", "AB   12"));  // 4 + 3 wide
+  CHECK(sameAs("LPRINT USING \"##.#\";1.25", " 1.2"));
+  CHECK(f->run("LPRINT USING \"##.#\"") == 0);
+  CHECK(sameAs("LPRINT 1.25", " 1.2"));  // the format lasts...
+  CHECK(f->run("LPRINT USING \"##.#\"") == 0);
+  CHECK(sameAs("LPRINT USING;1.25", "1.25"));  // ...until USING alone
+  int erl;
+  drawn("LPRINT USING \"##\";1234", &erl);
+  CHECK(erl == 36);  // too wide for the field
+  CHECK(f->run("LPRINT USING") == 0);
+
+  // GRAPH mode's bare LPRINT (p.123): the pen returns and the paper feeds,
+  // but the counters don't change -- the next LINE is that much over.
+  CHECK(f->run("SORGN") == 0);
+  CHECK(f->run("GLCURSOR (150,30)") == 0);
+  int32_t ly = f->mock->blePlotY();
+  CHECK(f->run("LPRINT") == 0);
+  CHECK(f->mock->blePlotX() == 0 && f->mock->blePlotY() == ly - 96);
+  f->mock->clearBlePlot();
+  CHECK(f->run("LINE -(160,30),0") == 0);  // believed 10 steps right of the pen
+  CHECK(lines().size() == 1 && same(lines()[0], lines()[0].pen, 0, ly - 96, 40, ly - 96));
+  CHECK(f->run("TEXT") == 0);
+
+  // A peer that doesn't take PLOT is no printer either.
+  f->mock->setBlePeerPlots(false);
+  CHECK(f->run("LPRINT \"X\"") == 27);
+  f->mock->setBlePeerPlots(true);
+}
+
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+// The firmware's basic_xlate (2026-10-01) on its own: a program's E1C0-E1C6
+// become E680-E686 as it's saved and back as it's loaded, only in real
+// tokens -- not a line number, not quoted text, not the module's other E1
+// keywords -- however the transfer is cut into chunks.
+void testBasicXlateChunks() {
+  auto line = [](uint16_t number, std::vector<uint8_t> body) {
+    body.push_back(0x0D);
+    std::vector<uint8_t> l = {static_cast<uint8_t>(number >> 8), static_cast<uint8_t>(number),
+                              static_cast<uint8_t>(body.size())};
+    l.insert(l.end(), body.begin(), body.end());
+    return l;
+  };
+  // line 57792 (E1C0): CSIZE, "<E1 C0>", SDSAVE (E186), TEXT; line 10: ROTATE
+  std::vector<uint8_t> ours = line(0xE1C0, {0xE1, 0xC0, '"', 0xE1, 0xC0, '"', 0xE1, 0x86, 0xE1, 0xC6});
+  std::vector<uint8_t> l2 = line(10, {0xE1, 0xC5});
+  ours.insert(ours.end(), l2.begin(), l2.end());
+  ours.push_back(0xFF);
+  std::vector<uint8_t> ce150 = ours;
+  ce150[3] = 0xE6, ce150[4] = 0x80;    // CSIZE
+  ce150[11] = 0xE6, ce150[12] = 0x86;  // TEXT
+  ce150[17] = 0xE6, ce150[18] = 0x85;  // ROTATE
+
+  // Every cut into two chunks, one byte at a time, and two. (A load can't
+  // hold back a read's only byte -- a read of 0 would end it -- so a token
+  // cut across one-byte reads isn't translated; reads are file chunks or
+  // whole BLE frames, and only a file's last byte, FF, comes alone.)
+  std::vector<std::vector<size_t>> cuts;
+  for (size_t k = 0; k <= ours.size(); k++) cuts.push_back({k});
+  std::vector<size_t> ones, twos;
+  for (size_t k = 1; k < ours.size(); k++) ones.push_back(k);
+  for (size_t k = 2; k < ours.size(); k += 2) twos.push_back(k);
+  cuts.push_back(ones);
+  cuts.push_back(twos);
+  for (const auto& cut : cuts) {
+    auto chunks = [&](const std::vector<uint8_t>& all) {
+      std::vector<std::vector<uint8_t>> out;
+      size_t at = 0;
+      for (size_t k : cut) {
+        out.emplace_back(all.begin() + static_cast<long>(at), all.begin() + static_cast<long>(k));
+        at = k;
+      }
+      out.emplace_back(all.begin() + static_cast<long>(at), all.end());
+      return out;
+    };
+    std::vector<uint8_t> saved, loaded;
+    basic_xlate_begin(BASIC_XLATE_SAVE);
+    for (auto c : chunks(ours)) {
+      if (c.empty()) continue;  // the ROM never writes 0 bytes
+      c.resize(c.size() + 1);
+      uint16_t n = basic_xlate_write(c.data(), static_cast<uint16_t>(c.size() - 1));
+      saved.insert(saved.end(), c.begin(), c.begin() + n);
+    }
+    uint8_t last;
+    if (basic_xlate_flush(&last)) saved.push_back(last);
+    basic_xlate_end();
+    basic_xlate_begin(BASIC_XLATE_LOAD);
+    for (auto c : chunks(ce150)) {
+      if (c.empty()) continue;  // a read of 0 is the end, below
+      c.resize(c.size() + 1);
+      uint16_t n = basic_xlate_read(c.data(), static_cast<uint16_t>(c.size() - 1));
+      loaded.insert(loaded.end(), c.begin(), c.begin() + n);
+    }
+    uint8_t end[2];
+    uint16_t n = basic_xlate_read(end, 0);  // the end of the file: anything held
+    loaded.insert(loaded.end(), end, end + n);
+    basic_xlate_end();
+    CHECK(saved == ce150);
+    if (cut.size() != ones.size() || cut != ones) CHECK(loaded == ours);
+    else loaded = ours;
+    if (saved != ce150 || loaded != ours) std::printf("  cut at %zu (%zu cuts)\n", cut[0], cut.size());
+  }
+}
+#endif
+
+// The CE-150 ROM, attached the way the user's emulator has one: at A000H,
+// visible whatever PV is (as this module's own).
+static bool attachCe150(BootedMachine& m) {
+  static std::vector<uint8_t> rom = readFile("C:/Users/paulc/Documents/PC1500/CE-150.ROM");
+  if (rom.size() != 0x2000) return false;
+  m.bus.loadRomModule(1, rom.data(), rom.size(), 0xA000, /*requirePv=*/false, /*usePuBank=*/false);
+  return true;
+}
+
+// Saving and loading a program (2026-10-01, RP2350/basic_xlate.h): files
+// hold the CE-150's E68x codes; a load makes them this module's E1Cx
+// unless a CE-150 is attached. And this module's E1Cx keywords hand over
+// to a real CE-150's own routines once one is attached.
+void testCe150CodesSaveLoadAndHandOver() {
+  auto f = bleFixture("testCe150CodesSaveLoadAndHandOver");
+  if (!f) return;
+  auto has = [](const std::vector<uint8_t>& bytes, uint8_t hi, uint8_t lo) {
+    for (size_t i = 0; i + 1 < bytes.size(); i++)
+      if (bytes[i] == hi && bytes[i + 1] == lo) return true;
+    return false;
+  };
+  auto onCard = [&](const char* name) {
+    std::ifstream in(f->sdDir / name, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  };
+  CHECK(f->typeProgram("10 CSIZE 3:TEXT\n20 REM \"CSIZE\"\n"));
+  std::vector<uint8_t> ours = f->program();
+  CHECK(has(ours, 0xE1, 0xC0) && has(ours, 0xE1, 0xC6));
+  CHECK(f->run("SDSAVE \"P.BAS\"") == 0);
+  std::vector<uint8_t> file = onCard("P.BAS");
+  CHECK(has(file, 0xE6, 0x80) && has(file, 0xE6, 0x86) && !has(file, 0xE1, 0xC0));
+  CHECK(f->run("NEW") == 0);
+  CHECK(f->run("SDLOAD \"P.BAS\"") == 0);
+  CHECK(f->program() == ours);  // no CE-150: this module's codes again
+  f->connect();
+  CHECK(f->run("BLSAVE \"Q.BAS\"") == 0);
+  CHECK(f->mock->bleFiles()["Q.BAS"] == file);
+  CHECK(f->run("NEW") == 0);
+  CHECK(f->run("BLLOAD \"Q.BAS\"") == 0);
+  CHECK(f->program() == ours);
+  CHECK(f->run("BLDISC") == 0);
+
+  // Run, no link and no CE-150: this module's CSIZE has no printer.
+  f->key(pc1500::Key::Cl);
+  f->key(pc1500::Key::Mode);  // PRO -> RUN
+  CHECK(f->run("RUN") == 27);
+
+  if (!attachCe150(*f->m)) {
+    std::printf("SKIP: the CE-150 half of testCe150CodesSaveLoadAndHandOver -- CE-150.ROM not found.\n");
+    return;
+  }
+  // The same program now runs the CE-150's own CSIZE (CE-150 ROM LB180: the
+  // size at 79F4H, no printer needed) and TEXT -- which, with the ROM but no
+  // printer here, stops at its own "printer not ready" check (LB0EB): the
+  // CE-150's ERROR 78, not this module's ERROR 27.
+  f->m->bus.writeME0(0x79F4, 0);
+  {
+    int e = f->run("RUN");
+    CHECK(e == 78);
+    if (e != 78) std::printf("  RUN with a CE-150: ERL %d, 79F4H %02X\n", e, f->m->bus.readME0(0x79F4));
+  }
+  CHECK(f->m->bus.readME0(0x79F4) == 3);
+  f->m->bus.writeME0(0x79F4, 0);
+  CHECK(f->run("CSIZE 5") == 0);  // typed with a CE-150 there: its own code
+  CHECK(f->m->bus.readME0(0x79F4) == 5);
+  // A load with a CE-150 attached keeps its codes.
+  f->key(pc1500::Key::Cl);
+  f->key(pc1500::Key::Mode);  // RUN -> PRO
+  CHECK(f->run("NEW") == 0);
+  CHECK(f->run("SDLOAD \"P.BAS\"") == 0);
+  std::vector<uint8_t> loaded = f->program();
+  CHECK(has(loaded, 0xE6, 0x80) && !has(loaded, 0xE1, 0xC0));
+}
+
+// GLOBE.BAS (the CE-150 program in Documents/PC1500) end to end, with its
+// INPUTs replaced by fixed answers, on a machine with 26K of expansion RAM
+// (16K at 0000H, 10K at 4800H): it doesn't fit the bare 3.5K. It ends by
+// design on the READ past its DATA (ON ERROR GOTO 560). What the peer drew goes to
+// %TEMP%/testCe150Globe/globe_lines.txt, "pen x0 y0 x1 y1" a line, to look
+// at. Slow (minutes): expansion_keyword_test Globe.
+void testCe150Globe() {
+  std::ifstream in("C:/Users/paulc/Documents/PC1500/GLOBE.BAS.TXT");
+  if (!in) {
+    std::printf("SKIP: testCe150Globe -- GLOBE.BAS.TXT not found.\n");
+    return;
+  }
+  auto f = bleFixture("testCe150Globe");
+  if (!f) return;
+  std::string text, line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.rfind("20 ", 0) == 0) line = "20 S=10:A=20:B=30:F=0:G=30:P=10";
+    else if (line.rfind("30 ", 0) == 0) line = "30 V$=\"N\"";
+    else if (line.rfind("70 ", 0) == 0) line = "70 CO$=\"Y\"";
+    if (!line.empty()) text += line + "\n";
+  }
+  f->connect();
+  CHECK(f->typeProgram(text));
+  f->key(pc1500::Key::Cl);
+  f->key(pc1500::Key::Mode);  // PRO -> RUN
+  f->mock->clearBlePlot();
+  f->m->bus.writeME0(kErlAbs, 0);
+  tapKey(*f->m, pc1500::Key::Cl);
+  typeText(*f->m, "RUN");
+  tapKey(*f->m, pc1500::Key::Ent);
+  bool idle = false;
+  for (int i = 0; i < 500 && !idle; i++) idle = waitForIdle(*f->m, 20'000'000);
+  CHECK(idle);
+  const auto& lines = f->mock->blePlotLines();
+  std::printf("  GLOBE: %zu lines in %d frames\n", lines.size(), f->mock->blePlotFrames());
+  CHECK(lines.size() > 500);
+  std::ofstream out(f->sdDir / "globe_lines.txt");
+  for (const auto& l : lines) {
+    CHECK(l.x0 >= 0 && l.x0 <= 860 && l.x1 >= 0 && l.x1 <= 860);
+    out << int(l.pen) << ' ' << l.x0 << ' ' << l.y0 << ' ' << l.x1 << ' ' << l.y1 << '\n';
+  }
+  std::printf("  wrote %s\n", (f->sdDir / "globe_lines.txt").string().c_str());
+}
+
+int main(int argc, char** argv) {
+  // expansion_keyword_test [part of a test's name]: only the tests whose
+  // names contain it (the whole suite takes about 11 minutes).
+  const char* only = argc > 1 ? argv[1] : nullptr;
+#define RUN(test)                                                              \
+  do {                                                                         \
+    if (!only || std::string(#test).find(only) != std::string::npos) test(); \
+  } while (0)
+  RUN(testCe150Plotter);
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  RUN(testBasicXlateChunks);
+#endif
+  RUN(testCe150CodesSaveLoadAndHandOver);
+  if (only) RUN(testCe150Globe);  // only when asked for: it takes minutes
+  RUN(testFnKeysAndStateSaveRestore);
+  RUN(testKeywordsInProgramWithExpressions);
+
+  RUN(testMconfShowsAndSetsSettings);
+  RUN(testBleScanConnectAndDisconnect);
+  RUN(testBleAdvertiseWaitsForPeer);
+  RUN(testBlePutToPeer);
+  RUN(testBleGetFromPeer);
+  RUN(testBleMessaging);
+  RUN(testSdeofEndsReadLoop);
+  RUN(testBlePrintText);
+  RUN(testBleListMatchesDetokenizer);
+  RUN(testBleSaveLoad);
+  RUN(testMlogmsgLogsLiteralAndStringVariable);
+  RUN(testBootHookStagesRomThenSkipsOnReset);
+  RUN(testStageQueryIsRecognizedKeyword);
+  RUN(testDebugBareWordIsNotAReservedKeyword);
+  RUN(testStageDebugIsRecognizedKeyword);
+  RUN(testStageBlockChecksumAlgorithmMatchesIndependentComputation);
+  RUN(testMlogViewIsRecognized);
+  RUN(testMlogVerboseIsRecognized);
+  RUN(testMlogQuietIsRecognized);
+  RUN(testMlogResetIsRecognized);
+  RUN(testSlsExitThenTypingDoesNotConcatenate);
+  RUN(testSdlsHidesBlinkingCursorDuringBrowse);
+  RUN(testSdlsScrollUpDoesNotCorruptEntryPastScratchOffset);
+  RUN(testStrayEnterAfterSlsExitDoesNotRedispatch);
+  RUN(testSdloadSelectsAndLoadsFile);
+  RUN(testSdloadDirectFilenameLoad);
+  RUN(testSdloadMHeaderBrowseSelectsFile);
+  RUN(testSdloadMDirectHeaderAddress);
+  RUN(testSdloadMExplicitAddressDecimal);
+  RUN(testSdloadMExplicitAddressHex);
+  RUN(testSdsaveBasicRoundTrip);
+  RUN(testSdsaveSdloadWidenedChunkRoundTrip);
+  RUN(testSdsaveOverwritePromptNAborts);
+  RUN(testSdsaveOverwritePromptYOverwrites);
+  RUN(testSdsaveDashYSkipsPrompt);
+  RUN(testSdsaveNoArgsRaisesError1);
+  RUN(testSdsaveBareSavesAsLastLoaded);
+  RUN(testSdsaveMMissingArgsRaisesError1);
+  RUN(testSdsaveMCallAddressRoundTrip);
+  RUN(testSdloadFileNotFoundRaisesError40);
+  RUN(testSdloadUsesLiveProgramStartPointer);
+  RUN(testSaveLoadBasicProgramUsesLiveProgramStartPointer);
+  RUN(testSdmkdirCreatesDirectory);
+  RUN(testSdmkdirFailsIfDirectoryAlreadyExists);
+  RUN(testSdrmdirRemovesEmptyDirectory);
+  RUN(testSdrmdirFailsOnNonEmptyDirectory);
+  RUN(testSdcdAffectsSubsequentFileCommands);
+  RUN(testSdlsListsDirectoriesWithDirMarker);
+  RUN(testSdpwdStagesCurrentDirectoryResponse);
+  RUN(testSdDirectoryCommandsRaiseError1WithoutArgument);
+  RUN(testSdloadUppercasesLowercaseFilename);
+  RUN(testSdmkdirRejectsNon83ShapedNames);
+  RUN(testSdcdDotAndDotDotStillWork);
+  RUN(testSdcdMultiSegmentPathValidatesEachSegment);
+  RUN(testSdPlusTildeTranslation);
+  RUN(testSdrmDeletesWithConfirmation);
+  RUN(testSdrmNAbortsDeletion);
+  RUN(testSdrmDashYSkipsPrompt);
+  RUN(testSdrmMissingFilenameRaisesError1);
+  RUN(testSdrmCannotRemoveDirectory);
+  RUN(testSdcpCopiesFile);
+  RUN(testSdcpMissingSourceRaisesError40);
+  RUN(testSdmvMovesFile);
+  RUN(testSddfDisplaysFreeAndTotalSpace);
+  RUN(testSdmvIntoExistingDirectory);
+  RUN(testSdcpIntoExistingDirectory);
+  RUN(testSdmvWithDotDotRelativeSource);
+  RUN(testSdcpWithAbsoluteDestinationPath);
+  RUN(testSdcpOverwritePromptNAborts);
+  RUN(testSdcpOverwritePromptYOverwrites);
+  RUN(testSdcpDashYSkipsPrompt);
+  RUN(testSdmvOverwritePromptNAborts);
+  RUN(testSdloadFromAbsolutePath);
+  RUN(testSdopenCreatesFileAndListsChannel);
+  RUN(testSdopenReusingChannelClosesPrevious);
+  RUN(testSdcloseClosesOneAndAll);
+  RUN(testSdprintSdinputNumericRoundTrip);
+  RUN(testSdprintSdinputStringRoundTrip);
+  RUN(testSdinputEofFillsZeroAndBlank);
+  RUN(testSdskipAdvancesAndRaisesError40PastEnd);
+  RUN(testSdChannelCommandsRaiseError1OnMalformedArgument);
+  RUN(testSdinputOverlongStringRaisesError42);
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");
