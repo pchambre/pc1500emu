@@ -425,6 +425,24 @@ std::filesystem::path defaultBleFilesDir() {
   return base / "Documents" / "PC1500-BLE-emu";
 }
 
+// The Link's identity and pairings (2026-10-03, BLE_PROTOCOL.md sec.7):
+// this user's own settings folder, never the files folder peers can read.
+// LinkCore encrypts the file with DPAPI on Windows, owner-only elsewhere.
+std::filesystem::path blePairingFile() {
+#if defined(_WIN32)
+  const char* base = std::getenv("LOCALAPPDATA");
+  if (!base) base = std::getenv("USERPROFILE");
+  std::filesystem::path dir = base ? std::filesystem::path(base) / "pc1500emu" : std::filesystem::temp_directory_path();
+#else
+  const char* xdg = std::getenv("XDG_CONFIG_HOME");
+  const char* home = std::getenv("HOME");
+  std::filesystem::path dir = xdg && *xdg ? std::filesystem::path(xdg) / "pc1500emu"
+                              : home      ? std::filesystem::path(home) / ".config" / "pc1500emu"
+                                          : std::filesystem::temp_directory_path();
+#endif
+  return dir / "link_pairings.bin";
+}
+
 struct HostBle {
   std::shared_ptr<pc1500::ble::LinkCore> core;
   std::string unavailable;
@@ -447,6 +465,7 @@ struct HostBle {
       return;
     }
     core = std::make_shared<pc1500::ble::LinkCore>(std::move(transport), dir, bus.expansionMock().hostName());
+    core->setPairingFile(blePairingFile());
     bus.expansionMock().setBleBackend(core);
   }
 
@@ -2037,6 +2056,11 @@ int main(int argc, char** argv) {
       //   ble text                console text a connected PC-1500 has sent
       //                           since the last `ble text` (FF = BLCLS)
       //   ble log                 the link's log (as in the Bluetooth panel)
+      //   ble pair                a PC-1500's pairing waiting here: "CODE NAME",
+      //                           or "none" (2026-10-03, BLE_PROTOCOL.md sec.7)
+      //   ble pair yes|no         this side's answer to it
+      //   ble pairings            one "ID NAME" line per pairing kept
+      //   ble forget ID|all       forgets one, or every one
       std::string sub, arg;
       iss >> sub >> arg;
       if (sub == "backend" && (arg == "fake" || arg == "host")) {
@@ -2060,8 +2084,24 @@ int main(int argc, char** argv) {
         if (hostBle.core)
           for (const std::string& line : hostBle.core->logLines()) log += line + "\n";
         writeResponse(log);
+      } else if ((sub == "pair" || sub == "pairings" || sub == "forget") && !hostBle.core) {
+        writeResponse("ERROR: host Bluetooth isn't in use (" + hostBle.status(appConfig.bleHostBluetooth) + ")");
+      } else if (sub == "pair" && arg.empty()) {
+        std::string code, name;
+        writeResponse(hostBle.core->pendingPairing(&code, &name) ? code + " " + name : "none");
+      } else if (sub == "pair" && (arg == "yes" || arg == "no")) {
+        hostBle.core->answerPairing(arg == "yes");
+        writeResponse("OK");
+      } else if (sub == "pairings") {
+        std::string out;
+        for (const auto& [name, id] : hostBle.core->pairings()) out += id + " " + name + "\n";
+        writeResponse(out);
+      } else if (sub == "forget" && !arg.empty()) {
+        hostBle.core->forgetPairing(arg == "all" ? std::string() : arg);
+        writeResponse("OK");
       } else {
-        writeResponse("ERROR: ble backend fake|host, ble advertise on|off, ble status, ble text, ble log");
+        writeResponse("ERROR: ble backend fake|host, ble advertise on|off, ble status, ble text, ble log, "
+                      "ble pair [yes|no], ble pairings, ble forget ID|all");
       }
     } else if (cmd == "dump") {
       long start = 0, end = 0;
@@ -2501,6 +2541,27 @@ int main(int argc, char** argv) {
       watchStepCycles(static_cast<long>(kIdleFrames) * kCyclesPerFrame);
       watchStepCycles(cycles);
       writeResponse(out.str());
+    } else if (cmd == "kbdtype") {
+      // The expansion module's external keyboard (2026-10-04): types `text`
+      // through the firmware's own key sequencer (RP2350/kbd_seq.c, in the
+      // mock), the way a BLE keyboard would. "\r" (the two characters) is
+      // ENTER. Needs the ROM's keyboard driver, which MCONF BLKBD=1 sets up
+      // at the next reset.
+      std::string text;
+      std::getline(iss, text);
+      size_t start = text.find_first_not_of(' ');
+      text = start == std::string::npos ? "" : text.substr(start);
+      for (size_t i = 0; i < text.size(); i++) {
+        char c = text[i];
+        if (c == '\\' && i + 1 < text.size() && text[i + 1] == 'r') {
+          c = '\r';
+          i++;
+        }
+        if (!bus.expansionMock().kbdChar(c))
+          std::fprintf(stderr, "pc1500emu: 'kbdtype' has no key for char '%c'\n", c);
+      }
+    } else if (cmd == "kbdbreak") {
+      bus.expansionMock().kbdBreak();
     } else if (cmd == "presskey" || cmd == "releasekey") {
       // Direct, synchronous bus.setKeyState -- bypasses the symbolActionQueue
       // that type/key use (which only drains via the normal ~60fps frame
@@ -3718,6 +3779,31 @@ int main(int argc, char** argv) {
           bool advertising = core.advertising();
           if (ImGui::Checkbox("Advertise as a server", &advertising)) core.setAdvertising(advertising);
           ImGui::TextDisabled("Files: %s", hostBle.filesDir.string().c_str());
+          // A PC-1500's BLPAIR (BLE_PROTOCOL.md sec.7): its code, for this
+          // side's answer; it must be the one the PC-1500 shows.
+          std::string pairCode, pairName;
+          if (core.pendingPairing(&pairCode, &pairName)) {
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "%s wants to pair. Code: %s -- the same on its screen?",
+                               pairName.c_str(), pairCode.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Accept")) core.answerPairing(true);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Reject")) core.answerPairing(false);
+          }
+          auto paired = core.pairings();
+          ImGui::TextDisabled("Paired:");
+          if (paired.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("none (a PC-1500 pairs with BLPAIR)");
+          }
+          for (const auto& [name, id] : paired) {
+            ImGui::SameLine();
+            ImGui::TextUnformatted(name.c_str());
+            ImGui::SameLine();
+            ImGui::PushID(id.c_str());
+            if (ImGui::SmallButton("Forget")) core.forgetPairing(id);
+            ImGui::PopID();
+          }
           if (ImGui::BeginTable("##bletable", 2, ImGuiTableFlags_SizingStretchSame)) {
             ImGui::TableNextColumn();
             ImGui::TextUnformatted("Console (from the connected PC-1500)");

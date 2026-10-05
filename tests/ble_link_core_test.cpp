@@ -99,7 +99,7 @@ struct Pair {
   fs::path dir[2];
   std::unique_ptr<LinkCore> pc, server;
 
-  explicit Pair(const char* testName) {
+  Pair(const char* testName, bool paired, int) {
     for (int i = 0; i < 2; i++) {
       dir[i] = fs::temp_directory_path() / (std::string(testName) + "_" + std::to_string(i));
       fs::remove_all(dir[i]);
@@ -113,7 +113,35 @@ struct Pair {
     server = std::make_unique<LinkCore>(std::move(b), dir[1], "PC-1500 EMU");
     pc->setAnswerTimeoutMs(300);
     server->setAnswerTimeoutMs(300);
+    if (paired) pairUp();
   }
+  explicit Pair(const char* testName, bool paired) : Pair(testName, paired, 0) {}
+  Pair(const char* testName) : Pair(testName, true, 0) {}
+
+  // sec.7's one-time pairing: the PC-1500's BLPAIR "name", Y on both sides.
+  // True once the link authenticated with the new key; left disconnected
+  // and not advertising.
+  bool pairUp(bool serverSays = true) {
+    server->setAdvertising(true);
+    std::vector<uint8_t> w(2048, 0);
+    const std::string name = "PC-1500 EMU";
+    w[0] = 1;
+    w[1] = static_cast<uint8_t>(name.size());
+    std::copy(name.begin(), name.end(), w.begin() + 2);
+    bool ok = pc->command(0x58, w) == 2;  // PAIR_BEGIN: [6 digits][len][name]
+    std::string code(w.begin(), w.begin() + 6), seen, who;
+    ok = ok && server->pendingPairing(&seen, &who) && seen == code && who == "PC-1500";
+    w[0] = 1;
+    ok = ok && pc->command(0x59, w) == 2 && w[0] == 0;  // the server's user hasn't answered
+    server->answerPairing(serverSays);
+    w[0] = 1;
+    ok = ok && pc->command(0x59, w) == 2 && w[0] == (serverSays ? 1 : 2);
+    lastPairAnswer = w[0];
+    if (pc->state() != "idle") pc->command(0x43, w);
+    server->setAdvertising(false);
+    return ok;
+  }
+  int lastPairAnswer = -1;
 };
 
 std::vector<uint8_t> window() { return std::vector<uint8_t>(2048, 0); }
@@ -478,7 +506,69 @@ void testMessages() {
   CHECK(msgCount(*p.pc) == std::make_pair(0, 1));
 }
 
+// Pairing (2026-10-03, sec.7): an unpaired BLCON is refused; BLPAIR with
+// the same code on both sides makes a key both keep (through the pairing
+// file), every later BLCON authenticates with it, and forgetting it on
+// either side ends that.
+void testPairing() {
+  fs::path keys = fs::temp_directory_path() / "ble_core_pair_keys";
+  fs::remove_all(keys);
+  Pair p("ble_core_pair", false);
+  p.server->setPairingFile(keys / "server.bin");
+  auto w = window();
+  p.server->setAdvertising(true);
+  nameSlot(w, "PC-1500 EMU");
+  CHECK(p.pc->command(0x42, w) == kError && w[0] == 8);  // NOT_PAIRED
+  CHECK(!p.wire.connected);
+
+  CHECK(p.pairUp(false) && p.lastPairAnswer == 2);  // the server's user said N
+  CHECK(p.server->pairings().empty());
+  CHECK(p.pairUp());
+  CHECK(p.server->pairings().size() == 1 && p.server->pairings()[0].first == "PC-1500");
+
+  p.server->setAdvertising(true);
+  w = window();
+  nameSlot(w, "PC-1500 EMU");
+  CHECK(p.pc->command(0x42, w) == kOk);
+  CHECK(waitStatus(*p.server, kLinked) & kLinked);
+  auto tw = window();
+  tw[1] = 3;
+  tw[2] = 'A', tw[3] = 'B', tw[4] = '\r';
+  CHECK(p.pc->command(0x44, tw) == kOk);  // sealed both ways
+  CHECK(p.server->consoleText() == "AB\n");
+  CHECK(p.pc->command(0x43, w) == kOk);
+
+  // The server's pairing outlives it.
+  {
+    auto t = std::make_unique<LoopTransport>(&p.wire, 1);
+    LinkCore again(std::move(t), p.dir[1], "X");
+    again.setPairingFile(keys / "server.bin");
+    CHECK(again.pairings() == p.server->pairings());
+  }
+
+  p.wire.advertising[1] = true;  // the copy's goodbye stopped the server's advertising
+  p.wire.name[1] = "PC-1500 EMU";
+  // Forgotten on the server: the PC-1500 is told it isn't paired.
+  p.server->forgetPairing(p.server->pairings()[0].second);
+  w = window();
+  nameSlot(w, "PC-1500 EMU");
+  CHECK(p.pc->command(0x42, w) == kError && w[0] == 8);
+  // Paired again, then forgotten on the PC-1500 (BLUNPAIR "PC-1500 EMU").
+  CHECK(p.pairUp());
+  w = window();
+  w[0] = 11;
+  std::string n = "pc-1500 emu";
+  std::copy(n.begin(), n.end(), w.begin() + 1);
+  CHECK(p.pc->command(0x5B, w) == kOk && w[0] == 1);
+  p.server->setAdvertising(true);
+  w = window();
+  nameSlot(w, "PC-1500 EMU");
+  CHECK(p.pc->command(0x42, w) == kError && w[0] == 8);
+  fs::remove_all(keys);
+}
+
 int main() {
+  testPairing();
   testScanConnectDisconnect();
   testText();
   testPlot();

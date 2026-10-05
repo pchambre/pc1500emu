@@ -9,8 +9,22 @@
 #include <fstream>
 #include <iterator>
 
+#include <cstdio>
+#include <random>
+
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
-#include "plotter.h"  // PLOT's frame splitting, shared with the firmware
+#include "link_secure.h"  // the Link's security (sec.7), shared with the firmware
+#include "plotter.h"      // PLOT's frame splitting, shared with the firmware
+#endif
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dpapi.h>
+#else
+#include <sys/stat.h>
 #endif
 
 namespace pc1500::ble {
@@ -19,14 +33,17 @@ namespace {
 
 // BLE_PROTOCOL.md sec.5
 constexpr uint8_t kHello = 0x01, kBye = 0x02, kText = 0x10;
+constexpr uint8_t kAuth = 0x03, kPairStart = 0x04, kPairNonce = 0x05, kPairConfirm = 0x06;  // sec.7
 constexpr uint8_t kFilePut = 0x20, kFileData = 0x21, kFileEnd = 0x22, kFileGet = 0x23, kFileAbort = 0x24;
 constexpr uint8_t kFileOffer = 0x25, kFileAnswer = 0x26;  // peer-to-peer (2026-09-28)
 constexpr uint8_t kMsg = 0x30;                             // peer messaging (2026-09-29)
-constexpr size_t kMsgMax = 240, kInboxMax = 8;             // EXP_BLE_MSG_MAX, EXP_BLE_MSG_INBOX
+constexpr size_t kMsgMax = 220, kInboxMax = 8;             // EXP_BLE_MSG_MAX, EXP_BLE_MSG_INBOX
 constexpr uint8_t kAck = 0x7E, kErr = 0x7F;
 constexpr uint8_t kErrBadFrame = 1, kErrUnsupported = 2, kErrNotFound = 3, kErrExists = 4, kErrIo = 5,
-                  kErrBusy = 6, kErrAborted = 7;
-constexpr uint8_t kVersion = 1, kKindPc1500 = 1, kTargetServer = 0, kKindUnknown = 0xFF;
+                  kErrBusy = 6, kErrAborted = 7, kErrNotPaired = 8, kErrAuthFailed = 9;
+constexpr uint8_t kVersion = 2, kKindPc1500 = 1, kTargetServer = 0, kKindUnknown = 0xFF;  // 2: sec.7
+constexpr size_t kSealOverhead = 20;  // LS_OVERHEAD: a sealed frame's counter and tag
+constexpr size_t kIdLen = 8, kNonceLen = 16, kKeyLen = 32, kProofLen = 16;
 constexpr uint32_t kSizeUnknown = 0xFFFFFFFFu;
 
 // RP2350/pc_exp.h
@@ -38,6 +55,8 @@ constexpr uint8_t kCmdAdvertise = 0x47, kCmdStatus = 0x48, kCmdOffer = 0x49, kCm
                   kCmdDataRead = 0x4F, kCmdDataClose = 0x50;
 constexpr uint8_t kCmdMsgSend = 0x51, kCmdMsgWait = 0x52, kCmdMsgRecv = 0x53, kCmdMsgCount = 0x54;
 constexpr uint8_t kCmdPlot = 0x57;  // the CE-150 stand-in's drawing (2026-09-30)
+constexpr uint8_t kCmdPairBegin = 0x58, kCmdPairConfirm = 0x59, kCmdPairAnswer = 0x5A, kCmdUnpair = 0x5B;  // sec.7
+constexpr uint8_t kStatusPairAsk = 0x20;
 constexpr uint8_t kPlot = 0x40;
 // EXP_BLE_STATUS_*
 constexpr uint8_t kStatusLinked = 0x01, kStatusAdvertising = 0x02, kStatusOfferIn = 0x04, kStatusAnswered = 0x08,
@@ -101,10 +120,161 @@ void writeText(std::vector<uint8_t>& w, size_t at, const std::string& text, size
   for (size_t i = 0; i < len; i++) w[at + i] = i < text.size() ? static_cast<uint8_t>(text[i]) : ' ';
 }
 
+// Random bytes from the OS (std::random_device is the OS's generator on
+// every platform this builds for).
+void randomBytes(uint8_t* p, size_t n) {
+  std::random_device rd;
+  for (size_t i = 0; i < n; i++) p[i] = static_cast<uint8_t>(rd());
+}
+
+std::string hexOf(const uint8_t* p, size_t n) {
+  static const char kHex[] = "0123456789ABCDEF";
+  std::string s;
+  for (size_t i = 0; i < n; i++) {
+    s += kHex[p[i] >> 4];
+    s += kHex[p[i] & 15];
+  }
+  return s;
+}
+
+// The pairing file's bytes, protected for this user: DPAPI on Windows; on
+// other systems the file itself is made owner-only.
+std::vector<uint8_t> protect(const std::vector<uint8_t>& plain, bool unprotect) {
+#ifdef _WIN32
+  DATA_BLOB in{static_cast<DWORD>(plain.size()), const_cast<BYTE*>(plain.data())}, out{};
+  BOOL ok = unprotect ? CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, 0, &out)
+                      : CryptProtectData(&in, L"pc1500emu Link pairings", nullptr, nullptr, nullptr, 0, &out);
+  if (!ok) return {};
+  std::vector<uint8_t> r(out.pbData, out.pbData + out.cbData);
+  SecureZeroMemory(out.pbData, out.cbData);
+  LocalFree(out.pbData);
+  return r;
+#else
+  (void)unprotect;
+  return plain;
+#endif
+}
+
 }  // namespace
 
+// sec.7's state: this side's identity and pairings, the session, and
+// pairings under way in either role. Its own lock, taken briefly, never
+// while waiting for the peer.
+struct LinkCore::Security {
+  mutable std::mutex m;
+  std::filesystem::path file;
+  uint8_t id[kIdLen] = {};
+  struct Pair {
+    uint8_t id[kIdLen];
+    std::string name;
+    uint8_t ltk[kKeyLen];
+  };
+  std::vector<Pair> pairs;
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  ls_session_t session{};
+#endif
+  bool authed = false;
+  uint8_t nonceC[kNonceLen] = {}, nonceS[kNonceLen] = {}, peerId[kIdLen] = {};
+  bool peerKnown = false;
+  uint8_t linkLtk[kKeyLen] = {};
+  // the advertiser's side of a pairing (answered in serve())
+  int aStep = 0, aAnswer = -1;
+  uint8_t aSk[32] = {}, aPkC[32] = {}, aPkS[32] = {}, aNc[kNonceLen] = {}, aNs[kNonceLen] = {}, aLtk[kKeyLen] = {};
+  uint32_t aCode = 0;
+  std::string aName;
+  // the connector's (BLPAIR)
+  bool cActive = false;
+  uint8_t cPkC[32] = {}, cPkS[32] = {}, cNc[kNonceLen] = {}, cNs[kNonceLen] = {}, cLtk[kKeyLen] = {};
+
+  Security() { randomBytes(id, kIdLen); }
+
+  const Pair* find(const uint8_t* peer) const {
+    for (const Pair& p : pairs)
+      if (std::equal(p.id, p.id + kIdLen, peer)) return &p;
+    return nullptr;
+  }
+  void add(const uint8_t* peer, const std::string& name, const uint8_t* ltk) {
+    Pair* p = const_cast<Pair*>(find(peer));
+    if (!p) {
+      pairs.push_back(Pair{});
+      p = &pairs.back();
+    }
+    std::copy(peer, peer + kIdLen, p->id);
+    p->name = name.substr(0, 16);
+    std::copy(ltk, ltk + kKeyLen, p->ltk);
+    save();
+  }
+  // ["PLK1"][id 8][count][per pairing: id 8, name str8, ltk 32]
+  void save() const {
+    if (file.empty()) return;
+    std::vector<uint8_t> b{'P', 'L', 'K', '1'};
+    b.insert(b.end(), id, id + kIdLen);
+    b.push_back(static_cast<uint8_t>(pairs.size()));
+    for (const Pair& p : pairs) {
+      b.insert(b.end(), p.id, p.id + kIdLen);
+      b.push_back(static_cast<uint8_t>(p.name.size()));
+      b.insert(b.end(), p.name.begin(), p.name.end());
+      b.insert(b.end(), p.ltk, p.ltk + kKeyLen);
+    }
+    std::vector<uint8_t> out = protect(b, false);
+    std::fill(b.begin(), b.end(), 0);
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    std::ofstream f(file, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+    f.close();
+#ifndef _WIN32
+    chmod(file.string().c_str(), 0600);
+#endif
+  }
+  void load() {
+    std::ifstream f(file, std::ios::binary);
+    if (!f) return save();  // a new identity, kept from now on
+    std::vector<uint8_t> raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::vector<uint8_t> b = protect(raw, true);
+    size_t at = 4 + kIdLen + 1;
+    if (b.size() < at || !std::equal(b.begin(), b.begin() + 4, "PLK1")) return;
+    std::copy(b.begin() + 4, b.begin() + 4 + kIdLen, id);
+    pairs.clear();
+    for (int n = b[4 + kIdLen]; n > 0 && at + kIdLen + 1 <= b.size(); n--) {
+      Pair p;
+      std::copy(b.begin() + static_cast<long>(at), b.begin() + static_cast<long>(at + kIdLen), p.id);
+      size_t len = b[at + kIdLen];
+      if (at + kIdLen + 1 + len + kKeyLen > b.size()) break;
+      p.name.assign(b.begin() + static_cast<long>(at + kIdLen + 1), b.begin() + static_cast<long>(at + kIdLen + 1 + len));
+      std::copy(b.begin() + static_cast<long>(at + kIdLen + 1 + len),
+                b.begin() + static_cast<long>(at + kIdLen + 1 + len + kKeyLen), p.ltk);
+      pairs.push_back(p);
+      at += kIdLen + 1 + len + kKeyLen;
+    }
+    std::fill(b.begin(), b.end(), 0);
+  }
+  void resetLink() {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+    ls_session_end(&session);
+#endif
+    authed = peerKnown = false;
+    std::fill(linkLtk, linkLtk + kKeyLen, 0);
+    resetAdvertiserPair();
+    resetConnectorPair();
+  }
+  void resetAdvertiserPair() {
+    aStep = 0;
+    aAnswer = -1;
+    std::fill(aSk, aSk + 32, 0);
+    std::fill(aLtk, aLtk + kKeyLen, 0);
+  }
+  void resetConnectorPair() {
+    cActive = false;
+    std::fill(cLtk, cLtk + kKeyLen, 0);
+  }
+};
+
 LinkCore::LinkCore(std::unique_ptr<Transport> transport, std::filesystem::path filesDir, std::string name)
-    : transport_(std::move(transport)), filesDir_(std::move(filesDir)), name_(std::move(name)) {
+    : transport_(std::move(transport)),
+      filesDir_(std::move(filesDir)),
+      name_(std::move(name)),
+      sec_(std::make_unique<Security>()) {
   transport_->onFrame = [this](const std::vector<uint8_t>& f) { onFrame(f); };
   transport_->onLink = [this](bool connected, bool asAdvertiser) { onLink(connected, asAdvertiser); };
   transport_->onLog = [this](const std::string& line) { log(line); };
@@ -124,11 +294,24 @@ LinkCore::~LinkCore() {
 
 // ---- frames in ----
 
-void LinkCore::onFrame(const std::vector<uint8_t>& f) {
-  if (f.size() < 4 || f.size() - 4 != static_cast<size_t>(f[2] | f[3] << 8)) {
-    log("Bad frame (" + std::to_string(f.size()) + " bytes)");
+void LinkCore::onFrame(const std::vector<uint8_t>& raw) {
+  if (raw.size() < 4 || raw.size() - 4 != static_cast<size_t>(raw[2] | raw[3] << 8)) {
+    log("Bad frame (" + std::to_string(raw.size()) + " bytes)");
     return;
   }
+  std::vector<uint8_t> f = raw;
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    if (sec_->session.on) {  // sec.7: every frame sealed; one that fails is dropped
+      std::vector<uint8_t> plain(raw.size());
+      uint16_t n = ls_open(&sec_->session, raw.data(), static_cast<uint16_t>(raw.size()), plain.data());
+      if (n == 0) return log("Dropped a frame that failed authentication");
+      plain.resize(n);
+      f = std::move(plain);
+    }
+  }
+#endif
   {
     std::lock_guard<std::mutex> lock(mutex_);
     Frame frame{f[0], f[1], std::vector<uint8_t>(f.begin() + 4, f.end())};
@@ -136,6 +319,7 @@ void LinkCore::onFrame(const std::vector<uint8_t>& f) {
       answerType_ = f[0];
       answerSeq_ = f[1];
       answerCode_ = f.size() > 4 ? f[4] : 0;
+      answerData_.assign(f.begin() + 4, f.end());  // a pairing ACK's payload
       answerReady_ = true;
     } else if (f[0] == kFileOffer || f[0] == kFileAnswer || f[0] == kMsg ||
                (f[0] == kFileAbort && xfer_ == Xfer::kNone)) {
@@ -153,6 +337,7 @@ void LinkCore::onLink(bool connected, bool asAdvertiser) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     linked_ = connected;
+    linkGen_++;
     asServer_ = connected && asAdvertiser;
     txSeq_ = 0;
     answerReady_ = false;
@@ -160,6 +345,10 @@ void LinkCore::onLink(bool connected, bool asAdvertiser) {
     toServe_.clear();
     helloDone_ = false;
     offerIn_ = offerOut_ = answered_ = false;  // sec.5: a dropped link drops them
+    {
+      std::lock_guard<std::mutex> slock(sec_->m);
+      sec_->resetLink();
+    }
     if (connected) inbox_.clear();             // a new link empties the inbox; a drop doesn't
     if (!connected) {
       peerName_.clear();
@@ -187,24 +376,53 @@ void LinkCore::log(const std::string& line) {
 bool LinkCore::sendFrame(uint8_t type, uint8_t seq, const std::vector<uint8_t>& payload) {
   std::vector<uint8_t> f{type, seq, static_cast<uint8_t>(payload.size()), static_cast<uint8_t>(payload.size() >> 8)};
   f.insert(f.end(), payload.begin(), payload.end());
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    if (sec_->session.on) {  // sec.7
+      std::vector<uint8_t> sealed(f.size() + kSealOverhead);
+      if (ls_seal(&sec_->session, f.data(), static_cast<uint16_t>(f.size()), sealed.data()) == 0) return false;
+      f = std::move(sealed);
+    }
+  }
+#endif
   if (f.size() > transport_->frameMax()) return false;
   return transport_->send(f);
+}
+
+// A frame in the clear even with the session started: the advertiser's
+// ACK of AUTH (sec.7), sent after its session starts so that nothing the
+// connector seals next can arrive before it.
+bool LinkCore::sendPlain(uint8_t type, uint8_t seq, const std::vector<uint8_t>& payload) {
+  std::vector<uint8_t> f{type, seq, static_cast<uint8_t>(payload.size()), static_cast<uint8_t>(payload.size() >> 8)};
+  f.insert(f.end(), payload.begin(), payload.end());
+  return transport_->send(f);
+}
+
+size_t LinkCore::plainMax() { return transport_->frameMax() - kSealOverhead; }
+
+bool LinkCore::authed() const {
+  std::lock_guard<std::mutex> lock(sec_->m);
+  return sec_->authed;
 }
 
 // A frame out and its answer back: 0 for ACK, the ERR code, kNoLink, or
 // kTimeout (the link is then dropped -- sec.4).
 int LinkCore::request(uint8_t type, const std::vector<uint8_t>& payload) {
   uint8_t seq;
+  unsigned gen;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!linked_) return kNoLink;
+    gen = linkGen_;
     seq = txSeq_++;
     answerReady_ = false;
   }
   if (!sendFrame(type, seq, payload)) return kNoLink;
   std::unique_lock<std::mutex> lock(mutex_);
   bool done = cv_.wait_for(lock, std::chrono::milliseconds(answerTimeoutMs_),
-                           [&] { return (answerReady_ && answerSeq_ == seq) || !linked_; });
+                           [&] { return (answerReady_ && answerSeq_ == seq) || linkGen_ != gen; });
+  if (linkGen_ != gen) return kNoLink;  // the link this went out on is gone
   if (done && answerReady_ && answerSeq_ == seq) {
     answerReady_ = false;
     return answerType_ == kAck ? 0 : (answerCode_ ? answerCode_ : kErrBadFrame);
@@ -218,8 +436,10 @@ int LinkCore::request(uint8_t type, const std::vector<uint8_t>& payload) {
 // The peer's next frame (connector side), or false after the timeout.
 bool LinkCore::receive(Frame* out) {
   std::unique_lock<std::mutex> lock(mutex_);
+  unsigned gen = linkGen_;
   bool got = cv_.wait_for(lock, std::chrono::milliseconds(answerTimeoutMs_),
-                          [&] { return !incoming_.empty() || !linked_; });
+                          [&] { return !incoming_.empty() || linkGen_ != gen; });
+  if (linkGen_ != gen) return false;
   if (!got || incoming_.empty()) {
     bool linked = linked_;
     lock.unlock();
@@ -236,7 +456,7 @@ void LinkCore::setName(const std::string& name) {
   name_ = name;
 }
 
-// Our HELLO's payload (sec.5): version, kind, name.
+// Our HELLO's start (sec.5): version, kind, name; the rest is sec.7's.
 std::vector<uint8_t> LinkCore::hello() {
   std::string name;
   {
@@ -286,6 +506,7 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
     case kCmdStatus:
       return status(w);
     case kCmdOffer:
+      if (isLinked() && !authed()) return fail(kErrNotPaired);
       return offer(w);
     case kCmdWithdraw: {
       bool out;
@@ -313,6 +534,7 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
     case kCmdMsgSend: {  // BLSEND: SUCCESS once the peer stored it
       size_t len = (static_cast<size_t>(w[0]) << 8) | w[1];
       if (len == 0 || len > kMsgMax) return fail(kErrBadFrame);
+      if (isLinked() && !authed()) return fail(kErrNotPaired);
       int r = request(kMsg, std::vector<uint8_t>(w.begin() + 2, w.begin() + 2 + static_cast<long>(len)));
       return r == 0 ? kStatusSuccess : fail(r);
     }
@@ -343,9 +565,29 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
       w[1] = (linked_ && helloDone_) ? 1 : 0;
       return kStatusSuccess;
     }
+    case kCmdPairAnswer: {  // the emulated PC-1500's BLADV: its user's answer
+      std::lock_guard<std::mutex> lock(sec_->m);
+      if (sec_->aStep == 2) sec_->aAnswer = w[0] ? 1 : 0;
+      return kStatusSuccess;
+    }
+    case kCmdUnpair: {  // [len][name], 0 = all; out: how many
+      std::string name(w.begin() + 1, w.begin() + 1 + std::min<int>(w[0], 16));
+      std::lock_guard<std::mutex> lock(sec_->m);
+      size_t before = sec_->pairs.size();
+      sec_->pairs.erase(std::remove_if(sec_->pairs.begin(), sec_->pairs.end(),
+                                       [&](const Security::Pair& p) { return name.empty() || sameName(p.name, name); }),
+                        sec_->pairs.end());
+      w[0] = static_cast<uint8_t>(before - sec_->pairs.size());
+      sec_->save();
+      return kStatusSuccess;
+    }
     default:
       break;
   }
+  // sec.7: only an authenticated link carries anything but pairing
+  if ((cmd == kCmdText || cmd == kCmdPlot || cmd == kCmdFilePut ||
+       cmd == kCmdFileGet) && isLinked() && !authed())
+    return fail(kErrNotPaired);
   if (server) {  // a peer is using this emulator as its server
     log("Busy: a peer is connected to this emulator");
     return fail(0);
@@ -360,6 +602,10 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
     case kCmdConnect:
       if (w[0] >= listed_.size()) return fail(0);
       return connectTo(listed_[w[0]], w);
+    case kCmdPairBegin:
+      return pairBegin(w);
+    case kCmdPairConfirm:
+      return pairConfirm(w);
     case kCmdConnectName: {
       std::string wanted = nameFromSlot(w);
       for (const Peer& p : transport_->scan(3000))
@@ -372,7 +618,7 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
     case kCmdPlot: {  // a PLOT payload (RP2350/plotter.h) as frames, each ACKed
       uint16_t len = static_cast<uint16_t>(std::min<size_t>((static_cast<size_t>(w[0]) << 8) | w[1], 1000));
-      std::vector<uint8_t> frame(transport_->frameMax() - 4);
+      std::vector<uint8_t> frame(plainMax() - 4);
       plot_split_t split;
       plot_split_start(&split, &w[2], len);
       while (uint16_t n = plot_split_next(&split, &w[2], len, frame.data(), static_cast<uint16_t>(frame.size()))) {
@@ -414,8 +660,10 @@ uint8_t LinkCore::scan(std::vector<uint8_t>& w) {
   return kStatusSuccess;
 }
 
-// Connects and exchanges HELLOs (sec.5); the peer's name to the window.
-uint8_t LinkCore::connectTo(const Peer& peer, std::vector<uint8_t>& w) {
+// Connects, exchanges HELLOs and authenticates (sec.5, 7) -- or, for a
+// pairing about to start, stops after the HELLOs; the peer's name to the
+// window. ERROR: [kErrNotPaired], [kErrAuthFailed], [0].
+uint8_t LinkCore::connectTo(const Peer& peer, std::vector<uint8_t>& w, bool authenticate) {
   if (isLinked()) disconnectLink();
   if (!transport_->connect(peer)) {
     log("Couldn't connect to " + (peer.name.empty() ? peer.address : peer.name));
@@ -426,31 +674,98 @@ uint8_t LinkCore::connectTo(const Peer& peer, std::vector<uint8_t>& w) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!linked_) {  // the transport reports the link through onLink; make sure
       linked_ = true;
+      linkGen_++;
       txSeq_ = 0;
     }
   }
-  Frame f;
-  if (request(kHello, hello()) != 0 || !receive(&f)) {
-    dropLink("HELLO failed");
-    w[0] = 0;
+  return helloExchange(w, authenticate);
+}
+
+uint8_t LinkCore::helloExchange(std::vector<uint8_t>& w, bool authenticate) {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  (void)authenticate;
+  dropLink("Built without the expansion firmware's link security");
+  w[0] = 0;
+  return kStatusError;
+#else
+  auto failWith = [&](const std::string& why, uint8_t code) {
+    dropLink(why);
+    w[0] = code;
     return kStatusError;
+  };
+  std::vector<uint8_t> h = hello();
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    sec_->resetLink();
+    randomBytes(sec_->nonceC, kNonceLen);
+    h.insert(h.end(), sec_->id, sec_->id + kIdLen);
+    h.insert(h.end(), sec_->nonceC, sec_->nonceC + kNonceLen);
   }
-  if (f.type != kHello || f.payload.size() < 3 || f.payload[0] != kVersion || 3u + f.payload[2] > f.payload.size()) {
+  Frame f;
+  int r = request(kHello, h);
+  if (r != 0 || !receive(&f))
+    return failWith(r == kErrUnsupported ? "The peer speaks an older version" : "HELLO failed",
+                    r == kErrUnsupported ? kErrUnsupported : 0);
+  const std::vector<uint8_t>& p = f.payload;
+  size_t nn = p.size() >= 3 ? p[2] : 0, rest = 3 + nn;
+  bool known = p.size() >= rest + kIdLen + kNonceLen + 1 && p[rest + kIdLen + kNonceLen] == 1;
+  if (f.type != kHello || p.size() < rest + kIdLen + kNonceLen + 1 || p[0] != kVersion ||
+      (known && p.size() < rest + kIdLen + kNonceLen + 1 + kProofLen)) {
     answer(f.seq, kErrUnsupported);
-    dropLink("The peer isn't compatible");
-    w[0] = 0;
-    return kStatusError;
+    return failWith("The peer isn't compatible", kErrUnsupported);
   }
   answer(f.seq);
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    peerName_.assign(f.payload.begin() + 3, f.payload.begin() + 3 + f.payload[2]);
+    peerName_.assign(p.begin() + 3, p.begin() + 3 + static_cast<long>(nn));
+  }
+  uint8_t proof[kProofLen], ltk[kKeyLen];
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    std::copy(p.begin() + static_cast<long>(rest), p.begin() + static_cast<long>(rest + kIdLen), sec_->peerId);
+    std::copy(p.begin() + static_cast<long>(rest + kIdLen), p.begin() + static_cast<long>(rest + kIdLen + kNonceLen),
+              sec_->nonceS);
+    if (authenticate) {
+      const Security::Pair* pair = sec_->find(sec_->peerId);
+      if (!pair) known = false;
+      else std::copy(pair->ltk, pair->ltk + kKeyLen, ltk);
+    }
+  }
+  w[0] = static_cast<uint8_t>(std::min<size_t>(peerName_.size(), 16));
+  std::copy(peerName_.begin(), peerName_.begin() + w[0], w.begin() + 1);
+  if (!authenticate) {
+    log("Connected to " + peerName_ + ", unpaired");
+    return kStatusSuccess;
+  }
+  if (!known) return failWith(peerName_ + " isn't paired with this emulator", kErrNotPaired);
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    ls_auth_proof(ltk, 'S', sec_->nonceC, sec_->nonceS, sec_->id, sec_->peerId, proof);
+  }
+  if (!ls_equal16(proof, &p[rest + kIdLen + kNonceLen + 1])) return failWith(peerName_ + " failed to prove itself", kErrAuthFailed);
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    ls_auth_proof(ltk, 'C', sec_->nonceC, sec_->nonceS, sec_->id, sec_->peerId, proof);
+  }
+  r = request(kAuth, std::vector<uint8_t>(proof, proof + kProofLen));
+  if (r != 0)
+    return failWith(r == kErrAuthFailed ? peerName_ + " no longer has our pairing" : "Authentication failed",
+                    r == kErrAuthFailed || r == kErrNotPaired ? static_cast<uint8_t>(r) : 0);
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    ls_session_start(&sec_->session, ltk, sec_->nonceC, sec_->nonceS, true);
+    sec_->authed = true;
+  }
+  std::fill(ltk, ltk + kKeyLen, 0);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
     helloDone_ = true;
   }
-  log("Connected to " + peerName_);
-  w[0] = static_cast<uint8_t>(peerName_.size());
-  std::copy(peerName_.begin(), peerName_.end(), w.begin() + 1);
+  log("Connected to " + peerName_ + " (authenticated)");
+  w[0] = static_cast<uint8_t>(std::min<size_t>(peerName_.size(), 16));
+  std::copy(peerName_.begin(), peerName_.begin() + w[0], w.begin() + 1);
   return kStatusSuccess;
+#endif
 }
 
 void LinkCore::disconnectLink() {
@@ -470,7 +785,7 @@ void LinkCore::disconnectLink() {
 
 uint8_t LinkCore::text(std::vector<uint8_t>& w) {
   size_t total = (static_cast<size_t>(w[0]) << 8) | w[1];
-  size_t chunk = transport_->frameMax() - 5;
+  size_t chunk = plainMax() - 5;
   for (size_t at = 0; at < total; at += chunk) {
     std::vector<uint8_t> p{0};  // channel 0: the console
     p.insert(p.end(), w.begin() + 2 + static_cast<long>(at), w.begin() + 2 + static_cast<long>(std::min(total, at + chunk)));
@@ -529,7 +844,7 @@ uint8_t LinkCore::fileGet(std::vector<uint8_t>& w) {
 uint8_t LinkCore::write(std::vector<uint8_t>& w) {
   size_t len = static_cast<size_t>(w[kLengthPort] << 8 | w[kLengthPort + 1]);
   if (xfer_ != Xfer::kPut || xferFailed_ || len == 0) return kStatusError;
-  size_t chunk = transport_->frameMax() - 4;
+  size_t chunk = plainMax() - 4;
   for (size_t at = 0; at < len; at += chunk) {
     if (request(kFileData, std::vector<uint8_t>(w.begin() + static_cast<long>(at),
                                                 w.begin() + static_cast<long>(std::min(len, at + chunk)))) != 0) {
@@ -601,6 +916,14 @@ uint8_t LinkCore::status(std::vector<uint8_t>& w) {
   if (advertising_ && !linked_) flags |= kStatusAdvertising;
   if (offerIn_) flags |= kStatusOfferIn;
   if (offerOut_ && answered_) flags |= kStatusAnswered | (accepted_ ? kStatusAccepted : 0);
+  {
+    std::lock_guard<std::mutex> slock(sec_->m);
+    if (sec_->aStep == 2 && sec_->aAnswer < 0) {  // a connector's pairing: its code, for BLADV's user
+      flags |= kStatusPairAsk;
+      uint32_t code = sec_->aCode;
+      for (int i = 5; i >= 0; i--, code /= 10) w[kFileArgs + i] = static_cast<uint8_t>('0' + code % 10);
+    }
+  }
   std::string name = peerName_.substr(0, 16);
   w[0] = flags;
   w[1] = static_cast<uint8_t>(name.size());
@@ -703,20 +1026,24 @@ void LinkCore::serverLoop() {
 
 void LinkCore::serve(const Frame& f) {
   const std::vector<uint8_t>& p = f.payload;
+  switch (f.type) {  // sec.7: anything else needs an authenticated link
+    case kHello:
+      return serveHello(f);
+    case kAuth:
+      return serveAuth(f);
+    case kPairStart:
+    case kPairNonce:
+    case kPairConfirm:
+      return servePair(f);
+    case kBye:
+    case kAck:
+    case kErr:
+      break;
+    default:
+      if (!authed()) return answer(f.seq, kErrNotPaired);
+      break;
+  }
   switch (f.type) {
-    case kHello: {
-      if (p.size() < 3 || p[0] != kVersion || 3u + p[2] > p.size()) return answer(f.seq, kErrUnsupported);
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        peerName_.assign(p.begin() + 3, p.begin() + 3 + p[2]);
-      }
-      log("HELLO from " + peerName_);
-      answer(f.seq);
-      if (request(kHello, hello()) != 0) return log("Our HELLO wasn't answered");
-      std::lock_guard<std::mutex> lock(mutex_);
-      helloDone_ = true;
-      return;
-    }
     case kFileOffer: {  // held for the emulated PC-1500's BLGET (sec.5)
       if (p.size() < 6 || 6u + p[5] > p.size()) return answer(f.seq, kErrBadFrame);
       std::string what;
@@ -850,12 +1177,332 @@ void LinkCore::serveFileGet(const Frame& f) {
   std::vector<uint8_t> n = str8(name);
   header.insert(header.end(), n.begin(), n.end());
   if (request(kFilePut, header) != 0) return log(name + ": refused");
-  size_t chunk = transport_->frameMax() - 4;
+  size_t chunk = plainMax() - 4;
   for (size_t at = 0; at < data.size(); at += chunk) {
     std::vector<uint8_t> part(data.begin() + static_cast<long>(at), data.begin() + static_cast<long>(std::min(data.size(), at + chunk)));
     if (int r = request(kFileData, part); r != 0) return log(name + ": stopped at byte " + std::to_string(at));
   }
   if (request(kFileEnd, {}) == 0) log("Sent " + name);
+}
+
+// ---- advertiser: sec.7's HELLO, AUTH and pairing ----
+
+// The connector's HELLO: ACK it, and send ours -- with our proof if we have
+// a pairing for its id. Also the HELLO a connector sends again after pairing.
+void LinkCore::serveHello(const Frame& f) {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  answer(f.seq, kErrUnsupported);
+#else
+  const std::vector<uint8_t>& p = f.payload;
+  size_t nn = p.size() >= 3 ? p[2] : 0;
+  if (p.size() < 3 || p[0] != kVersion || p.size() < 3 + nn + kIdLen + kNonceLen) {
+    log("A peer with an older Link version was refused");
+    return answer(f.seq, kErrUnsupported);
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    peerName_.assign(p.begin() + 3, p.begin() + 3 + static_cast<long>(nn));
+    helloDone_ = false;
+  }
+  std::vector<uint8_t> h = hello();
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    sec_->resetLink();
+    std::copy(p.begin() + static_cast<long>(3 + nn), p.begin() + static_cast<long>(3 + nn + kIdLen), sec_->peerId);
+    std::copy(p.begin() + static_cast<long>(3 + nn + kIdLen), p.begin() + static_cast<long>(3 + nn + kIdLen + kNonceLen),
+              sec_->nonceC);
+    randomBytes(sec_->nonceS, kNonceLen);
+    const Security::Pair* pair = sec_->find(sec_->peerId);
+    sec_->peerKnown = pair != nullptr;
+    if (pair) std::copy(pair->ltk, pair->ltk + kKeyLen, sec_->linkLtk);
+    h.insert(h.end(), sec_->id, sec_->id + kIdLen);
+    h.insert(h.end(), sec_->nonceS, sec_->nonceS + kNonceLen);
+    h.push_back(pair ? 1 : 0);
+    if (pair) {
+      uint8_t proof[kProofLen];
+      ls_auth_proof(sec_->linkLtk, 'S', sec_->nonceC, sec_->nonceS, sec_->peerId, sec_->id, proof);
+      h.insert(h.end(), proof, proof + kProofLen);
+    }
+  }
+  log("HELLO from " + peerName_);
+  answer(f.seq);
+  if (request(kHello, h) != 0) return log("Our HELLO wasn't answered");
+#endif
+}
+
+// AUTH: the connector's proof; the session starts before the ACK goes out
+// (in the clear, the last frame that is).
+void LinkCore::serveAuth(const Frame& f) {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  answer(f.seq, kErrUnsupported);
+#else
+  uint8_t want[kProofLen];
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    if (!sec_->peerKnown || sec_->authed || f.payload.size() != kProofLen) {
+      uint8_t code = sec_->peerKnown ? kErrBadFrame : kErrNotPaired;
+      sendPlain(kErr, f.seq, {code});
+      return;
+    }
+    ls_auth_proof(sec_->linkLtk, 'C', sec_->nonceC, sec_->nonceS, sec_->peerId, sec_->id, want);
+    if (!ls_equal16(want, f.payload.data())) {
+      sendPlain(kErr, f.seq, {kErrAuthFailed});
+      log(peerName_ + " failed to prove itself");
+      return;
+    }
+    ls_session_start(&sec_->session, sec_->linkLtk, sec_->nonceC, sec_->nonceS, false);
+    std::fill(sec_->linkLtk, sec_->linkLtk + kKeyLen, 0);
+    sec_->authed = true;
+    sendPlain(kAck, f.seq, {});
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    helloDone_ = true;
+  }
+  log(peerName_ + " authenticated");
+#endif
+}
+
+// The pairing frames: answered at once, the ACKs carrying our side; the
+// user's answer comes from the UI (answerPairing) or the emulated PC-1500's
+// BLADV (PAIR_ANSWER).
+void LinkCore::servePair(const Frame& f) {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  answer(f.seq, kErrUnsupported);
+#else
+  const std::vector<uint8_t>& p = f.payload;
+  std::vector<uint8_t> out;
+  uint8_t err = 0;
+  std::string note, peer;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);  // before sec_->m, never inside it (status() takes them in this order)
+    peer = peerName_;
+  }
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    Security& s = *sec_;
+    if (s.authed) {
+      err = kErrBadFrame;
+    } else if (f.type == kPairStart && p.size() == 32) {
+      uint8_t r[32];
+      s.resetAdvertiserPair();
+      randomBytes(r, sizeof r);
+      ls_keypair(r, s.aSk, s.aPkS);
+      std::fill(r, r + 32, 0);
+      std::copy(p.begin(), p.end(), s.aPkC);
+      randomBytes(s.aNs, kNonceLen);
+      out.assign(s.aPkS, s.aPkS + 32);
+      out.resize(32 + kProofLen);
+      ls_pair_commit(s.aPkS, s.aPkC, s.aNs, out.data() + 32);
+      s.aStep = 1;
+    } else if (f.type == kPairNonce && p.size() == kNonceLen && s.aStep == 1) {
+      std::copy(p.begin(), p.end(), s.aNc);
+      if (!ls_pair_ltk(s.aSk, s.aPkC, s.aPkC, s.aPkS, s.aNc, s.aNs, s.aLtk)) {
+        s.resetAdvertiserPair();
+        err = kErrAuthFailed;
+      } else {
+        std::fill(s.aSk, s.aSk + 32, 0);
+        s.aCode = ls_pair_code(s.aPkC, s.aPkS, s.aNc, s.aNs);
+        s.aAnswer = -1;
+        s.aStep = 2;
+        s.aName = peer;
+        out.assign(s.aNs, s.aNs + kNonceLen);
+        note = s.aName + " wants to pair: check its code";
+      }
+    } else if (f.type == kPairConfirm && p.size() == 1 + kProofLen && s.aStep == 2) {
+      if (s.aAnswer < 0) {
+        err = kErrBusy;  // our user hasn't answered: the connector asks again
+      } else if (s.aAnswer == 0 || p[0] != 1) {
+        s.resetAdvertiserPair();
+        out = {0};
+        note = "Pairing refused";
+      } else {
+        uint8_t want[kProofLen];
+        ls_pair_confirm(s.aLtk, 'C', s.peerId, s.id, want);
+        if (!ls_equal16(want, p.data() + 1)) {
+          s.resetAdvertiserPair();
+          err = kErrAuthFailed;
+        } else {
+          s.add(s.peerId, s.aName, s.aLtk);
+          out.assign(1 + kProofLen, 1);
+          ls_pair_confirm(s.aLtk, 'S', s.peerId, s.id, out.data() + 1);
+          note = "Paired with " + s.aName;
+          s.resetAdvertiserPair();
+        }
+      }
+    } else {
+      s.resetAdvertiserPair();
+      err = kErrBadFrame;
+    }
+  }
+  if (!note.empty()) log(note);
+  if (err) return answer(f.seq, err);
+  sendFrame(kAck, f.seq, out);
+#endif
+}
+
+// ---- connector: BLPAIR (sec.7) ----
+
+uint8_t LinkCore::pairBegin(std::vector<uint8_t>& w) {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  w[0] = 0;
+  return kStatusError;
+#else
+  auto fail = [&](const std::string& why, uint8_t code) {
+    dropLink(why);
+    std::lock_guard<std::mutex> lock(sec_->m);
+    sec_->resetConnectorPair();
+    w[0] = code;
+    return kStatusError;
+  };
+  Peer peer;
+  if (w[0] == 0) {
+    if (w[1] >= listed_.size()) return fail("No such peer", 0);
+    peer = listed_[w[1]];
+  } else {
+    std::string wanted(w.begin() + 2, w.begin() + 2 + std::min<int>(w[1], 40));
+    bool found = false;
+    for (const Peer& p : transport_->scan(3000))
+      if (sameName(p.name, wanted)) peer = p, found = true;
+    if (!found) return fail("No peer named " + wanted, 0);
+  }
+  if (connectTo(peer, w, false) != kStatusSuccess) return kStatusError;
+  std::string name = peerName_.substr(0, 16);
+  uint8_t sk[32], pk[32], commit[kProofLen], nc[kNonceLen];
+  randomBytes(sk, 32);
+  ls_keypair(sk, sk, pk);
+  randomBytes(nc, kNonceLen);
+  int r = request(kPairStart, std::vector<uint8_t>(pk, pk + 32));
+  if (r != 0 || answerData_.size() != 32 + kProofLen) return fail("Pairing refused", r > 0 ? static_cast<uint8_t>(r) : 0);
+  std::vector<uint8_t> first = answerData_;
+  r = request(kPairNonce, std::vector<uint8_t>(nc, nc + kNonceLen));
+  if (r != 0 || answerData_.size() != kNonceLen) return fail("Pairing failed", r > 0 ? static_cast<uint8_t>(r) : 0);
+  uint8_t check[kProofLen];
+  bool ok;
+  std::copy(first.begin() + 32, first.end(), commit);
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    Security& s = *sec_;
+    std::copy(pk, pk + 32, s.cPkC);
+    std::copy(first.begin(), first.begin() + 32, s.cPkS);
+    std::copy(nc, nc + kNonceLen, s.cNc);
+    std::copy(answerData_.begin(), answerData_.end(), s.cNs);
+    ls_pair_commit(s.cPkS, s.cPkC, s.cNs, check);
+    ok = ls_equal16(check, commit) && ls_pair_ltk(sk, s.cPkS, s.cPkC, s.cPkS, s.cNc, s.cNs, s.cLtk);
+    std::fill(sk, sk + 32, 0);
+    s.cActive = ok;
+    if (ok) {
+      uint32_t code = ls_pair_code(s.cPkC, s.cPkS, s.cNc, s.cNs);
+      for (int i = 5; i >= 0; i--, code /= 10) w[i] = static_cast<uint8_t>('0' + code % 10);
+    }
+  }
+  if (!ok) return fail("The pairing was tampered with", kErrAuthFailed);
+  w[6] = static_cast<uint8_t>(name.size());
+  std::copy(name.begin(), name.end(), w.begin() + 7);
+  return kStatusSuccess;
+#endif
+}
+
+uint8_t LinkCore::pairConfirm(std::vector<uint8_t>& w) {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  w[0] = 0;
+  return kStatusError;
+#else
+  bool ok = w[0] != 0;
+  std::vector<uint8_t> payload(1 + kProofLen);
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    if (!sec_->cActive) {
+      w[0] = 0;
+      return kStatusError;
+    }
+    payload[0] = ok ? 1 : 0;
+    ls_pair_confirm(sec_->cLtk, 'C', sec_->id, sec_->peerId, payload.data() + 1);
+  }
+  int r = request(kPairConfirm, payload);
+  if (r == kErrBusy) {  // the peer's user hasn't answered yet
+    w[0] = 0;
+    return kStatusSuccess;
+  }
+  auto end = [&] {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    sec_->resetConnectorPair();
+  };
+  if (r != 0 || answerData_.empty()) {
+    end();
+    dropLink("Pairing failed");
+    w[0] = r > 0 ? static_cast<uint8_t>(r) : 0;
+    return kStatusError;
+  }
+  if (!ok || answerData_[0] != 1) {
+    end();
+    log("Pairing refused");
+    disconnectLink();
+    w[0] = 2;
+    return kStatusSuccess;
+  }
+  bool good;
+  {
+    std::lock_guard<std::mutex> lock(sec_->m);
+    uint8_t want[kProofLen];
+    ls_pair_confirm(sec_->cLtk, 'S', sec_->id, sec_->peerId, want);
+    good = answerData_.size() == 1 + kProofLen && ls_equal16(want, answerData_.data() + 1);
+    if (good) sec_->add(sec_->peerId, peerName_, sec_->cLtk);
+    sec_->resetConnectorPair();
+  }
+  if (!good) {
+    dropLink("The pairing was tampered with");
+    w[0] = kErrAuthFailed;
+    return kStatusError;
+  }
+  log("Paired with " + peerName_);
+  std::vector<uint8_t> rest(w.size());
+  if (helloExchange(rest, true) != kStatusSuccess) {  // the new pairing, used at once
+    w[0] = rest[0];
+    return kStatusError;
+  }
+  w[0] = 1;
+  std::copy(rest.begin(), rest.begin() + 1 + rest[0], w.begin() + 1);
+  return kStatusSuccess;
+#endif
+}
+
+// ---- pairing: the UI's side ----
+
+void LinkCore::setPairingFile(const std::filesystem::path& path) {
+  std::lock_guard<std::mutex> lock(sec_->m);
+  sec_->file = path;
+  sec_->load();
+}
+
+bool LinkCore::pendingPairing(std::string* code, std::string* name) const {
+  std::lock_guard<std::mutex> lock(sec_->m);
+  if (sec_->aStep != 2 || sec_->aAnswer >= 0) return false;
+  char text[8];
+  std::snprintf(text, sizeof text, "%06u", static_cast<unsigned>(sec_->aCode));
+  *code = text;
+  *name = sec_->aName;
+  return true;
+}
+
+void LinkCore::answerPairing(bool accept) {
+  std::lock_guard<std::mutex> lock(sec_->m);
+  if (sec_->aStep == 2) sec_->aAnswer = accept ? 1 : 0;
+}
+
+std::vector<std::pair<std::string, std::string>> LinkCore::pairings() const {
+  std::lock_guard<std::mutex> lock(sec_->m);
+  std::vector<std::pair<std::string, std::string>> out;
+  for (const Security::Pair& p : sec_->pairs) out.emplace_back(p.name, hexOf(p.id, kIdLen));
+  return out;
+}
+
+void LinkCore::forgetPairing(const std::string& idHex) {
+  std::lock_guard<std::mutex> lock(sec_->m);
+  sec_->pairs.erase(std::remove_if(sec_->pairs.begin(), sec_->pairs.end(),
+                                   [&](const Security::Pair& p) { return idHex.empty() || hexOf(p.id, kIdLen) == idHex; }),
+                    sec_->pairs.end());
+  sec_->save();
 }
 
 // ---- views ----

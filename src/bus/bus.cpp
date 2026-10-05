@@ -437,6 +437,12 @@ uint8_t Bus::readME0(uint16_t addr) {
         // BUSY rather than whatever the worker thread's writes have
         // gotten to so far.
         if (m.hasDataWindow && addr == m.instructionAddr) return expansionMock_.pollStatusPaced();
+        // The external keyboard's two bytes (2026-10-04) come from the
+        // mock's key sequencer, which runs on the emulated clock.
+        if (m.hasDataWindow && addr == m.dataWindowBase + ExpansionMock::kKbdKeyOffset)
+          return expansionMock_.kbdKeyCell();
+        if (m.hasDataWindow && addr == m.dataWindowBase + ExpansionMock::kKbdBreakOffset)
+          return expansionMock_.kbdBreakCell();
         return v;
       }
     }
@@ -453,6 +459,11 @@ uint8_t Bus::readME0(uint16_t addr) {
           return expansionMock_.sramByte(addr - m.base);
         }
       }
+      // The keyboard driver's wait loop, once KBD_INSTALL has patched it
+      // into the mock's copy of the image (2026-10-04).
+      if (m.hasDataWindow && pv_ == m.requirePv && addr >= m.base &&
+          expansionMock_.kbdLoopByte(addr - m.base, &v))
+        return v;
       if (m.tryRead(addr, pv_, pu_, v)) return v;
     }
     return 0xFF;  // empty socket, or a module present but not selected by the current PV level

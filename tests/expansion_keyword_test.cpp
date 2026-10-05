@@ -3970,10 +3970,15 @@ void testMconfShowsAndSetsSettings() {
   CHECK(run("MCONF HOSTNAME=A$") == 0);
   CHECK(mock.hostName() == "KITCHEN");
 
-  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (5th)
+  // BLKBD (2026-10-04): the external keyboard's driver at the next reset.
+  CHECK(run("MCONF BLKBD=1") == 0);
+  CHECK(mock.configValue(7) == 1);
+
+  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (6th)
   CHECK(shown(0x8002) == "LED=0");
   CHECK(shown(0x8002 + 3 * 30) == "AUTOSTAGE=1");
-  CHECK(shown(0x8002 + 4 * 30) == "HOSTNAME=KITCHEN");
+  CHECK(shown(0x8002 + 4 * 30) == "BLKBD=1");
+  CHECK(shown(0x8002 + 5 * 30) == "HOSTNAME=KITCHEN");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -3982,6 +3987,8 @@ void testMconfShowsAndSetsSettings() {
   CHECK(mock.configValue(0) == 0);
   CHECK(run("MCONF AUTOSTAGE=2") == 1);    // 0 or 1 only
   CHECK(mock.configValue(6) == 1);
+  CHECK(run("MCONF BLKBD=2") == 1);
+  CHECK(mock.configValue(7) == 1);
   CHECK(run("MCONF COLOUR=1") == 1);       // unknown setting
   CHECK(run("MCONF SLEEPWAIT=") == 1);     // no value
   CHECK(mock.configValue(1) == 1000);
@@ -4586,6 +4593,74 @@ void testBleAdvertiseWaitsForPeer() {
   CHECK(f->run("BLADV 1") == 1);  // no arguments
 }
 
+// Pairing (2026-10-03, BLE_PROTOCOL.md sec.7). An unpaired peer refuses
+// BLCON: the reason, then ERROR 40. BLPAIR shows the code for Y/N and waits
+// for the peer's user; a pairing leaves the link up, as BLCON's. BLUNPAIR
+// forgets one by name, or all after a Y. BLADV answers a connector's
+// pairing with the code's Y/N.
+void testBlePairing() {
+  auto f = bleFixture("testBlePairing");
+  if (!f) return;
+  f->mock->setBlePeerPaired("MARVIN", false);
+  CHECK(f->run("BLCON \"MARVIN\"") == 0);
+  CHECK(f->shown() == "BLE: NOT PAIRED - BLPAIR");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->m->bus.readME0(kErlAbs) == 40);
+  CHECK(!f->mock->bleConnected());
+
+  // Refused here: nothing changes.
+  CHECK(f->run("BLPAIR \"marvin\"") == 0);
+  CHECK(f->shown() == "PAIR CODE 123456 Y/N");
+  f->key(pc1500::Key::N);
+  CHECK(f->m->bus.readME0(kErlAbs) == 0);
+  CHECK(!f->mock->blePeerPaired("MARVIN"));
+
+  // Refused there.
+  f->mock->setBlePeerPairAnswer(false, 2);
+  CHECK(f->run("BLPAIR \"MARVIN\"") == 0);
+  f->key(pc1500::Key::Y);
+  CHECK(f->shown() == "BLPAIR: REFUSED");
+  f->key(pc1500::Key::Ent);
+  CHECK(!f->mock->blePeerPaired("MARVIN"));
+
+  // Accepted on both sides, picked from the listing with P.
+  f->mock->setBlePeerPairAnswer(true, 3);
+  CHECK(f->run("BLPAIR") == 0);
+  CHECK(f->shown(0x8002) == "MARVIN");
+  f->key(pc1500::Key::P);
+  CHECK(f->shown() == "PAIR CODE 123456 Y/N");
+  f->key(pc1500::Key::Y);
+  CHECK(f->shown() == "CONNECTED: MARVIN");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->mock->blePeerPaired("MARVIN"));
+  CHECK(f->mock->bleConnected());
+  CHECK(f->run("BLDISC") == 0);
+  f->connect();  // BLCON just works now
+
+  CHECK(f->run("BLUNPAIR \"NOBODY\"") == 40);
+  CHECK(f->run("BLUNPAIR \"MARVIN\"") == 0);
+  CHECK(!f->mock->blePeerPaired("MARVIN"));
+  f->mock->setBlePeerPaired("MARVIN", true);
+  CHECK(f->run("BLUNPAIR") == 0);
+  CHECK(f->shown() == "FORGET ALL PAIRINGS Y/N");
+  f->key(pc1500::Key::N);
+  CHECK(f->mock->blePeerPaired("MARVIN"));
+  CHECK(f->run("BLUNPAIR") == 0);
+  f->key(pc1500::Key::Y);
+  CHECK(!f->mock->blePeerPaired("MARVIN"));
+
+  // BLADV: a connector asks to pair; Y pairs and links it.
+  CHECK(f->run("BLDISC") == 0);
+  f->mock->bleRequestPairing("ZAPHOD");
+  CHECK(f->run("BLADV") == 0);
+  CHECK(f->shown() == "PAIR CODE 123456 Y/N");
+  f->key(pc1500::Key::Y);
+  CHECK(f->mock->blePairAnswered() == 1);
+  CHECK(f->shown() == "CONNECTED: ZAPHOD");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->mock->bleConnected());
+}
+
 // BLPUT offers the program, memory, or a card file; the peer's answer
 // decides. Each form's bytes are what the matching SDSAVE would write.
 void testBlePutToPeer() {
@@ -5078,6 +5153,230 @@ void testCe150Globe() {
   std::printf("  wrote %s\n", (f->sdDir / "globe_lines.txt").string().c_str());
 }
 
+// The external keyboard's driver (2026-10-04). With MCONF BLKBD=1 the boot
+// hook copies ROM1's keyboard wait loop to the MCU, which patches it into
+// the ROM image at KBD_LOOP (RP2350/kbd_seq.c kbd_loop_install(), in the
+// mock), and arms the base ROM's keyboard hook (79D4H = 55H, vector
+// 785BH/785CH = KBD_HOOK at 880EH). The firmware's key sequencer (also in
+// the mock) then types: the real keyboard still works through the driver,
+// and the sequencer's keys reach BASIC as the same matrix keys -- letters,
+// digits, shifted symbols (a Shift tap first), ENTER -- and its ON is a
+// BREAK, here stopping a program waiting at INPUT. OFF goes through the
+// loop's own power-off, so the hook is still there after ON. And with
+// AUTOSTAGE=1 too, the loop is in place before staging, so the SRAM copy
+// has it.
+void testExternalKeyboardDriver() {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  std::printf("SKIP: testExternalKeyboardDriver -- built without the firmware sources.\n");
+#else
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomDir =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom/";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomDir + "rom_8800.bin");
+  std::vector<uint8_t> romBin = readFile(kExpRomDir + "rom.bin");
+  if (rom.empty() || expRom.empty() || romBin.size() < 0x800) {
+    std::printf("SKIP: testExternalKeyboardDriver -- ROM1.BIN, rom_8800.bin and/or rom.bin not found.\n");
+    return;
+  }
+  // The address the loop's own idle HLT returns to (ROM1 E2AAH, where BASIC
+  // waits for a key) once it's copied to KBD_LOOP: KBD_HOOK (880EH) jumps
+  // to KBD_ENTRY, whose own jump goes to KBD_LOOP.
+  const uint16_t kbdEntry = static_cast<uint16_t>((expRom[0x0F] << 8) | expRom[0x10]);
+  const uint16_t kbdLoop = static_cast<uint16_t>((expRom[0x11] << 8) | expRom[0x12]);
+  const uint16_t kDriverIdle = static_cast<uint16_t>(kbdLoop + (0xE2AA - 0xE24A));
+  CHECK(kbdEntry >= 0x8800 && kbdLoop >= 0x8800);
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_kbd");
+  auto m = std::make_unique<BootedMachine>();
+  m->bus.ioPort().useManualRtcClock();
+  m->bus.loadME0(0xC000, rom.data(), rom.size());
+  m->bus.setExtRam0000Size(0x4000);
+  m->bus.setExtRamExtSize(0x2800);
+  m->bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x8800, /*requirePv=*/false,
+                             /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
+                             /*dataWindowSize=*/0x800, /*instructionAddr=*/0x87FF, romBin.data(),
+                             0x800);
+  m->bus.expansionMock().setRootDir(sdDir);
+  pc1500::ExpansionMock& mock = m->bus.expansionMock();
+
+  auto idle = [&]() {
+    for (long i = 0; i < 4'000'000; i++) {
+      if (m->cpu.halted() && (m->cpu.p() == kIdleAddr || m->cpu.p() == kDriverIdle)) return true;
+      stepOne(*m);
+    }
+    return false;
+  };
+  auto resetAndBoot = [&]() {
+    m->cpu.reset();
+    for (long c = 0; !m->cpu.halted() && c < 20'000'000; c++) stepOne(*m);
+    for (long i = 0; i < 4'000'000; i++) stepOne(*m);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "NEW0");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(idle());
+  };
+  auto armed = [&]() {
+    return m->bus.readME0(0x79D4) == 0x55 && m->bus.readME0(0x785B) == 0x88 && m->bus.readME0(0x785C) == 0x0E;
+  };
+  auto external = [&](const std::string& text) {  // types it, then waits for BASIC
+    for (char c : text) CHECK(mock.kbdChar(c));
+    for (long i = 0; i < 40'000'000 && mock.kbdBusy(); i++) stepOne(*m);
+    CHECK(!mock.kbdBusy());
+    return idle();
+  };
+  auto number = [&](uint16_t at) {  // exponent, then the first mantissa byte
+    return (m->bus.readME0(at) << 8) | m->bus.readME0(static_cast<uint16_t>(at + 2));
+  };
+
+  // BLKBD defaults to 0: no driver.
+  resetAndBoot();
+  CHECK(m->bus.readME0(0x79D4) == 0x00);
+  CHECK(m->bus.readME0(kbdLoop) != rom[0xE24A - 0xC000]);
+
+  mock.setConfigValue(pc1500::ExpansionMock::kConfigBlkbd, 1);
+  resetAndBoot();
+  CHECK(armed());
+  CHECK(m->bus.readME0(kbdLoop) == rom[0xE24A - 0xC000]);
+
+  // The real keyboard, through the driver.
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "A=12+3");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(idle());
+  CHECK(m->cpu.p() == kDriverIdle);
+  CHECK(number(0x7900) == 0x0115);
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+
+  // The external one: a line and its ENTER, then shifted symbols.
+  CHECK(external("B=2*3\r"));
+  CHECK(number(0x7908) == 0x0060);  // 6: exponent 0, mantissa 6
+  CHECK(external("PRINT \"X\";"));
+  CHECK(readDisplayBuffer(m->bus) == "PRINT \"X\";");
+  CHECK(mock.kbdTap(0xB5, false));  // CL
+  CHECK(external(""));
+
+  // ON = BREAK: a program waiting at INPUT stops, and the next line typed is
+  // a command again, not INPUT's answer.
+  std::string typeError;
+  CHECK(pc1500::basic::typeBasicProgramText(m->bus, m->cpu, "10 INPUT E\n20 F=9\n", kCyclesPerFrame,
+                                            kCyclesPerTimerTick, &typeError));
+  tapKey(*m, pc1500::Key::Cl);
+  tapKey(*m, pc1500::Key::Mode);  // PRO -> RUN
+  CHECK(external("RUN\r"));       // waits at INPUT
+  mock.kbdBreak();
+  CHECK(idle());
+  for (int i = 0; i < 3'000'000; i++) stepOne(*m);
+  CHECK(idle());
+  CHECK(external("G=1\r"));
+  CHECK(number(0x7930) == 0x0010);  // G = 1
+  CHECK(number(0x7928) == 0);       // F: line 20 never ran
+  CHECK(number(0x7920) == 0);       // E: INPUT got nothing
+
+  // OFF, then ON: still armed, and still typing.
+  tapKey(*m, pc1500::Key::Off);
+  for (int i = 0; i < 2'000'000; i++) stepOne(*m);
+  CHECK(armed());
+  m->cpu.pressOnKey();
+  m->bus.ioPort().setOnKeyLine(true);
+  m->cpu.requestMI();
+  for (int i = 0; i < 200'000; i++) stepOne(*m);
+  m->bus.ioPort().setOnKeyLine(false);
+  CHECK(idle());
+  CHECK(armed());
+  CHECK(external("H=2\r"));
+  CHECK(number(0x7938) == 0x0020);  // H = 2
+
+  // A Bluetooth keyboard's boot reports, keys going down and up about as
+  // fast as a typist's: Ctrl+J is ignored, Shift+= is +, F7 is CL, Enter
+  // is held like the host keyboard's.
+  auto hid = [&](uint8_t mods, uint8_t usage) {
+    const uint8_t down[8] = {mods, 0, usage, 0, 0, 0, 0, 0}, up[8] = {mods, 0, 0, 0, 0, 0, 0, 0};
+    mock.kbdReport(down);
+    for (int i = 0; i < 50'000; i++) stepOne(*m);  // ~40ms
+    mock.kbdReport(up);
+    for (int i = 0; i < 50'000; i++) stepOne(*m);
+  };
+  hid(0x00, 0x0E);  // K
+  hid(0x00, 0x40);  // F7: CL
+  CHECK(external(""));
+  CHECK(readDisplayBuffer(m->bus) == ">");  // the prompt CL leaves
+  hid(0x01, 0x0D);  // Ctrl+J: nothing
+  for (uint8_t u : {0x0D, 0x2E, 0x1E}) hid(0x00, u);  // J = 1
+  hid(0x02, 0x2E);  // Shift+=: +
+  hid(0x00, 0x1F);  // 2
+  CHECK(external(""));
+  CHECK(readDisplayBuffer(m->bus) == "J=1+2");
+  hid(0x00, 0x28);  // Enter
+  CHECK(external(""));
+  CHECK(number(0x7948) == 0x0030);  // J = 3
+
+  // AUTOSTAGE as well: the loop is in the image before it's staged, so the
+  // SRAM copy has it, and the driver runs from there.
+  mock.setConfigValue(pc1500::ExpansionMock::kConfigAutostage, 1);
+  resetAndBoot();
+  CHECK(mock.remapActive());
+  CHECK(mock.romStagedVerified());
+  CHECK(mock.sramByte(kbdLoop - 0x8800) == rom[0xE24A - 0xC000]);
+  CHECK(armed());
+  CHECK(external("I=3\r"));
+  CHECK(number(0x7940) == 0x0030);  // I = 3
+#endif
+}
+
+// BLKBD (2026-10-04): pairing the external keyboard, against the mock's
+// pretend keyboard (found, asks for 123456, connects). Needs MCONF BLKBD=1
+// first; the result stays up until a key; BLKBD FORGET drops the bond.
+void testBlkbdPairsKeyboard() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testBlkbdPairsKeyboard -- ROM1.BIN and/or rom_8800.bin not found.\n");
+    return;
+  }
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_blkbd");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+  pc1500::ExpansionMock& mock = m->bus.expansionMock();
+  auto run = [&](const std::string& line) {
+    m->bus.writeME0(kErlAbs, 0);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, line);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m, 20'000'000));
+    return m->bus.readME0(kErlAbs);
+  };
+  auto shown = [&]() {
+    std::string text;
+    for (int i = 0; i < 26; i++) text += static_cast<char>(m->bus.readME0(static_cast<uint16_t>(0x8000 + i)));
+    return text.substr(0, text.find_last_not_of(' ') + 1);
+  };
+
+  run("NEW0");
+  CHECK(run("BLKBD") == 0);
+  CHECK(shown() == "BLKBD: MCONF BLKBD=1 FIRST");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  mock.setConfigValue(pc1500::ExpansionMock::kConfigBlkbd, 1);
+  CHECK(run("BLKBD") == 0);  // searching, the code, then connected
+  CHECK(shown() == "BLKBD OK: MOCK KEYBOARD");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+
+  CHECK(run("BLKBD ?") == 0);  // what's arriving: nothing, from the pretend keyboard
+  CHECK(shown() == "S0 R0 L0 00000000 PFF");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(run("BLKBD FORGET") == 0);
+  CHECK(run("BLKBD X") == 1);
+}
+
 int main(int argc, char** argv) {
   // expansion_keyword_test [part of a test's name]: only the tests whose
   // names contain it (the whole suite takes about 11 minutes).
@@ -5094,10 +5393,13 @@ int main(int argc, char** argv) {
   if (only) RUN(testCe150Globe);  // only when asked for: it takes minutes
   RUN(testFnKeysAndStateSaveRestore);
   RUN(testKeywordsInProgramWithExpressions);
+  RUN(testExternalKeyboardDriver);
+  RUN(testBlkbdPairsKeyboard);
 
   RUN(testMconfShowsAndSetsSettings);
   RUN(testBleScanConnectAndDisconnect);
   RUN(testBleAdvertiseWaitsForPeer);
+  RUN(testBlePairing);
   RUN(testBlePutToPeer);
   RUN(testBleGetFromPeer);
   RUN(testBleMessaging);

@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -19,6 +20,8 @@
 
 #include "ble_backend.h"
 #include "plot_paper.h"
+
+struct kbd_seq;  // RP2350/kbd_seq.h -- see ExpansionMock::kbdChar()
 
 namespace pc1500 {
 
@@ -142,6 +145,25 @@ class ExpansionMock {
   void advanceCycles(int cycles) { emulatedCycles_ += static_cast<uint64_t>(cycles); }
   static constexpr double kCpuHz = 1300000.0;
 
+  // The external keyboard (2026-10-04): the firmware's own key sequencer
+  // (RP2350/kbd_seq.h), timed by the emulated clock, fed from here instead
+  // of a BLE keyboard. The ROM's keyboard driver reads its key from the data
+  // window's EXP_KBD_KEY byte, which Bus serves from kbdKeyCell(), and its
+  // ON count from EXP_KBD_BREAK (kbdBreakCell()). False (nothing queued)
+  // without the firmware sources, or for a character it has no key for.
+  bool kbdChar(char c);
+  bool kbdTap(uint8_t matrixIndex, bool shifted);
+  void kbdHold(uint8_t matrixIndex, bool down);
+  void kbdBreak();
+  // A keyboard's 8-byte HID boot report, mapped as the firmware maps one
+  // from a real Bluetooth keyboard (kbd_seq_report()).
+  void kbdReport(const uint8_t report[8]);
+  bool kbdBusy();
+  uint8_t kbdKeyCell();
+  uint8_t kbdBreakCell();
+  static constexpr size_t kKbdKeyOffset = 0x7EF;    // pc_exp.h EXP_KBD_KEY
+  static constexpr size_t kKbdBreakOffset = 0x7F5;  // EXP_KBD_BREAK
+
   // Test-only: blocks until whatever command processCommand() most
   // recently started has fully finished. Real ROM/CPU code never needs
   // this -- it always polls pollStatus() instead, the same way real
@@ -252,8 +274,19 @@ class ExpansionMock {
   // value. The mock keeps them in memory (real firmware: flash).
   static constexpr uint8_t kCommandConfigGet = 0x30;
   static constexpr uint8_t kCommandConfigSet = 0x31;
-  static constexpr int kConfigCount = 7;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE -- mcu_config.h
+  static constexpr int kConfigCount = 8;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD -- mcu_config.h
   static constexpr int kConfigAutostage = 6;
+  static constexpr int kConfigBlkbd = 7;
+  // The external keyboard's driver (2026-10-04): ROM1's wait loop, copied
+  // to the window by the ROM's boot hook, checked and patched into the ROM
+  // image by the firmware's own kbd_loop_install() (RP2350/kbd_seq.h).
+  static constexpr uint8_t kCommandKbdInstall = 0x37;
+  // BLKBD's pairing (pc_exp.h EXP_COMMAND_KBD_*): answered by a pretend
+  // keyboard that's found, asks for 123456, and connects -- one STATUS each.
+  static constexpr uint8_t kCommandKbdPair = 0x38;
+  static constexpr uint8_t kCommandKbdStatus = 0x39;
+  static constexpr uint8_t kCommandKbdStop = 0x3A;
+  static constexpr uint8_t kCommandKbdForget = 0x3B;
 
   // FNSAVE/FNLOAD/STSAVE/STLOAD stores (2026-09-25): the real firmware
   // keeps them in flash (mcu_store.c), the mock in memory. Parameters at
@@ -291,9 +324,14 @@ class ExpansionMock {
   static constexpr uint8_t kCommandFnBlstat = 0x55;  // the BLSTAT function's value
   static constexpr uint8_t kCommandFnSdeof = 0x56;   // SDEOF(n)'s value
   static constexpr uint8_t kCommandBlePlot = 0x57;   // the CE-150 stand-in's drawing (2026-09-30)
+  // Pairing (2026-10-03, BLE_PROTOCOL.md sec.7) -- EXP_COMMAND_BLE_PAIR_BEGIN..UNPAIR.
+  static constexpr uint8_t kCommandBlePairBegin = 0x58;
+  static constexpr uint8_t kCommandBlePairConfirm = 0x59;
+  static constexpr uint8_t kCommandBlePairAnswer = 0x5A;
+  static constexpr uint8_t kCommandBleUnpair = 0x5B;
   // EXP_BLE_STATUS_*
   static constexpr uint8_t kBleStatusLinked = 0x01, kBleStatusAdvertising = 0x02, kBleStatusOfferIn = 0x04,
-                           kBleStatusAnswered = 0x08, kBleStatusAccepted = 0x10;
+                           kBleStatusAnswered = 0x08, kBleStatusAccepted = 0x10, kBleStatusPairAsk = 0x20;
   static constexpr int kBleFileArgs = 42;
   static constexpr int kStoreParams = 0x7F0;
 
@@ -313,6 +351,7 @@ class ExpansionMock {
   // `data`, so this never needs to be called separately -- mirrors
   // setRootDir()'s own "setter called once at load time" shape.
   void setRomImage(std::vector<uint8_t> image) {
+    kbdLoopInstalled_ = false;
     romImage_ = std::move(image);
     sram_.assign(romImage_.size(), 0xFF);
     remapActive_ = false;
@@ -328,6 +367,17 @@ class ExpansionMock {
   // BEGIN/ROM_FROM_MCU -- ROM_GET_MODE's second response byte, which the
   // ROM's boot hook and STAGE RAM use to skip re-staging.
   bool romStagedVerified() const { return romStagedVerified_; }
+
+  // A ROM byte KBD_INSTALL has patched in -- Bus serves these instead of
+  // the module's loaded image (offset from the module's base). False for
+  // any other byte.
+  bool kbdLoopByte(size_t offset, uint8_t* value) const {
+    if (!kbdLoopInstalled_.load(std::memory_order_acquire)) return false;
+    if (offset < kbdLoopOffset_ || offset >= kbdLoopOffset_ + kKbdLoopLen) return false;
+    *value = romImage_[offset];
+    return true;
+  }
+  static constexpr size_t kKbdLoopLen = 284;  // kbd_seq.h KBD_LOOP_LEN
   // Test-only: how many ROM_COPY_BEGINs have been processed since the
   // image was loaded -- lets a test confirm a copy was (or wasn't) run.
   int romCopyBeginCount() const { return romCopyBeginCount_; }
@@ -417,6 +467,22 @@ class ExpansionMock {
   int32_t blePlotY() const { return blePaper_.penY(); }
   uint8_t blePlotPen() const { return blePaper_.pen(); }
   void setBlePeerPlots(bool plots) { blePeerPlots_ = plots; }
+
+  // Test-only, pairing (2026-10-03). Every fake peer starts paired, so the
+  // other BL* tests connect as before; an unpaired one refuses BLCON with
+  // ERR NOT_PAIRED (8). BLPAIR shows kBlePairCode; the peer's user answers
+  // after `polls` PAIR_CONFIRM checks (one per POLL of BLPAIR's wait).
+  static constexpr const char* kBlePairCode = "123456";
+  void setBlePeerPaired(const std::string& name, bool paired);
+  bool blePeerPaired(const std::string& name) const;
+  void setBlePeerPairAnswer(bool accept, int polls) {
+    blePairAccept_ = accept;
+    blePairAfter_ = polls;
+  }
+  // BLADV: `name` (a PC-1500's BLPAIR) asks to pair; STATUS shows the code
+  // until PAIR_ANSWER; a Y pairs it and it then connects.
+  void bleRequestPairing(std::string name) { blePairFrom_ = std::move(name); }
+  int blePairAnswered() const { return blePairAnswered_; }  // -1 none, 0 N, 1 Y
 
   // A real Bluetooth link in place of the fake peer (2026-09-28): BLE
   // commands, and a BLE transfer's WRITE/READ/CLOSE_SD_FILE, go to it.
@@ -530,6 +596,12 @@ class ExpansionMock {
   // pollStatusPaced(): when the command in flight started, in emulated
   // cycles and real time; the worker signals doneCv_ when it finishes.
   uint64_t emulatedCycles_ = 0;
+  // The kbd*() sequencer: made on first use (kbdState()); the host's FIFO
+  // thread and the emulation both reach it, hence the mutex.
+  std::unique_ptr<::kbd_seq, void (*)(::kbd_seq*)> kbd_{nullptr, nullptr};
+  std::mutex kbdMutex_;
+  ::kbd_seq* kbdState();
+  uint32_t kbdNowMs() const { return static_cast<uint32_t>(emulatedCycles_ * 1000 / 1300000); }
   uint64_t commandStartCycles_ = 0;
   std::chrono::steady_clock::time_point commandStartTime_;
   std::mutex doneMutex_;
@@ -662,7 +734,10 @@ class ExpansionMock {
   int romCopyBeginCount_ = 0;
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
-  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0};  // mcu_config.c's defaults
+  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0};  // mcu_config.c's defaults
+  std::atomic<bool> kbdLoopInstalled_{false};
+  int kbdPairStep_ = -1;  // -1: no pairing; then SEARCHING, CODE, CONNECTED
+  size_t kbdLoopOffset_ = 0;
   // The fake BLE peer -- see blePeers().
   std::vector<std::string> blePeers_ = {"MARVIN"};
   bool bleConnected_ = false;
@@ -703,6 +778,12 @@ class ExpansionMock {
   PlotPaper blePaper_;
   int blePlotFrames_ = 0;
   bool blePeerPlots_ = true;
+  std::set<std::string> bleUnpaired_;  // upper-cased names
+  std::string blePairing_;             // a BLPAIR under way, with this peer
+  bool blePairAccept_ = true;
+  int blePairAfter_ = 0;
+  std::string blePairFrom_;            // a pairing asked of our BLADV
+  int blePairAnswered_ = -1;
   mutable std::mutex bleBackendMutex_;
   std::shared_ptr<BleBackend> bleBackend_;
   std::string hostName_ = "PC-1500 EMU";  // the firmware's default is "PC-1500"

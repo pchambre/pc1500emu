@@ -8,6 +8,9 @@ target_include_directories(pc1500bus PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # std::thread: the mock's command worker, the BLE core's server thread
 find_package(Threads REQUIRED)
 target_link_libraries(pc1500bus PUBLIC lh5801cpu pc1500keyboard Threads::Threads)
+if(WIN32)
+  target_link_libraries(pc1500bus PRIVATE crypt32)  # DPAPI: the Link's pairing file
+endif()
 
 # The expansion board's keyword executor (2026-09-25) is portable C in the
 # PC1500-PSOC5 repo's RP2350/keywords.c -- the mock compiles that same file
@@ -26,7 +29,13 @@ if(EXISTS "${PC1500_EXPANSION_FIRMWARE_DIR}/keywords.c")
     # a BASIC program's CE-150 codes, as it's saved and loaded (2026-10-01)
     "${PC1500_EXPANSION_FIRMWARE_DIR}/basic_xlate.c"
     "${PC1500_EXPANSION_FIRMWARE_DIR}/plot_text.c"
-    "${PC1500_EXPANSION_FIRMWARE_DIR}/hershey_simplex.c")
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/hershey_simplex.c"
+    # the external keyboard's key sequencer (2026-10-04)
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/kbd_seq.c"
+    # the Link's pairing and sealed frames (2026-10-03, BLE_PROTOCOL.md sec.7)
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/link_secure.c"
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/third_party/monocypher/monocypher.c"
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/third_party/monocypher/monocypher-ed25519.c")
   target_include_directories(pc1500bus PRIVATE "${PC1500_EXPANSION_FIRMWARE_DIR}")
   target_compile_definitions(pc1500bus PRIVATE PC1500_HAVE_EXPANSION_KEYWORDS=1)
 else()

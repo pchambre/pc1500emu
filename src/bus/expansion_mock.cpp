@@ -10,6 +10,7 @@
 
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
 #include "basic_xlate.h"
+#include "kbd_seq.h"
 #include "keywords.h"
 #include "plotter.h"
 #endif
@@ -271,6 +272,44 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       return romCopyGetBlock(window);
     case kCommandRomCopyFinish:
       return romCopyFinish(window);
+    case kCommandKbdPair:
+      if (!config_[kConfigBlkbd]) return kStatusError;
+      kbdPairStep_ = 0;
+      return kStatusSuccess;
+    case kCommandKbdStatus: {
+      static const char kName[] = "MOCK KEYBOARD";
+      std::fill(window.begin(), window.begin() + 33, 0);
+      window[32] = 0xFF;  // BLKBD ?'s SET_PROTOCOL answer: none
+      int step = kbdPairStep_ < 0 ? 3 : kbdPairStep_++;
+      window[0] = step == 0 ? 1 : step == 1 ? 3 : step == 2 ? 4 : 0;  // EXP_KBD_SEARCHING, CODE, CONNECTED, NONE
+      if (step == 1) {
+        window[1] = 6;
+        std::copy(std::begin("123456"), std::begin("123456") + 6, window.begin() + 2);
+      }
+      if (step == 2) {
+        window[8] = sizeof kName - 1;
+        std::copy(kName, kName + sizeof kName - 1, window.begin() + 9);
+        kbdPairStep_ = -1;
+      }
+      return kStatusSuccess;
+    }
+    case kCommandKbdStop:
+    case kCommandKbdForget:
+      kbdPairStep_ = -1;
+      return kStatusSuccess;
+    case kCommandKbdInstall:
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+      // monitor.c's EXP_COMMAND_KBD_INSTALL: the same check and patch.
+      if (romImage_.size() < 0x14 || !kbd_loop_install(window.data(), romImage_.data(),
+                                                       static_cast<uint32_t>(romImage_.size())))
+        return kStatusError;
+      kbdLoopOffset_ = static_cast<size_t>(((romImage_[0x11] << 8) | romImage_[0x12]) - 0x8800);
+      kbdLoopInstalled_.store(true, std::memory_order_release);
+      romStagedVerified_ = false;  // a staged copy doesn't have it
+      return kStatusSuccess;
+#else
+      return kStatusNotImplemented;
+#endif
     case kCommandRomGetMode:
       return romGetMode(window);
     case kCommandLogBlockChecksum:
@@ -406,6 +445,10 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandBleMsgRecv:
     case kCommandBleMsgCount:
     case kCommandBlePlot:
+    case kCommandBlePairBegin:
+    case kCommandBlePairConfirm:
+    case kCommandBlePairAnswer:
+    case kCommandBleUnpair:
       return bleCommand(cmd, window);
     case kCommandLogClear:
       return kStatusSuccess;
@@ -652,6 +695,13 @@ std::string upper(std::string s) {
 }
 }  // namespace
 
+void ExpansionMock::setBlePeerPaired(const std::string& name, bool paired) {
+  if (paired) bleUnpaired_.erase(upper(name));
+  else bleUnpaired_.insert(upper(name));
+}
+
+bool ExpansionMock::blePeerPaired(const std::string& name) const { return !bleUnpaired_.count(upper(name)); }
+
 // The link drops once bleDropAfter_ more file bytes have moved.
 bool ExpansionMock::bleMoved(size_t bytes) {
   if (bleDropAfter_ < 0) return true;
@@ -697,12 +747,72 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
     }
     case kCommandBleConnect:
       if (window[0] >= blePeers_.size()) return fail(0);
+      if (!blePeerPaired(blePeers_[window[0]])) return fail(8);  // ERR NOT_PAIRED
       return connected(blePeers_[window[0]]);
     case kCommandBleConnectName: {
       std::string wanted = upper(bleNameFromSlot(window));
       for (const std::string& name : blePeers_)
-        if (upper(name) == wanted) return connected(name);
+        if (upper(name) == wanted) return blePeerPaired(name) ? connected(name) : fail(8);
       return fail(0);
+    }
+
+    // ---- pairing (2026-10-03): the fake peer's user checks the code ----
+    case kCommandBlePairBegin: {  // in: [0][index] or [1][len][name]; out: [6 digits][len][name]
+      std::string found;
+      if (window[0] == 0) {
+        if (window[1] < blePeers_.size()) found = blePeers_[window[1]];
+      } else {
+        std::string wanted = upper(std::string(window.begin() + 2, window.begin() + 2 + window[1]));
+        for (const std::string& name : blePeers_)
+          if (upper(name) == wanted) found = name;
+      }
+      if (found.empty()) return fail(0);
+      bleConnected_ = false;
+      blePairing_ = found;
+      std::copy(kBlePairCode, kBlePairCode + 6, window.begin());
+      window[6] = static_cast<uint8_t>(found.size());
+      std::copy(found.begin(), found.end(), window.begin() + 7);
+      return kStatusSuccess;
+    }
+    case kCommandBlePairConfirm: {  // in: [ok]; out: [0 wait | 1 paired + len + name | 2 refused]
+      if (blePairing_.empty()) return fail(0);
+      if (window[0] && blePairAfter_ > 0) {
+        blePairAfter_--;
+        window[0] = 0;
+        return kStatusSuccess;
+      }
+      std::string name = blePairing_;
+      blePairing_.clear();
+      if (!window[0] || !blePairAccept_) {
+        window[0] = 2;
+        return kStatusSuccess;
+      }
+      setBlePeerPaired(name, true);
+      connected(name);
+      std::copy_backward(window.begin(), window.begin() + 1 + window[0], window.begin() + 2 + window[0]);
+      window[0] = 1;
+      return kStatusSuccess;
+    }
+    case kCommandBlePairAnswer:
+      if (blePairFrom_.empty()) return kStatusSuccess;
+      blePairAnswered_ = window[0] ? 1 : 0;
+      if (window[0]) {
+        setBlePeerPaired(blePairFrom_, true);
+        bleConnectAfter_ = 0;  // it connects at the next check
+        bleConnectName_ = blePairFrom_;
+      }
+      blePairFrom_.clear();
+      return kStatusSuccess;
+    case kCommandBleUnpair: {  // in: [len][name], 0 = all; out: how many
+      std::string wanted = upper(std::string(window.begin() + 1, window.begin() + 1 + window[0]));
+      uint8_t count = 0;
+      for (const std::string& name : blePeers_)
+        if (blePeerPaired(name) && (wanted.empty() || upper(name) == wanted)) {
+          setBlePeerPaired(name, false);
+          count++;
+        }
+      window[0] = count;
+      return kStatusSuccess;
     }
     case kCommandBleDisconnect:
       bleConnected_ = false;
@@ -763,6 +873,10 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       if (bleAdvertising_) flags |= kBleStatusAdvertising;
       if (bleOfferIn_ && bleConnected_) flags |= kBleStatusOfferIn;
       if (bleOfferOut_ && bleAnswered_) flags |= kBleStatusAnswered | (bleAccepted_ ? kBleStatusAccepted : 0);
+      if (bleAdvertising_ && !blePairFrom_.empty()) {
+        flags |= kBleStatusPairAsk;
+        std::copy(kBlePairCode, kBlePairCode + 6, window.begin() + kBleFileArgs);
+      }
       window[0] = flags;
       window[1] = static_cast<uint8_t>(bleLinkedName_.size());
       std::copy(bleLinkedName_.begin(), bleLinkedName_.end(), window.begin() + 2);
@@ -866,7 +980,7 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       if (!blePeerPlots_) return fail(2);  // ERR UNSUPPORTED
       uint16_t len = static_cast<uint16_t>((window[0] << 8) | window[1]);
       const uint8_t* payload = &window[2];
-      uint8_t frame[244];
+      uint8_t frame[220];  // the firmware's at a 247-byte MTU: 244, less the seal's 20 and the header
       plot_split_t split;
       plot_split_start(&split, payload, len);
       while (uint16_t n = plot_split_next(&split, payload, len, frame, sizeof frame)) {
@@ -1458,6 +1572,7 @@ uint8_t ExpansionMock::romGetMode(std::vector<uint8_t>& window) {
   window[0] = remapActive_ ? 1 : 0;
   window[1] = (remapActive_ && romStagedVerified_) ? 1 : 0;
   window[2] = config_[kConfigAutostage] ? 1 : 0;  // MCONF AUTOSTAGE: the boot hook's go-ahead
+  window[3] = config_[kConfigBlkbd] ? 1 : 0;      // MCONF BLKBD: the keyboard driver
   return kStatusSuccess;
 }
 
@@ -1490,6 +1605,66 @@ uint8_t ExpansionMock::getSdDfText(std::vector<uint8_t>& window) {
   writeLengthPrefixedString(text, window, kScratchOffset);
   return kStatusSuccess;
 }
+
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+::kbd_seq* ExpansionMock::kbdState() {
+  if (!kbd_) {
+    kbd_ = std::unique_ptr<::kbd_seq, void (*)(::kbd_seq*)>(new ::kbd_seq, [](::kbd_seq* s) { delete s; });
+    kbd_seq_init(kbd_.get());
+  }
+  return kbd_.get();
+}
+
+bool ExpansionMock::kbdChar(char c) {
+  std::lock_guard<std::mutex> lock(kbdMutex_);
+  return kbd_seq_char(kbdState(), c);
+}
+
+bool ExpansionMock::kbdTap(uint8_t matrixIndex, bool shifted) {
+  std::lock_guard<std::mutex> lock(kbdMutex_);
+  return kbd_seq_tap(kbdState(), matrixIndex, shifted);
+}
+
+void ExpansionMock::kbdHold(uint8_t matrixIndex, bool down) {
+  std::lock_guard<std::mutex> lock(kbdMutex_);
+  kbd_seq_hold(kbdState(), matrixIndex, down, kbdNowMs());
+}
+
+void ExpansionMock::kbdBreak() {
+  std::lock_guard<std::mutex> lock(kbdMutex_);
+  kbd_seq_break(kbdState());
+}
+
+void ExpansionMock::kbdReport(const uint8_t report[8]) {
+  std::lock_guard<std::mutex> lock(kbdMutex_);
+  kbd_seq_report(kbdState(), report, kbdNowMs());
+}
+
+bool ExpansionMock::kbdBusy() {
+  std::lock_guard<std::mutex> lock(kbdMutex_);
+  return kbd_ && kbd_seq_busy(kbd_.get());
+}
+
+uint8_t ExpansionMock::kbdKeyCell() {
+  std::lock_guard<std::mutex> lock(kbdMutex_);
+  return kbd_ ? kbd_seq_key(kbd_.get(), kbdNowMs()) : 0;
+}
+
+uint8_t ExpansionMock::kbdBreakCell() {
+  std::lock_guard<std::mutex> lock(kbdMutex_);
+  return kbd_ ? kbd_->break_count : 0;
+}
+#else
+::kbd_seq* ExpansionMock::kbdState() { return nullptr; }
+bool ExpansionMock::kbdChar(char) { return false; }
+bool ExpansionMock::kbdTap(uint8_t, bool) { return false; }
+void ExpansionMock::kbdHold(uint8_t, bool) {}
+void ExpansionMock::kbdBreak() {}
+void ExpansionMock::kbdReport(const uint8_t*) {}
+bool ExpansionMock::kbdBusy() { return false; }
+uint8_t ExpansionMock::kbdKeyCell() { return 0; }
+uint8_t ExpansionMock::kbdBreakCell() { return 0; }
+#endif
 
 ExpansionMock::~ExpansionMock() {
   if (worker_.joinable()) worker_.join();

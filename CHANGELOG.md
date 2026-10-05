@@ -4,6 +4,36 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.12.0] - 2026-10-05
+
+### Added
+- **Link pairing** (the expansion firmware's `BLPAIR`/`BLUNPAIR`,
+  `RP2350/BLE_PROTOCOL.md` sec.7): every link is authenticated with a key
+  from a one-time pairing.
+  - `LinkCore` pairs and authenticates in both roles, using the firmware's
+    `link_secure.c` (Monocypher).
+  - The emulator's identity and pairings are kept in this user's settings
+    folder, never the files folder peers can read: DPAPI-encrypted on
+    Windows, owner-only elsewhere.
+  - Pipe commands: `ble pair [yes|no]` (a PC-1500's pairing waiting here),
+    `ble pairings`, `ble forget ID|all`.
+- **The external keyboard** (the expansion firmware's `MCONF BLKBD`, `BLKBD`):
+  - the mock compiles the firmware's `kbd_seq.c`. It sequences keys on the
+    emulated clock, and Bus serves the window bytes the module ROM's keyboard
+    driver reads (key at 87EFH, ON count at 87F5H);
+  - the mock answers `KBD_INSTALL` as the firmware does, so the boot hook's
+    copy of ROM1's keyboard wait loop gets patched in, and Bus serves the
+    patched bytes;
+  - it answers `BLKBD`'s pairing with a pretend keyboard;
+  - `kbdReport()` takes a keyboard's HID boot reports;
+  - pipe commands: `kbdtype <text>` (`\r` = ENTER) and `kbdbreak`.
+- Tests:
+  - `testBlePairing` and `ble_link_core_test`'s `testPairing`;
+  - `testExternalKeyboardDriver`: boot install with and without AUTOSTAGE,
+    typing, shifted symbols, BREAK at INPUT, OFF/ON, HID reports;
+  - `testBlkbdPairsKeyboard`;
+  - `testMconfShowsAndSetsSettings` covers `BLKBD`.
+
 ## [0.11.0] - 2026-10-01
 
 ### Added

@@ -308,6 +308,11 @@ Commands:
   `f1`-`f6`, `space`. Prefix with `shift+` (e.g. `key shift+mode`) to send
   a genuine PC-1500 Shift-tap before it, same mechanism as typing a
   host-Shift symbol.
+- `kbdtype <text>` / `kbdbreak` — the expansion module's external keyboard:
+  `kbdtype` types `<text>` through the firmware's own key sequencer (`\r` is
+  ENTER; letters type as their key, so SML picks the case), and `kbdbreak`
+  is its ON key. They need the module ROM's keyboard driver, which
+  `MCONF BLKBD=1` sets up at the next reset (Ctrl+F12).
 - `peek <addr>` / `poke <addr> <val>` — addresses and values in hex.
 - `dump <start> <end>` — hex bytes, 16 per line, address-prefixed.
 - `reset` — same as Ctrl+F12; re-runs `CPU::reset()` without touching RAM.

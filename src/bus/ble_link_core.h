@@ -96,6 +96,21 @@ class LinkCore : public BleBackend {
   std::string consoleText() const;       // everything since the last FF
   // What a connected PC-1500's CE-150 stand-in drew here (PLOT frames).
   PlotPaper& paper() { return paper_; }
+
+  // Pairing (2026-10-03, RP2350/BLE_PROTOCOL.md sec.7). Every link is
+  // authenticated with a key a one-time pairing made. Where this emulator
+  // keeps its identity and pairings: set once, before use (DPAPI-encrypted
+  // on Windows, owner-only elsewhere). Never inside the files folder, which
+  // peers can read. Unset, they live only as long as the process.
+  void setPairingFile(const std::filesystem::path& path);
+  // A connector pairing with this emulator (a PC-1500's BLPAIR) waits for
+  // this side's answer: the six-digit code and the peer's name.
+  bool pendingPairing(std::string* code, std::string* name) const;
+  void answerPairing(bool accept);
+  // The pairings kept: names (and ids, in hex).
+  std::vector<std::pair<std::string, std::string>> pairings() const;
+  // Forgets one (by its id in hex), or all with an empty id.
+  void forgetPairing(const std::string& idHex);
   std::vector<std::string> logLines() const;
 
   // Shortened for the tests (BLE_PROTOCOL.md sec.4 says 5 s).
@@ -122,7 +137,7 @@ class LinkCore : public BleBackend {
 
   // connector
   uint8_t scan(std::vector<uint8_t>& w);
-  uint8_t connectTo(const Peer& peer, std::vector<uint8_t>& w);
+  uint8_t connectTo(const Peer& peer, std::vector<uint8_t>& w, bool authenticate = true);
   void disconnectLink();
   uint8_t text(std::vector<uint8_t>& w);
   uint8_t filePut(std::vector<uint8_t>& w);
@@ -149,6 +164,7 @@ class LinkCore : public BleBackend {
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   bool linked_ = false;
+  unsigned linkGen_ = 0;  // counts onLink()s: a wait from an older link ends at once
   bool asServer_ = false;
   bool advertising_ = false;
   std::string peerName_;
@@ -160,7 +176,7 @@ class LinkCore : public BleBackend {
   uint8_t answerType_ = 0, answerSeq_ = 0, answerCode_ = 0;
   std::deque<Frame> incoming_;  // for the command waiting (receive())
   std::deque<Frame> toServe_;   // for the server thread (serve())
-  bool helloDone_ = false;      // HELLOs exchanged: STATUS's "linked"
+  bool helloDone_ = false;      // HELLOs exchanged and authenticated: STATUS's "linked"
 
   // peer-to-peer: the offer the peer made us (until BLGET takes it), ours
   // (until the peer answers), as BLE_PROTOCOL.md sec.5 describes
@@ -196,6 +212,21 @@ class LinkCore : public BleBackend {
 
   bool stopping_ = false;
   std::thread serverThread_;
+
+  // sec.7: the session, the HELLO values, pairings under way and kept
+  // (ble_link_core.cpp; empty without the expansion firmware's link_secure).
+  struct Security;
+  std::unique_ptr<Security> sec_;
+  std::vector<uint8_t> answerData_;  // an ACK's payload (pairing answers)
+  bool authed() const;
+  bool sendPlain(uint8_t type, uint8_t seq, const std::vector<uint8_t>& payload);
+  uint8_t helloExchange(std::vector<uint8_t>& w, bool authenticate);
+  uint8_t pairBegin(std::vector<uint8_t>& w);
+  uint8_t pairConfirm(std::vector<uint8_t>& w);
+  void serveHello(const Frame& f);
+  void serveAuth(const Frame& f);
+  void servePair(const Frame& f);
+  size_t plainMax();  // a frame's size before sealing
 };
 
 }  // namespace pc1500::ble
