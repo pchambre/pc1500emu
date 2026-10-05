@@ -278,7 +278,7 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       return kStatusSuccess;
     case kCommandKbdStatus: {
       static const char kName[] = "MOCK KEYBOARD";
-      std::fill(window.begin(), window.begin() + 33, 0);
+      std::fill(window.begin(), window.begin() + 35, 0);
       window[32] = 0xFF;  // BLKBD ?'s SET_PROTOCOL answer: none
       int step = kbdPairStep_ < 0 ? 3 : kbdPairStep_++;
       window[0] = step == 0 ? 1 : step == 1 ? 3 : step == 2 ? 4 : 0;  // EXP_KBD_SEARCHING, CODE, CONNECTED, NONE

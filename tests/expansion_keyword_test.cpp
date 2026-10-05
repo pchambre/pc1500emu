@@ -5321,6 +5321,22 @@ void testExternalKeyboardDriver() {
   CHECK(armed());
   CHECK(external("I=3\r"));
   CHECK(number(0x7940) == 0x0030);  // I = 3
+
+  // MCONF BLKBD=0 unhooks the driver at once (2026-10-05: on hardware the
+  // driver went on reading a key byte nothing kept up any more, and every
+  // character typed was wiped again). A key "held" there now must not matter.
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "MCONF BLKBD=0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(idle());
+  CHECK(m->bus.readME0(0x79D4) == 0x00);
+  mock.kbdHold(0xB5, true);  // CL, stuck
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "K=4");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(number(0x7950) == 0x0040);  // K = 4
+  mock.kbdHold(0xB5, false);
 #endif
 }
 

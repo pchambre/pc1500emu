@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.12.1] - 2026-10-05
+
+### Changed
+- The mock's `BLKBD ?` answer carries the firmware's new "where pairing
+  failed" bytes (zero).
+
+### Added
+- `testExternalKeyboardDriver`: `MCONF BLKBD=0` unhooks the keyboard
+  driver at once, so a key still "held" in the external keyboard's byte
+  no longer matters (on hardware every character typed was being wiped);
+  `testBlkbdPairsKeyboard` checks `BLKBD ?`.
+
 ## [0.12.0] - 2026-10-05
 
 ### Added
