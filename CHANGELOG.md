@@ -4,6 +4,13 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.12.4] - 2026-10-06
+
+### Added
+- The expansion mock knows the firmware's ninth setting, `MCONF POWMANDELAY`
+  (default -1). `testMconfShowsAndSetsSettings` sets and shows it, including
+  -1, and rejects values out of range.
+
 ## [0.12.3] - 2026-10-06
 
 ### Added

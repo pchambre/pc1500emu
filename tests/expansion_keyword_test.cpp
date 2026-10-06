@@ -3974,11 +3974,24 @@ void testMconfShowsAndSetsSettings() {
   CHECK(run("MCONF BLKBD=1") == 0);
   CHECK(mock.configValue(7) == 1);
 
-  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (6th)
+  // POWMANDELAY (2026-10-05): -1 (the default) is off, stored as 0xFFFF.
+  CHECK(run("MCONF POWMANDELAY") == 0);
+  CHECK(shown() == "POWMANDELAY=-1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(run("MCONF POWMANDELAY=60") == 0);
+  CHECK(mock.configValue(8) == 60);
+  CHECK(run("MCONF POWMANDELAY=-1") == 0);
+  CHECK(mock.configValue(8) == 0xFFFF);
+  CHECK(run("MCONF POWMANDELAY=0") == 0);
+  CHECK(mock.configValue(8) == 0);
+
+  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (7th)
   CHECK(shown(0x8002) == "LED=0");
   CHECK(shown(0x8002 + 3 * 30) == "AUTOSTAGE=1");
   CHECK(shown(0x8002 + 4 * 30) == "BLKBD=1");
-  CHECK(shown(0x8002 + 5 * 30) == "HOSTNAME=KITCHEN");
+  CHECK(shown(0x8002 + 5 * 30) == "POWMANDELAY=0");
+  CHECK(shown(0x8002 + 6 * 30) == "HOSTNAME=KITCHEN");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -3989,6 +4002,8 @@ void testMconfShowsAndSetsSettings() {
   CHECK(mock.configValue(6) == 1);
   CHECK(run("MCONF BLKBD=2") == 1);
   CHECK(mock.configValue(7) == 1);
+  CHECK(run("MCONF POWMANDELAY=-2") == 1);  // -1 is the only negative
+  CHECK(mock.configValue(8) == 0);
   CHECK(run("MCONF COLOUR=1") == 1);       // unknown setting
   CHECK(run("MCONF SLEEPWAIT=") == 1);     // no value
   CHECK(mock.configValue(1) == 1000);
