@@ -5393,6 +5393,78 @@ void testBlkbdPairsKeyboard() {
   CHECK(run("BLKBD X") == 1);
 }
 
+// An older PC-1500 ROM (2026-10-05, dumped from a real machine with SDSAVE M,
+// so a 4-byte header first): its keyboard hook loads the vector at 79D5H
+// into U and then jumps to whatever X held, so there's no driver for it.
+// With MCONF BLKBD=1 the boot hook's copy is refused (E2B9H is D5H, not
+// 38H), the hook stays unarmed and the machine's own keyboard works as
+// before; BLKBD says why instead of pairing.
+void testExternalKeyboardOldRom() {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  std::printf("SKIP: testExternalKeyboardOldRom -- built without the firmware sources.\n");
+#else
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/S1500ROM.BIN";
+  const std::string kExpRomDir =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom/";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomDir + "rom_8800.bin");
+  std::vector<uint8_t> romBin = readFile(kExpRomDir + "rom.bin");
+  if (rom.size() == 0x4004) rom.erase(rom.begin(), rom.begin() + 4);  // SDSAVE M's header
+  if (rom.size() != 0x4000 || expRom.empty() || romBin.size() < 0x800) {
+    std::printf("SKIP: testExternalKeyboardOldRom -- S1500ROM.BIN, rom_8800.bin and/or rom.bin not found.\n");
+    return;
+  }
+  CHECK(rom[0xE2B9 - 0xC000] == 0xD5);
+  const uint16_t kbdLoop = static_cast<uint16_t>((expRom[0x11] << 8) | expRom[0x12]);
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_kbd_old");
+  auto m = std::make_unique<BootedMachine>();
+  m->bus.ioPort().useManualRtcClock();
+  m->bus.loadME0(0xC000, rom.data(), rom.size());
+  m->bus.setExtRam0000Size(0x4000);
+  m->bus.setExtRamExtSize(0x2800);
+  m->bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x8800, /*requirePv=*/false,
+                             /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
+                             /*dataWindowSize=*/0x800, /*instructionAddr=*/0x87FF, romBin.data(),
+                             0x800);
+  m->bus.expansionMock().setRootDir(sdDir);
+  pc1500::ExpansionMock& mock = m->bus.expansionMock();
+  mock.setConfigValue(pc1500::ExpansionMock::kConfigBlkbd, 1);
+
+  m->cpu.reset();
+  for (long c = 0; !m->cpu.halted() && c < 20'000'000; c++) stepOne(*m);
+  for (long i = 0; i < 4'000'000; i++) stepOne(*m);
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+
+  // Refused: nothing patched in, the hook not armed.
+  CHECK(m->bus.readME0(kbdLoop) != rom[0xE24A - 0xC000]);
+  CHECK(m->bus.readME0(0x79D4) == 0x00);
+
+  // The machine's own keyboard, unaffected.
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "A=12+3");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(((m->bus.readME0(0x7900) << 8) | m->bus.readME0(0x7902)) == 0x0115);
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+
+  // BLKBD says why.
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "BLKBD");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m, 20'000'000));
+  std::string text;
+  for (int i = 0; i < 26; i++) text += static_cast<char>(m->bus.readME0(static_cast<uint16_t>(0x8000 + i)));
+  CHECK(text.substr(0, text.find_last_not_of(' ') + 1) == "BLKBD: NOT ON THIS ROM");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+#endif
+}
+
 int main(int argc, char** argv) {
   // expansion_keyword_test [part of a test's name]: only the tests whose
   // names contain it (the whole suite takes about 11 minutes).
@@ -5411,6 +5483,7 @@ int main(int argc, char** argv) {
   RUN(testKeywordsInProgramWithExpressions);
   RUN(testExternalKeyboardDriver);
   RUN(testBlkbdPairsKeyboard);
+  RUN(testExternalKeyboardOldRom);
 
   RUN(testMconfShowsAndSetsSettings);
   RUN(testBleScanConnectAndDisconnect);

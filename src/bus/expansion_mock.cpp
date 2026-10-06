@@ -300,8 +300,9 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandKbdInstall:
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
       // monitor.c's EXP_COMMAND_KBD_INSTALL: the same check and patch.
-      if (romImage_.size() < 0x14 || !kbd_loop_install(window.data(), romImage_.data(),
-                                                       static_cast<uint32_t>(romImage_.size())))
+      if (romImage_.size() < 0x14 ||
+          kbd_loop_install(window.data(), romImage_.data(), static_cast<uint32_t>(romImage_.size()), nullptr) !=
+              KBD_LOOP_OK)
         return kStatusError;
       kbdLoopOffset_ = static_cast<size_t>(((romImage_[0x11] << 8) | romImage_[0x12]) - 0x8800);
       kbdLoopInstalled_.store(true, std::memory_order_release);

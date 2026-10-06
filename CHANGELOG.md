@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.12.2] - 2026-10-06
+
+### Changed
+- The mock's keyboard install follows the firmware's `kbd_loop_install()`,
+  which now says why it refused a loop.
+
+### Added
+- `testExternalKeyboardOldRom`: an older PC-1500 ROM (a real machine's
+  dump, `S1500ROM.BIN`), whose 79D4H keyboard hook jumps through X instead
+  of its vector. With `MCONF BLKBD=1` the loop is refused, the hook stays
+  unarmed, the machine's own keyboard still works, and `BLKBD` shows
+  `BLKBD: NOT ON THIS ROM`.
+
 ## [0.12.1] - 2026-10-05
 
 ### Changed
