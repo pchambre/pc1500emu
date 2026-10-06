@@ -5005,7 +5005,7 @@ void testBasicXlateChunks() {
       return out;
     };
     std::vector<uint8_t> saved, loaded;
-    basic_xlate_begin(BASIC_XLATE_SAVE);
+    basic_xlate_begin(BASIC_XLATE_SAVE, BASIC_XLATE_CE150);
     for (auto c : chunks(ours)) {
       if (c.empty()) continue;  // the ROM never writes 0 bytes
       c.resize(c.size() + 1);
@@ -5015,7 +5015,7 @@ void testBasicXlateChunks() {
     uint8_t last;
     if (basic_xlate_flush(&last)) saved.push_back(last);
     basic_xlate_end();
-    basic_xlate_begin(BASIC_XLATE_LOAD);
+    basic_xlate_begin(BASIC_XLATE_LOAD, BASIC_XLATE_CE150);
     for (auto c : chunks(ce150)) {
       if (c.empty()) continue;  // a read of 0 is the end, below
       c.resize(c.size() + 1);
@@ -5465,6 +5465,159 @@ void testExternalKeyboardOldRom() {
 #endif
 }
 
+// BLKEY$ (2026-10-06): INKEY$ for either keyboard. A program's INKEY$
+// becomes BLKEY$ when it's loaded with MCONF BLKBD=1, and a save always
+// writes INKEY$, so a file stays plain BASIC (RP2350/basic_xlate.h). The
+// quoted "INKEY$" is text, and stays.
+void testBlkeyLoadSaveTranslation() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testBlkeyLoadSaveTranslation -- ROM1.BIN and/or rom_8800.bin not found.\n");
+    return;
+  }
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_blkey_xlate");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+  pc1500::ExpansionMock& mock = m->bus.expansionMock();
+  auto run = [&](const std::string& line) {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, line);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m, 20'000'000));
+  };
+  // Every 2-byte token hi,lo in the program's statements (line structure:
+  // number hi, lo, length, body ending in CR; FF after the last).
+  auto tokens = [](const std::vector<uint8_t>& p, uint8_t hi, uint8_t lo) {
+    int n = 0;
+    size_t i = 0;
+    while (i + 3 <= p.size() && p[i] != 0xFF) {
+      size_t len = p[i + 2], body = i + 3;
+      bool quoted = false;
+      for (size_t k = body; k + 1 < body + len && k + 1 < p.size(); k++) {
+        if (p[k] == '"') {
+          quoted = !quoted;
+        } else if (!quoted && p[k] >= 0xE0) {
+          if (p[k] == hi && p[k + 1] == lo) n++;
+          k++;
+        }
+      }
+      i = body + len;
+    }
+    return n;
+  };
+
+  run("NEW0");
+  std::string error;
+  CHECK(pc1500::basic::typeBasicProgramText(m->bus, m->cpu, "10 A$=INKEY$\n20 B$=\"INKEY$\"\n30 C$=BLKEY$\n",
+                                            kCyclesPerFrame, kCyclesPerTimerTick, &error));
+  std::vector<uint8_t> typed = pc1500::basic::readBasicProgramBytes(m->bus, &error);
+  CHECK(tokens(typed, 0xF1, 0x5C) == 1 && tokens(typed, 0xE1, 0x53) == 1);
+
+  run("SDSAVE \"K.BAS\"");  // BLKBD=0, and still INKEY$ for both
+  std::vector<uint8_t> saved = readFile((sdDir / "K.BAS").string());
+  CHECK(tokens(saved, 0xF1, 0x5C) == 2 && tokens(saved, 0xE1, 0x53) == 0);
+
+  run("NEW0");
+  run("SDLOAD \"K.BAS\"");  // BLKBD=0: as saved
+  CHECK(pc1500::basic::readBasicProgramBytes(m->bus, &error) == saved);
+
+  mock.setConfigValue(pc1500::ExpansionMock::kConfigBlkbd, 1);
+  run("NEW0");
+  run("SDLOAD \"K.BAS\"");  // BLKBD=1: BLKEY$ for both
+  std::vector<uint8_t> loaded = pc1500::basic::readBasicProgramBytes(m->bus, &error);
+  CHECK(loaded.size() == saved.size());
+  CHECK(tokens(loaded, 0xF1, 0x5C) == 0 && tokens(loaded, 0xE1, 0x53) == 2);
+  std::string text(loaded.begin(), loaded.end());
+  CHECK(text.find("\"INKEY$\"") != std::string::npos);
+
+  run("SDSAVE \"K2.BAS\"");  // and back
+  CHECK(readFile((sdDir / "K2.BAS").string()) == saved);
+}
+
+// BLKEY$ (2026-10-06) reads either keyboard: the external one's key (with the
+// driver armed, MCONF BLKBD=1), and the PC-1500's own. The program first
+// waits for no key, so RUN's own ENTER doesn't count.
+void testBlkeyReadsEitherKeyboard() {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  std::printf("SKIP: testBlkeyReadsEitherKeyboard -- built without the firmware sources.\n");
+#else
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomDir =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom/";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomDir + "rom_8800.bin");
+  std::vector<uint8_t> romBin = readFile(kExpRomDir + "rom.bin");
+  if (rom.empty() || expRom.empty() || romBin.size() < 0x800) {
+    std::printf("SKIP: testBlkeyReadsEitherKeyboard -- ROM1.BIN, rom_8800.bin and/or rom.bin not found.\n");
+    return;
+  }
+  const uint16_t kbdLoop = static_cast<uint16_t>((expRom[0x11] << 8) | expRom[0x12]);
+  const uint16_t kDriverIdle = static_cast<uint16_t>(kbdLoop + (0xE2AA - 0xE24A));
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_blkey");
+  auto m = std::make_unique<BootedMachine>();
+  m->bus.ioPort().useManualRtcClock();
+  m->bus.loadME0(0xC000, rom.data(), rom.size());
+  m->bus.setExtRam0000Size(0x4000);
+  m->bus.setExtRamExtSize(0x2800);
+  m->bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x8800, /*requirePv=*/false,
+                             /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
+                             /*dataWindowSize=*/0x800, /*instructionAddr=*/0x87FF, romBin.data(),
+                             0x800);
+  m->bus.expansionMock().setRootDir(sdDir);
+  pc1500::ExpansionMock& mock = m->bus.expansionMock();
+  mock.setConfigValue(pc1500::ExpansionMock::kConfigBlkbd, 1);
+  auto idle = [&]() {
+    for (long i = 0; i < 20'000'000; i++) {
+      if (m->cpu.halted() && (m->cpu.p() == kIdleAddr || m->cpu.p() == kDriverIdle)) return true;
+      stepOne(*m);
+    }
+    return false;
+  };
+  auto number = [&](uint16_t at) { return (m->bus.readME0(at) << 8) | m->bus.readME0(static_cast<uint16_t>(at + 2)); };
+
+  m->cpu.reset();
+  for (long c = 0; !m->cpu.halted() && c < 20'000'000; c++) stepOne(*m);
+  for (long i = 0; i < 4'000'000; i++) stepOne(*m);
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "NEW0");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(idle());
+  CHECK(m->bus.readME0(0x79D4) == 0x55);  // the driver is armed
+
+  std::string error;
+  CHECK(pc1500::basic::typeBasicProgramText(
+      m->bus, m->cpu,
+      "5 IF BLKEY$<>\"\" GOTO 5\n10 K$=BLKEY$:IF K$=\"\" GOTO 10\n20 B=0:IF K$=\"Q\" LET B=1\n"
+      "30 IF K$=\"W\" LET B=2\n",
+      kCyclesPerFrame, kCyclesPerTimerTick, &error));
+  tapKey(*m, pc1500::Key::Cl);
+  tapKey(*m, pc1500::Key::Mode);  // PRO -> RUN
+  auto runAndPress = [&](auto press) {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "RUN");
+    tapKey(*m, pc1500::Key::Ent);
+    for (int i = 0; i < 400'000; i++) stepOne(*m);  // in the wait loop by now
+    CHECK(!m->cpu.halted());
+    press();
+    CHECK(idle());
+    CHECK(m->bus.readME0(kErlAbs) == 0);
+  };
+
+  // The external keyboard.
+  runAndPress([&] { CHECK(mock.kbdChar('Q')); });
+  CHECK(number(0x7908) == 0x0010);  // B = 1: K$ was "Q"
+
+  // The PC-1500's own.
+  runAndPress([&] { tapKey(*m, pc1500::Key::W); });
+  CHECK(number(0x7908) == 0x0020);  // B = 2: K$ was "W"
+#endif
+}
+
 int main(int argc, char** argv) {
   // expansion_keyword_test [part of a test's name]: only the tests whose
   // names contain it (the whole suite takes about 11 minutes).
@@ -5484,6 +5637,8 @@ int main(int argc, char** argv) {
   RUN(testExternalKeyboardDriver);
   RUN(testBlkbdPairsKeyboard);
   RUN(testExternalKeyboardOldRom);
+  RUN(testBlkeyLoadSaveTranslation);
+  RUN(testBlkeyReadsEitherKeyboard);
 
   RUN(testMconfShowsAndSetsSettings);
   RUN(testBleScanConnectAndDisconnect);

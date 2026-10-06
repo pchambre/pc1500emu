@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.12.3] - 2026-10-06
+
+### Added
+- `testBlkeyLoadSaveTranslation`: with `MCONF BLKBD=1`, a BASIC program's
+  `INKEY$` loads as the module's `BLKEY$`, and a save always writes
+  `INKEY$`; quoted text is left alone.
+- `testBlkeyReadsEitherKeyboard`: `BLKEY$` sees a key from the external
+  keyboard and from the PC-1500's own.
+
+### Changed
+- `testBasicXlateChunks` passes the translator's new swaps argument.
+
 ## [0.12.2] - 2026-10-06
 
 ### Changed
