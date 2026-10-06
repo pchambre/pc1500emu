@@ -35,6 +35,9 @@
 #include <string>
 #include <system_error>
 #include <vector>
+#if defined(_MSC_VER) && defined(_DEBUG)
+#include <crtdbg.h>
+#endif
 
 #include "basic_text.h"
 #include "bus.h"
@@ -212,9 +215,17 @@ void typeText(BootedMachine& m, const std::string& text) {
 // of sleeping a guessed number of milliseconds after each keypress, except
 // deterministic: it returns as soon as the real condition is true rather
 // than hoping a fixed delay was long enough.
+// With the external keyboard's driver on (79D4H = 55H), the machine idles
+// at the same place in the driver's copy of the loop (KBD_LOOP, from the
+// module ROM's descriptor at 8811H) instead.
 bool waitForIdle(BootedMachine& m, long maxInstructions = 2'000'000) {
+  uint16_t driverIdle = kIdleAddr;
+  if (m.bus.readME0(0x79D4) == 0x55) {
+    uint16_t loop = static_cast<uint16_t>(m.bus.readME0(0x8811) << 8 | m.bus.readME0(0x8812));
+    driverIdle = static_cast<uint16_t>(loop + (kIdleAddr - 0xE24A));
+  }
   for (long i = 0; i < maxInstructions; i++) {
-    if (m.cpu.p() == kIdleAddr && m.cpu.halted()) return true;
+    if ((m.cpu.p() == kIdleAddr || m.cpu.p() == driverIdle) && m.cpu.halted()) return true;
     stepOne(m);
   }
   return false;
@@ -4270,6 +4281,139 @@ void testBleScanConnectAndDisconnect() {
   CHECK(f->run("BLCON \"NOBODY\"") == 40);
 }
 
+// Wi-Fi (2026-10-06, RP2350/wifi_link.h). The mock's networks stand in for
+// the CYW43's: "HOST" (open) unless a test adds more. WFSCAN lists them,
+// strongest first; C connects -- with the remembered password, with none
+// for an open network, else after asking for one ('*'s; the left arrow
+// deletes, SML gives lowercase). A network that connects is remembered;
+// WFCON alone rejoins the strongest remembered one. WFSTAT is a function:
+// 0 off, 2 connected.
+void testWifiScanConnectAndPassword() {
+  auto f = bleFixture("testWifiScanConnectAndPassword");
+  if (!f) return;
+  auto& nets = f->mock->wifiNetworks();
+  nets.push_back({"HomeNet", -30, "WPA2", "Ab1"});
+  nets.push_back({"OLDCAFE", -70, "WEP", ""});
+  auto said = [&](const std::string& expr) {  // what BLPRINT expr shows the BLE peer
+    f->mock->clearBleText();
+    CHECK(f->run("BLPRINT " + expr) == 0);
+    std::string t = f->mock->bleText();
+    return t.empty() ? t : t.substr(0, t.size() - 1);
+  };
+  f->connect();  // BLE, only to read values with BLPRINT
+  CHECK(said("WFSTAT") == "0");
+
+  CHECK(f->run("WFSCAN") == 0);
+  CHECK(f->shown(0x8002) == "HomeNet         -30 WPA2");
+  f->key(pc1500::Key::C);  // secured, not remembered: asks
+  CHECK(f->shown() == "PASSWORD:");
+  f->key(pc1500::Key::A);
+  CHECK(f->shown() == "PASSWORD: *");
+  f->key(pc1500::Key::X);
+  f->key(pc1500::Key::Left);  // deletes the X
+  CHECK(f->shown() == "PASSWORD: *");
+  f->key(pc1500::Key::Sml);
+  f->key(pc1500::Key::B);  // lowercase
+  f->key(pc1500::Key::Sml);
+  f->key(pc1500::Key::Digit1);
+  CHECK(f->shown() == "PASSWORD: ***");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->shown() == "CONNECTED: 192.168.1.15");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->mock->wifiConnectedSsid() == "HomeNet");
+  CHECK(f->mock->wifiRemembered("HomeNet") && *f->mock->wifiRemembered("HomeNet") == "Ab1");
+  CHECK(said("WFSTAT") == "2");
+  CHECK(f->run("WFSCAN") == 0);  // remembered: marked, and no question
+  CHECK(f->shown(0x8002) == "HomeNet         -30 WPA2*");
+  f->key(pc1500::Key::C);
+  CHECK(f->shown() == "CONNECTED: 192.168.1.15");
+  f->key(pc1500::Key::Ent);
+
+  CHECK(f->run("WFDISC") == 0);
+  CHECK(f->mock->wifiConnectedSsid().empty());
+  CHECK(said("WFSTAT") == "0");
+  CHECK(f->run("WFCON") == 0);  // the strongest remembered network
+  CHECK(f->shown() == "CONNECTED: 192.168.1.15");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->mock->wifiConnectedSsid() == "HomeNet");
+
+  // BREAK at the password gives up; so does ENTER with nothing typed.
+  CHECK(f->run("WFFORGET \"homenet\"") == 0);
+  CHECK(!f->mock->wifiRemembered("HomeNet"));
+  CHECK(f->run("WFCON \"HOMENET\"") == 0);  // any case
+  CHECK(f->shown() == "PASSWORD:");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->m->bus.readME0(kErlAbs) == 0);
+
+  // A WEP network is refused: the reason, then ERROR 40.
+  CHECK(f->run("WFSCAN") == 0);
+  f->key(pc1500::Key::Down);
+  f->key(pc1500::Key::Down);
+  CHECK(f->shown(0x8002 + 2 * 30) == "OLDCAFE         -70 WEP");
+  f->key(pc1500::Key::C);
+  CHECK(f->shown() == "WIFI: WEP NOT SUPPORTED");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->m->bus.readME0(kErlAbs) == 40);
+}
+
+// WFSTAT is a function: alone at the prompt, or in an assignment, no
+// error. MLOG CLEAR is MLOG RESET's new name (2026-10-06); both work.
+void testWifiStatAndMlogClear() {
+  auto f = bleFixture("testWifiStatAndMlogClear");
+  if (!f) return;
+  CHECK(f->run("WFSTAT") == 0);
+  CHECK(f->run("S=WFSTAT") == 0);
+  CHECK(f->run("MLOG CLEAR") == 0);
+  CHECK(f->run("MLOG RESET") == 0);
+}
+
+// WFCON by name: an open network needs no password; a wrong one, or a
+// network that isn't there, says so, then ERROR 40. The arguments are any
+// string expressions, so a password can hold lowercase (CHR$). WFFORGET
+// forgets one, ERROR 40 if it isn't remembered, or all after a Y.
+void testWifiConnectByNameAndForget() {
+  auto f = bleFixture("testWifiConnectByNameAndForget");
+  if (!f) return;
+  f->mock->wifiNetworks().push_back({"HomeNet", -30, "WPA2", "Ab1"});
+  CHECK(f->run("WFCON") == 0);  // nothing remembered yet
+  CHECK(f->shown() == "WIFI: NO KNOWN NETWORK");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->m->bus.readME0(kErlAbs) == 40);
+
+  CHECK(f->run("WFCON \"HOST\"") == 0);
+  CHECK(f->shown() == "CONNECTED: 192.168.1.15");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->mock->wifiConnectedSsid() == "HOST");
+
+  CHECK(f->run("WFCON \"HOMENET\",\"AB1\"") == 0);
+  CHECK(f->shown() == "WIFI: WRONG PASSWORD");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->m->bus.readME0(kErlAbs) == 40);
+  CHECK(f->mock->wifiConnectedSsid().empty());
+
+  CHECK(f->run("A$=\"HOMENET\"") == 0);
+  CHECK(f->run("B$=\"A\"+CHR$ 98+\"1\"") == 0);
+  CHECK(f->run("WFCON A$,B$") == 0);
+  CHECK(f->shown() == "CONNECTED: 192.168.1.15");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->mock->wifiConnectedSsid() == "HomeNet");
+
+  CHECK(f->run("WFCON \"NOBODY\"") == 0);
+  CHECK(f->shown() == "WIFI: NETWORK NOT FOUND");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->m->bus.readME0(kErlAbs) == 40);
+
+  CHECK(f->run("WFFORGET \"NOBODY\"") == 40);
+  CHECK(f->run("WFFORGET \"host\"") == 0);
+  CHECK(!f->mock->wifiRemembered("HOST"));
+  CHECK(f->mock->wifiRemembered("HomeNet"));
+  CHECK(f->run("WFFORGET") == 0);
+  CHECK(f->shown() == "FORGET ALL NETWORKS Y/N");
+  f->key(pc1500::Key::Y);
+  CHECK(!f->mock->wifiRemembered("HomeNet"));
+  CHECK(f->run("WFDISC 1") == 1);  // no arguments
+}
+
 // BLPRINT: ';' runs values together, ',' pads to the next 13-column zone,
 // a trailing separator leaves the line open; each statement's text is sent
 // when it ends. Numbers read exactly as STR$ writes them (the ROM's own
@@ -5399,6 +5543,14 @@ void testBlkbdPairsKeyboard() {
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
   CHECK(m->bus.readME0(kErlAbs) == 0);
+  // The driver is on now (2026-10-06), though this boot had MCONF BLKBD=0:
+  // the hook points at KBD_HOOK and BASWORD's flag is set. Until then only
+  // the boot hook put it on, and the keyboard typed nothing until a power
+  // cycle.
+  CHECK(m->bus.readME0(0x785B) == 0x88 && m->bus.readME0(0x785C) == 0x0E);
+  CHECK(m->bus.readME0(0x79D4) == 0x55);
+  uint16_t loop = static_cast<uint16_t>(m->bus.readME0(0x8811) << 8 | m->bus.readME0(0x8812));  // KBD_LOOP
+  CHECK(m->bus.readME0(loop) == m->bus.readME0(0xE24A));  // ROM1's loop is served there
 
   CHECK(run("BLKBD ?") == 0);  // what's arriving: nothing, from the pretend keyboard
   CHECK(shown() == "S0 R0 L0 00000000 PFF");
@@ -5637,6 +5789,14 @@ int main(int argc, char** argv) {
   // expansion_keyword_test [part of a test's name]: only the tests whose
   // names contain it (the whole suite takes about 11 minutes).
   const char* only = argc > 1 ? argv[1] : nullptr;
+#if defined(_MSC_VER) && defined(_DEBUG)
+  // A Debug CRT/STL assertion goes to stderr instead of a popup dialog, so
+  // an unattended run reports it instead of waiting for a click.
+  _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+  _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+#endif
 #define RUN(test)                                                              \
   do {                                                                         \
     if (!only || std::string(#test).find(only) != std::string::npos) test(); \
@@ -5659,6 +5819,9 @@ int main(int argc, char** argv) {
   RUN(testBleScanConnectAndDisconnect);
   RUN(testBleAdvertiseWaitsForPeer);
   RUN(testBlePairing);
+  RUN(testWifiScanConnectAndPassword);
+  RUN(testWifiConnectByNameAndForget);
+  RUN(testWifiStatAndMlogClear);
   RUN(testBlePutToPeer);
   RUN(testBleGetFromPeer);
   RUN(testBleMessaging);

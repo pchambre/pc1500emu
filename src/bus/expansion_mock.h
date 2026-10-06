@@ -329,6 +329,18 @@ class ExpansionMock {
   static constexpr uint8_t kCommandBlePairConfirm = 0x59;
   static constexpr uint8_t kCommandBlePairAnswer = 0x5A;
   static constexpr uint8_t kCommandBleUnpair = 0x5B;
+  // Wi-Fi (2026-10-06, RP2350/wifi_link.h) -- EXP_COMMAND_WIFI_*, EXP_WIFI_*.
+  static constexpr uint8_t kCommandWifiScan = 0x60;
+  static constexpr uint8_t kCommandWifiConnect = 0x61;
+  static constexpr uint8_t kCommandWifiConnectName = 0x62;
+  static constexpr uint8_t kCommandWifiDisconnect = 0x63;
+  static constexpr uint8_t kCommandWifiStatus = 0x64;
+  static constexpr uint8_t kCommandWifiForget = 0x65;
+  static constexpr uint8_t kCommandFnWfstat = 0x66;  // the WFSTAT function's value
+  static constexpr int kWifiSsidMax = 32, kWifiPwMax = 63, kWifiRemembered = 4;
+  static constexpr uint8_t kWifiPwNone = 0xFF;
+  static constexpr uint8_t kWifiErrFailed = 0, kWifiErrNotFound = 1, kWifiErrBadPassword = 2,
+                           kWifiErrNeedPassword = 3, kWifiErrNoneKnown = 4, kWifiErrWep = 5;
   // EXP_BLE_STATUS_*
   static constexpr uint8_t kBleStatusLinked = 0x01, kBleStatusAdvertising = 0x02, kBleStatusOfferIn = 0x04,
                            kBleStatusAnswered = 0x08, kBleStatusAccepted = 0x10, kBleStatusPairAsk = 0x20;
@@ -467,6 +479,23 @@ class ExpansionMock {
   int32_t blePlotY() const { return blePaper_.penY(); }
   uint8_t blePlotPen() const { return blePaper_.pen(); }
   void setBlePeerPlots(bool plots) { blePeerPlots_ = plots; }
+
+  // Test-only, Wi-Fi (2026-10-06): the networks a WFSCAN finds, in place of
+  // the CYW43's radio. Until a test changes them there's one, "HOST", open:
+  // the host's own connection. A connect to one succeeds with its password
+  // (any for an open one), and the network is then remembered with it, as
+  // the firmware's wifi_store does (kWifiRemembered, the most recent first).
+  struct WifiNetwork {
+    std::string ssid;
+    int rssi;
+    std::string security;  // "OPEN", "WPA2", "WPA" or "WEP"
+    std::string password;
+  };
+  std::vector<WifiNetwork>& wifiNetworks() { return wifiNetworks_; }
+  const std::string& wifiConnectedSsid() const { return wifiSsid_; }  // "" when not connected
+  // The remembered password for `ssid`, or nullptr.
+  const std::string* wifiRemembered(const std::string& ssid) const;
+  static constexpr const char* kWifiIp = "192.168.1.15";
 
   // Test-only, pairing (2026-10-03). Every fake peer starts paired, so the
   // other BL* tests connect as before; an unpaired one refuses BLCON with
@@ -671,6 +700,9 @@ class ExpansionMock {
   uint8_t readFromSdFile(std::vector<uint8_t>& window);
   uint8_t closeSdFile(std::vector<uint8_t>& window);
   uint8_t bleCommand(uint8_t cmd, std::vector<uint8_t>& window);
+  uint8_t wifiCommand(uint8_t cmd, std::vector<uint8_t>& window);
+  uint8_t wifiJoin(const WifiNetwork* net, const std::string& ssid, const std::string& password,
+                   std::vector<uint8_t>& window);
   // keywords.c's kw_reset() (what the keywords remember between statements).
   void resetKeywords();
   uint8_t bleWrite(std::vector<uint8_t>& window);
@@ -738,6 +770,11 @@ class ExpansionMock {
   std::atomic<bool> kbdLoopInstalled_{false};
   int kbdPairStep_ = -1;  // -1: no pairing; then SEARCHING, CODE, CONNECTED
   size_t kbdLoopOffset_ = 0;
+  // The fake Wi-Fi -- see wifiNetworks().
+  std::vector<WifiNetwork> wifiNetworks_ = {{"HOST", -40, "OPEN", ""}};
+  std::vector<WifiNetwork> wifiFound_;  // the last scan, strongest first
+  std::vector<std::pair<std::string, std::string>> wifiKnown_;  // ssid, password; most recent first
+  std::string wifiSsid_;
   // The fake BLE peer -- see blePeers().
   std::vector<std::string> blePeers_ = {"MARVIN"};
   bool bleConnected_ = false;

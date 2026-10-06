@@ -4,6 +4,26 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [0.13.0] - 2026-10-06
+
+### Added
+- Wi-Fi in the expansion mock (the firmware's `EXP_COMMAND_WIFI_*`):
+  pretend networks in place of the CYW43's radio, by default one open
+  network called `HOST`; connecting remembers a network with its password.
+  Tests: `testWifiScanConnectAndPassword` (WFSCAN, the masked password
+  prompt, remembered networks, WEP refused), `testWifiConnectByNameAndForget`
+  and `testWifiStatAndMlogClear`.
+- `testBlkbdPairsKeyboard` checks that BLKBD now turns the keyboard driver
+  on after pairing (the hook, BASWORD's flag, the loop served), on a boot
+  that had MCONF BLKBD=0.
+- `waitForIdle` also recognises the keyboard driver's idle point.
+- A Debug build's CRT/STL assertions go to stderr instead of a dialog, so
+  an unattended test run reports them instead of waiting for a click.
+
+### Fixed
+- The mock's keyboard pairing status copied its code from two different
+  `"123456"` literals ("transposed pointer range" in Debug builds).
+
 ## [0.12.4] - 2026-10-06
 
 ### Added

@@ -278,13 +278,14 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       return kStatusSuccess;
     case kCommandKbdStatus: {
       static const char kName[] = "MOCK KEYBOARD";
+      static const char kCode[] = "123456";
       std::fill(window.begin(), window.begin() + 35, 0);
       window[32] = 0xFF;  // BLKBD ?'s SET_PROTOCOL answer: none
       int step = kbdPairStep_ < 0 ? 3 : kbdPairStep_++;
       window[0] = step == 0 ? 1 : step == 1 ? 3 : step == 2 ? 4 : 0;  // EXP_KBD_SEARCHING, CODE, CONNECTED, NONE
       if (step == 1) {
         window[1] = 6;
-        std::copy(std::begin("123456"), std::begin("123456") + 6, window.begin() + 2);
+        std::copy(kCode, kCode + 6, window.begin() + 2);  // one array: two "123456" literals needn't be the same
       }
       if (step == 2) {
         window[8] = sizeof kName - 1;
@@ -356,6 +357,7 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
 #endif
     case kCommandFnBlstat:  // keywords as BASIC functions (2026-09-29): BLSTAT, SDEOF(n)
     case kCommandFnSdeof:
+    case kCommandFnWfstat:
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
       if (window.size() < 2048) return kStatusError;
       kwWindow_ = &window;
@@ -451,6 +453,13 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandBlePairAnswer:
     case kCommandBleUnpair:
       return bleCommand(cmd, window);
+    case kCommandWifiScan:
+    case kCommandWifiConnect:
+    case kCommandWifiConnectName:
+    case kCommandWifiDisconnect:
+    case kCommandWifiStatus:
+    case kCommandWifiForget:
+      return wifiCommand(cmd, window);
     case kCommandLogClear:
       return kStatusSuccess;
     case kCommandLogSetInfoEnabled:
@@ -674,6 +683,163 @@ void ExpansionMock::resetKeywords() {
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
   kw_reset();
 #endif
+}
+
+// ---- Wi-Fi (2026-10-06) ----
+//
+// Fake networks in place of the CYW43 (RP2350/wifi_link.c): the same
+// window layouts and EXP_WIFI_ERR_* codes as the firmware's commands.
+
+namespace {
+std::string upperText(std::string s) {
+  for (char& ch : s) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  return s;
+}
+}  // namespace
+
+const std::string* ExpansionMock::wifiRemembered(const std::string& ssid) const {
+  for (const auto& known : wifiKnown_)
+    if (known.first == ssid) return &known.second;
+  return nullptr;
+}
+
+// Joins `net` (nullptr: not in range) with `password`; remembers it.
+uint8_t ExpansionMock::wifiJoin(const WifiNetwork* net, const std::string& ssid, const std::string& password,
+                                std::vector<uint8_t>& window) {
+  auto fail = [&](uint8_t code) {
+    wifiSsid_.clear();
+    window[0] = code;
+    return kStatusError;
+  };
+  if (!net) return fail(kWifiErrNotFound);
+  if (net->security != "OPEN" && password != net->password) return fail(kWifiErrBadPassword);
+  wifiSsid_ = ssid;
+  for (auto it = wifiKnown_.begin(); it != wifiKnown_.end(); ++it)
+    if (it->first == ssid) {
+      wifiKnown_.erase(it);
+      break;
+    }
+  wifiKnown_.insert(wifiKnown_.begin(), {ssid, password});
+  if (wifiKnown_.size() > static_cast<size_t>(kWifiRemembered)) wifiKnown_.pop_back();
+  std::string ip = kWifiIp;
+  window[0] = static_cast<uint8_t>(ip.size());
+  std::copy(ip.begin(), ip.end(), window.begin() + 1);
+  return kStatusSuccess;
+}
+
+uint8_t ExpansionMock::wifiCommand(uint8_t cmd, std::vector<uint8_t>& window) {
+  auto scan = [&] {
+    wifiFound_ = wifiNetworks_;
+    std::stable_sort(wifiFound_.begin(), wifiFound_.end(),
+                     [](const WifiNetwork& a, const WifiNetwork& b) { return a.rssi > b.rssi; });
+  };
+  auto find = [&](const std::string& ssid) -> const WifiNetwork* {
+    for (const auto& net : wifiFound_)
+      if (net.ssid == ssid) return &net;
+    for (const auto& net : wifiFound_)
+      if (upperText(net.ssid) == upperText(ssid)) return &net;
+    return nullptr;
+  };
+  // The password to use (pc_exp.h): given, else remembered, else none for
+  // an open network; false if a secured one has none.
+  auto password = [&](size_t at, const std::string& ssid, const WifiNetwork* net, std::string& out) {
+    if (window[at] != kWifiPwNone) {
+      out.assign(window.begin() + static_cast<long>(at + 1),
+                 window.begin() + static_cast<long>(at + 1 + std::min<size_t>(window[at], kWifiPwMax)));
+      return true;
+    }
+    if (const std::string* known = wifiRemembered(ssid)) {
+      out = *known;
+      return true;
+    }
+    out.clear();
+    return !net || net->security == "OPEN";
+  };
+  auto fail = [&](uint8_t code) {
+    window[0] = code;
+    return kStatusError;
+  };
+  switch (cmd) {
+    case kCommandWifiScan: {
+      scan();
+      size_t count = wifiFound_.size();
+      for (size_t i = 0; i < count; i++) {
+        const WifiNetwork& net = wifiFound_[i];
+        size_t at = 2 + i * kDirRecordSize;
+        writeText(net.ssid, window, at, kDirNameLen);
+        writeText(std::to_string(net.rssi) + " " + net.security + (wifiRemembered(net.ssid) ? "*" : ""), window,
+                  at + kDirNameLen, kDirSizeTextLen);
+        std::fill(window.begin() + static_cast<long>(at + kDirNameLen + kDirSizeTextLen),
+                  window.begin() + static_cast<long>(at + kDirRecordSize), 0);
+      }
+      window[0] = 0;
+      window[1] = static_cast<uint8_t>(count);
+      writeText(std::to_string(count) + " FOUND", window, 2 + count * kDirRecordSize, kSummaryLineLen);
+      return kStatusSuccess;
+    }
+    case kCommandWifiConnect: {
+      if (window[0] >= wifiFound_.size()) return fail(kWifiErrNotFound);
+      WifiNetwork net = wifiFound_[window[0]];
+      std::string pw;
+      if (net.security == "WEP") return fail(kWifiErrWep);
+      if (!password(1, net.ssid, &net, pw)) return fail(kWifiErrNeedPassword);
+      return wifiJoin(&net, net.ssid, pw, window);
+    }
+    case kCommandWifiConnectName: {
+      size_t len = std::min<size_t>(window[0], kWifiSsidMax);
+      std::string ssid(window.begin() + 1, window.begin() + 1 + static_cast<long>(len));
+      if (len == 0 && !wifiSsid_.empty()) {  // already on one
+        std::string ip = kWifiIp;
+        window[0] = static_cast<uint8_t>(ip.size());
+        std::copy(ip.begin(), ip.end(), window.begin() + 1);
+        return kStatusSuccess;
+      }
+      scan();
+      if (len == 0) {
+        for (const auto& net : wifiFound_)
+          if (const std::string* known = wifiRemembered(net.ssid)) {
+            WifiNetwork copy = net;
+            return wifiJoin(&copy, copy.ssid, *known, window);
+          }
+        return fail(kWifiErrNoneKnown);
+      }
+      const WifiNetwork* net = find(ssid);
+      WifiNetwork copy;
+      if (net) {
+        copy = *net;
+        ssid = copy.ssid;
+        if (copy.security == "WEP") return fail(kWifiErrWep);
+      }
+      std::string pw;
+      if (!password(1 + kWifiSsidMax, ssid, net ? &copy : nullptr, pw)) return fail(kWifiErrNeedPassword);
+      return wifiJoin(net ? &copy : nullptr, ssid, pw, window);
+    }
+    case kCommandWifiDisconnect:
+      wifiSsid_.clear();
+      return kStatusSuccess;
+    case kCommandWifiStatus: {
+      std::string ip = wifiSsid_.empty() ? "" : kWifiIp;
+      window[0] = wifiSsid_.empty() ? 0 : 2;
+      window[1] = static_cast<uint8_t>(wifiSsid_.size());
+      std::copy(wifiSsid_.begin(), wifiSsid_.end(), window.begin() + 2);
+      window[2 + wifiSsid_.size()] = static_cast<uint8_t>(ip.size());
+      std::copy(ip.begin(), ip.end(), window.begin() + 3 + static_cast<long>(wifiSsid_.size()));
+      return kStatusSuccess;
+    }
+    case kCommandWifiForget: {
+      std::string ssid(window.begin() + 1, window.begin() + 1 + std::min<long>(window[0], kWifiSsidMax));
+      size_t before = wifiKnown_.size();
+      wifiKnown_.erase(std::remove_if(wifiKnown_.begin(), wifiKnown_.end(),
+                                      [&](const auto& known) {
+                                        return ssid.empty() || upperText(known.first) == upperText(ssid);
+                                      }),
+                       wifiKnown_.end());
+      window[0] = static_cast<uint8_t>(before - wifiKnown_.size());
+      return kStatusSuccess;
+    }
+    default:
+      return kStatusNotImplemented;
+  }
 }
 
 // ---- BLE (2026-09-27) ----
