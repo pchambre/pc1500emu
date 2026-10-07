@@ -4525,6 +4525,39 @@ void testBleListMatchesDetokenizer() {
   CHECK(f->mock->bleText().find("40 ") == std::string::npos);
 }
 
+// BLLIST honors BREAK (2026-10-07): it checks after each TEXT frame (1000
+// bytes) it sends, so a long program stops a frame in -- the text out so
+// far whole, back at BASIC's prompt with no error.
+void testBleListBreak() {
+  auto f = bleFixture("testBleListBreak");
+  if (!f) return;
+  f->connect();
+  std::string program;
+  for (int n = 10; n <= 3000; n += 10) program += std::to_string(n) + " REM 0123456789ABCDEFGHIJ\n";
+  CHECK(f->typeProgram(program));
+  f->m->bus.writeME0(kErlAbs, 0);
+  tapKey(*f->m, pc1500::Key::Cl);
+  typeText(*f->m, "BLLIST");
+  // Enter let go at once, not tapKey's idle frames after it: those alone
+  // would see a few frames through.
+  runKeyAction(*f->m, pc1500::Key::Ent, true, pc1500::basic::kTapFrames);
+  runKeyAction(*f->m, pc1500::Key::Ent, false, 0);
+  for (long i = 0; i < 20'000'000 && f->mock->bleText().empty(); i++) stepOne(*f->m);
+  CHECK(!f->mock->bleText().empty());  // the first frame is out
+  f->m->cpu.pressOnKey();
+  f->m->bus.ioPort().setOnKeyLine(true);
+  f->m->cpu.requestMI();
+  f->m->bus.ioPort().setOnKeyLine(false);
+  CHECK(waitForIdle(*f->m, 20'000'000));
+  CHECK(f->m->bus.readME0(kErlAbs) == 0);
+  const std::string& text = f->mock->bleText();
+  std::printf("  %zu bytes listed before BREAK\n", text.size());
+  CHECK(text.find("3000 REM") == std::string::npos);  // stopped well short of the end
+  CHECK(!text.empty() && text.back() == '\r');         // ...at a line's end
+  CHECK(f->run("BLLIST 2990,3000") == 0);  // and listing still works afterwards
+  CHECK(f->mock->bleText().find("\r3000 REM") != std::string::npos);
+}
+
 // BLSAVE/BLLOAD move the same bytes SDSAVE writes; an existing file asks
 // before overwriting (N keeps it, Y or -Y replaces it); M files carry the
 // [start][call] header. A missing file, or a link that drops part-way,
@@ -6077,6 +6110,7 @@ int main(int argc, char** argv) {
   RUN(testSdeofEndsReadLoop);
   RUN(testBlePrintText);
   RUN(testBleListMatchesDetokenizer);
+  RUN(testBleListBreak);
   RUN(testBleSaveLoad);
   RUN(testMlogmsgLogsLiteralAndStringVariable);
   RUN(testBootHookStagesRomThenSkipsOnReset);
@@ -6158,3 +6192,4 @@ int main(int argc, char** argv) {
   std::printf("%d test(s) failed.\n", g_failures);
   return 1;
 }
+
