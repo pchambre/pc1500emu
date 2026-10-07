@@ -44,6 +44,7 @@
 #include "keyboard.h"
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
 #include "basic_xlate.h"  // the firmware's own (testBasicXlateChunks)
+#include "kbd_seq.h"      // ...and its key sequencer (testKbdLayouts)
 #endif
 #include "lh5801.h"
 #include "text_loader.h"
@@ -3997,12 +3998,23 @@ void testMconfShowsAndSetsSettings() {
   CHECK(run("MCONF POWMANDELAY=0") == 0);
   CHECK(mock.configValue(8) == 0);
 
-  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (7th)
+  // KBDLAYOUT (2026-10-07): the external keyboard's layout as its HID
+  // country code -- 33 US (the default), 8 French, 9 German, 25 Spanish,
+  // 2 Belgian.
+  CHECK(run("MCONF KBDLAYOUT") == 0);
+  CHECK(shown() == "KBDLAYOUT=33");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(run("MCONF KBDLAYOUT=8") == 0);
+  CHECK(mock.configValue(9) == 8);
+
+  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (8th)
   CHECK(shown(0x8002) == "LED=0");
   CHECK(shown(0x8002 + 3 * 30) == "AUTOSTAGE=1");
   CHECK(shown(0x8002 + 4 * 30) == "BLKBD=1");
   CHECK(shown(0x8002 + 5 * 30) == "POWMANDELAY=0");
-  CHECK(shown(0x8002 + 6 * 30) == "HOSTNAME=KITCHEN");
+  CHECK(shown(0x8002 + 6 * 30) == "KBDLAYOUT=8");
+  CHECK(shown(0x8002 + 7 * 30) == "HOSTNAME=KITCHEN");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -4015,6 +4027,9 @@ void testMconfShowsAndSetsSettings() {
   CHECK(mock.configValue(7) == 1);
   CHECK(run("MCONF POWMANDELAY=-2") == 1);  // -1 is the only negative
   CHECK(mock.configValue(8) == 0);
+  CHECK(run("MCONF KBDLAYOUT=1") == 1);     // a country code with no layout (Arabic)
+  CHECK(run("MCONF KBDLAYOUT=34") == 1);    // beyond US, the highest
+  CHECK(mock.configValue(9) == 8);
   CHECK(run("MCONF COLOUR=1") == 1);       // unknown setting
   CHECK(run("MCONF SLEEPWAIT=") == 1);     // no value
   CHECK(mock.configValue(1) == 1000);
@@ -5123,6 +5138,77 @@ void testCe150Plotter() {
 // become E680-E686 as it's saved and back as it's loaded, only in real
 // tokens -- not a line number, not quoted text, not the module's other E1
 // keywords -- however the transfer is cut into chunks.
+// The external keyboard's layouts (2026-10-07, MCONF KBDLAYOUT): a key
+// reports its US position, and the layout -- French AZERTY, German,
+// Spanish, Belgian AZERTY -- says what's printed on it: the keys the
+// sequencer then taps on the PC-1500.
+void testKbdLayouts() {
+  // The keys one report taps, in order (Shift included).
+  auto taps = [](uint8_t layout, uint8_t mods, uint8_t usage) {
+    kbd_seq_t s;
+    kbd_seq_init(&s);
+    s.layout = layout;
+    uint8_t report[8] = {mods, 0, usage, 0, 0, 0, 0, 0};
+    kbd_seq_report(&s, report, 0);
+    std::vector<uint8_t> keys;
+    for (uint16_t i = s.head; i != s.tail; i = static_cast<uint16_t>((i + 1) % KBD_QUEUE_LEN))
+      if (s.queue[i].pressed) keys.push_back(s.queue[i].key);
+    return keys;
+  };
+  using K = std::vector<uint8_t>;
+  const uint8_t US = KBD_LAYOUT_US, FR = KBD_LAYOUT_FR, SHIFT = 0x02, ALTGR = 0x40;
+  CHECK(taps(US, 0, 0x14) == K{KBD_K_Q});                // US: the Q key is Q
+  CHECK(taps(FR, 0, 0x14) == K{KBD_K_A});                // AZERTY: it's A
+  CHECK(taps(FR, 0, 0x04) == K{KBD_K_Q});
+  CHECK(taps(FR, 0, 0x1A) == K{KBD_K_Z});
+  CHECK(taps(FR, 0, 0x1D) == K{KBD_K_W});
+  CHECK(taps(FR, 0, 0x33) == K{KBD_K_M});                // M is right of L
+  CHECK(taps(FR, 0, 0x10) == (K{KBD_K_SHIFT, KBD_K_MINUS}));  // , where US M is
+  CHECK(taps(FR, SHIFT, 0x1F) == K{KBD_K_2});            // digits on Shift
+  CHECK(taps(FR, 0, 0x1E) == (K{KBD_K_SHIFT, KBD_K_F6}));     // & unshifted
+  CHECK(taps(FR, 0, 0x1F).empty());                       // e acute: none on a PC-1500
+  CHECK(taps(FR, ALTGR, 0x27) == (K{KBD_K_SHIFT, KBD_K_EQUALS}));  // AltGr+0 is @
+  CHECK(taps(FR, 0, 0x37) == (K{KBD_K_SHIFT, KBD_K_ASTERISK}));    // :
+  CHECK(taps(FR, SHIFT, 0x64) == (K{KBD_K_SHIFT, KBD_K_RPAREN}));  // > on the ISO key
+  CHECK(taps(FR, 0, 0x52).empty());  // the arrows don't move: held, not tapped
+
+  // German QWERTZ: Y and Z swapped, digits plain, AltGr for brackets and @.
+  const uint8_t DE = KBD_LAYOUT_DE, ES = KBD_LAYOUT_ES, BE = KBD_LAYOUT_BE;
+  CHECK(taps(DE, 0, 0x1C) == K{KBD_K_Z});
+  CHECK(taps(DE, 0, 0x1D) == K{KBD_K_Y});
+  CHECK(taps(DE, 0, 0x1F) == K{KBD_K_2});
+  CHECK(taps(DE, SHIFT, 0x24) == K{KBD_K_SLASH});
+  CHECK(taps(DE, SHIFT, 0x27) == K{KBD_K_EQUALS});        // Shift+0 is =
+  CHECK(taps(DE, ALTGR, 0x14) == (K{KBD_K_SHIFT, KBD_K_EQUALS}));  // AltGr+Q is @
+  CHECK(taps(DE, 0, 0x2F).empty());                        // u umlaut
+  CHECK(taps(DE, 0, 0x30) == K{KBD_K_PLUS});
+  CHECK(taps(DE, 0, 0x38) == K{KBD_K_MINUS});
+
+  // Spanish: letters as US, Shift+7 is /, AltGr+2 is @, n tilde is none.
+  CHECK(taps(ES, 0, 0x14) == K{KBD_K_Q});
+  CHECK(taps(ES, SHIFT, 0x24) == K{KBD_K_SLASH});
+  CHECK(taps(ES, ALTGR, 0x1F) == (K{KBD_K_SHIFT, KBD_K_EQUALS}));
+  CHECK(taps(ES, 0, 0x33).empty());
+  CHECK(taps(ES, SHIFT, 0x2D) == (K{KBD_K_SHIFT, KBD_K_SLASH}));  // ?
+
+  // Belgian AZERTY: French letters, its own symbols.
+  CHECK(taps(BE, 0, 0x14) == K{KBD_K_A});
+  CHECK(taps(BE, 0, 0x25) == (K{KBD_K_SHIFT, KBD_K_F1}));   // 8 key: !
+  CHECK(taps(BE, 0, 0x2E) == K{KBD_K_MINUS});               // - where French has =
+  CHECK(taps(BE, 0, 0x38) == K{KBD_K_EQUALS});              // = where French has !
+  CHECK(taps(BE, ALTGR, 0x1F) == (K{KBD_K_SHIFT, KBD_K_EQUALS}));  // AltGr+2 is @
+
+  // MCONF KBDLAYOUT's HID country codes to the layouts.
+  CHECK(kbd_seq_layout_for_country(8) == FR);
+  CHECK(kbd_seq_layout_for_country(9) == DE);
+  CHECK(kbd_seq_layout_for_country(25) == ES);
+  CHECK(kbd_seq_layout_for_country(2) == BE);
+  CHECK(kbd_seq_layout_for_country(33) == US);
+  CHECK(kbd_seq_layout_for_country(0) == US);
+  CHECK(kbd_seq_country_supported(0) && kbd_seq_country_supported(33));
+  CHECK(!kbd_seq_country_supported(1) && !kbd_seq_country_supported(32));  // Arabic, UK: none yet
+}
+
 void testBasicXlateChunks() {
   auto line = [](uint16_t number, std::vector<uint8_t> body) {
     body.push_back(0x0D);
@@ -5804,6 +5890,7 @@ int main(int argc, char** argv) {
   RUN(testCe150Plotter);
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
   RUN(testBasicXlateChunks);
+  RUN(testKbdLayouts);
 #endif
   RUN(testCe150CodesSaveLoadAndHandOver);
   if (only) RUN(testCe150Globe);  // only when asked for: it takes minutes

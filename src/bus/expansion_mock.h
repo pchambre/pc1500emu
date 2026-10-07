@@ -274,7 +274,7 @@ class ExpansionMock {
   // value. The mock keeps them in memory (real firmware: flash).
   static constexpr uint8_t kCommandConfigGet = 0x30;
   static constexpr uint8_t kCommandConfigSet = 0x31;
-  static constexpr int kConfigCount = 9;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY -- mcu_config.h
+  static constexpr int kConfigCount = 10;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT -- mcu_config.h
   static constexpr int kConfigAutostage = 6;
   static constexpr int kConfigBlkbd = 7;
   // The external keyboard's driver (2026-10-04): ROM1's wait loop, copied
@@ -766,7 +766,7 @@ class ExpansionMock {
   int romCopyBeginCount_ = 0;
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
-  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF};  // mcu_config.c's defaults (POWMANDELAY -1)
+  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US)
   std::atomic<bool> kbdLoopInstalled_{false};
   int kbdPairStep_ = -1;  // -1: no pairing; then SEARCHING, CODE, CONNECTED
   size_t kbdLoopOffset_ = 0;

@@ -4,6 +4,25 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [1.1.0] - 2026-10-07
+
+The emulator itself is done; recent changes, like this one, are all about
+the expansion board's mock and tests. Hence 1.1 from 0.13.
+
+### Added
+- The expansion mock knows the firmware's tenth setting, `MCONF KBDLAYOUT`:
+  the external keyboard's layout as its HID country code (33 US, the
+  default; 8 French, 9 German, 25 Spanish, 2 Belgian).
+  `testMconfShowsAndSetsSettings` sets and lists it, and refuses a code
+  with no layout.
+- `testKbdLayouts`: the firmware's key sequencer under each layout --
+  which PC-1500 keys a key position taps for French and Belgian AZERTY,
+  German QWERTZ and Spanish -- and the country codes it takes.
+
+### Changed
+- The mock's keyboard status clears one more byte, the keyboard's kind
+  (0 classic; the firmware's BLE keyboards say 1).
+
 ## [0.13.0] - 2026-10-06
 
 ### Added
