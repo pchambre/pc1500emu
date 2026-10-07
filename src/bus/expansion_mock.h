@@ -21,6 +21,7 @@
 #include "ble_backend.h"
 #include "plot_paper.h"
 #include "ssh_mock.h"
+#include "history_mock.h"
 
 struct kbd_seq;  // RP2350/kbd_seq.h -- see ExpansionMock::kbdChar()
 
@@ -148,9 +149,11 @@ class ExpansionMock {
   // the firmware runs it on core1 between commands.
   void advanceCycles(int cycles) {
     emulatedCycles_ += static_cast<uint64_t>(cycles);
-    if (sshWindow_ && ssh_.terminal() && emulatedCycles_ - sshPolledCycles_ >= kSshPollCycles) {
+    if (sshWindow_ && (ssh_.terminal() || history_.terminal()) &&
+        emulatedCycles_ - sshPolledCycles_ >= kSshPollCycles) {
       sshPolledCycles_ = emulatedCycles_;
       ssh_.poll(*sshWindow_, kbdNowMs());
+      history_.poll(*sshWindow_, kbdNowMs());  // the command history's browsing, the same way
     }
   }
   static constexpr double kCpuHz = 1300000.0;
@@ -284,9 +287,10 @@ class ExpansionMock {
   // value. The mock keeps them in memory (real firmware: flash).
   static constexpr uint8_t kCommandConfigGet = 0x30;
   static constexpr uint8_t kCommandConfigSet = 0x31;
-  static constexpr int kConfigCount = 10;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT -- mcu_config.h
+  static constexpr int kConfigCount = 11;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY -- mcu_config.h
   static constexpr int kConfigAutostage = 6;
   static constexpr int kConfigBlkbd = 7;
+  static constexpr int kConfigHistory = 10;
   // The external keyboard's driver (2026-10-04): ROM1's wait loop, copied
   // to the window by the ROM's boot hook, checked and patched into the ROM
   // image by the firmware's own kbd_loop_install() (RP2350/kbd_seq.h).
@@ -351,6 +355,9 @@ class ExpansionMock {
   static constexpr uint8_t kCommandSshFirst = 0x68, kCommandSshTerm = 0x6C, kCommandSshLast = 0x6F;
   static constexpr uint64_t kSshPollCycles = 1300;  // 1ms
   SshMock& ssh() { return ssh_; }
+  // The command history (2026-10-07, MCONF HISTORY): HIST_ADD/HIST_BEGIN, 0x71-0x72 -- history_mock.h
+  static constexpr uint8_t kCommandHistAdd = 0x71, kCommandHistBegin = 0x72;
+  HistoryMock& history() { return history_; }
   static constexpr int kWifiSsidMax = 32, kWifiPwMax = 63, kWifiRemembered = 4;
   static constexpr uint8_t kWifiPwNone = 0xFF;
   static constexpr uint8_t kWifiErrFailed = 0, kWifiErrNotFound = 1, kWifiErrBadPassword = 2,
@@ -780,7 +787,7 @@ class ExpansionMock {
   int romCopyBeginCount_ = 0;
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
-  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US)
+  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on)
   std::atomic<bool> kbdLoopInstalled_{false};
   int kbdPairStep_ = -1;  // -1: no pairing; then SEARCHING, CODE, CONNECTED
   size_t kbdLoopOffset_ = 0;
@@ -790,6 +797,7 @@ class ExpansionMock {
   std::vector<std::pair<std::string, std::string>> wifiKnown_;  // ssid, password; most recent first
   std::string wifiSsid_;
   SshMock ssh_;
+  HistoryMock history_;
   std::vector<uint8_t>* sshWindow_ = nullptr;  // the data window, from the TERM command
   uint64_t sshPolledCycles_ = 0;
   // The fake BLE peer -- see blePeers().

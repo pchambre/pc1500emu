@@ -470,6 +470,10 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       return kStatusSuccess;
     default:
       if (cmd == 0x67 || cmd == 0x70) return ssh_.pingCommand(cmd, window, !wifiSsid_.empty());  // WFPING
+      if (cmd == kCommandHistAdd || cmd == kCommandHistBegin) {  // the command history (2026-10-07)
+        if (cmd == kCommandHistBegin) sshWindow_ = &window;
+        return history_.command(cmd, window, config_[kConfigHistory] != 0);
+      }
       if (cmd >= kCommandSshFirst && cmd <= kCommandSshLast) {  // SSH (2026-10-07)
         if (cmd == kCommandSshTerm) sshWindow_ = &window;
         return ssh_.command(cmd, window, !wifiSsid_.empty(), rootDir_, hostName());
@@ -1744,7 +1748,8 @@ uint8_t ExpansionMock::romGetMode(std::vector<uint8_t>& window) {
   window[0] = remapActive_ ? 1 : 0;
   window[1] = (remapActive_ && romStagedVerified_) ? 1 : 0;
   window[2] = config_[kConfigAutostage] ? 1 : 0;  // MCONF AUTOSTAGE: the boot hook's go-ahead
-  window[3] = config_[kConfigBlkbd] ? 1 : 0;      // MCONF BLKBD: the keyboard driver
+  // the keyboard driver's arm flags (2026-10-07): bit 0 BLKBD, bit 1 the command history
+  window[3] = static_cast<uint8_t>((config_[kConfigBlkbd] ? 1 : 0) | (config_[kConfigHistory] ? 2 : 0));
   return kStatusSuccess;
 }
 

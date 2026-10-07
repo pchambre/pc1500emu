@@ -32,6 +32,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -3809,6 +3810,10 @@ void testBootHookStagesRomThenSkipsOnReset() {
   };
 
   // MCONF AUTOSTAGE (2026-09-28) defaults to 0: the hook stages nothing.
+  // (The command history off: on, the hook puts ROM1's keyboard loop into
+  // the image before staging -- testCommandHistory -- and the copy below is
+  // checked against the image as built.)
+  m->bus.expansionMock().setConfigValue(pc1500::ExpansionMock::kConfigHistory, 0);
   resetAndBoot();
   CHECK(mock.romCopyBeginCount() == 0);
   CHECK(!mock.remapActive());
@@ -4009,13 +4014,14 @@ void testMconfShowsAndSetsSettings() {
   CHECK(run("MCONF KBDLAYOUT=8") == 0);
   CHECK(mock.configValue(9) == 8);
 
-  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (8th)
+  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (9th)
   CHECK(shown(0x8002) == "LED=0");
   CHECK(shown(0x8002 + 3 * 30) == "AUTOSTAGE=1");
   CHECK(shown(0x8002 + 4 * 30) == "BLKBD=1");
   CHECK(shown(0x8002 + 5 * 30) == "POWMANDELAY=0");
   CHECK(shown(0x8002 + 6 * 30) == "KBDLAYOUT=8");
-  CHECK(shown(0x8002 + 7 * 30) == "HOSTNAME=KITCHEN");
+  CHECK(shown(0x8002 + 7 * 30) == "HISTORY=1");  // 2026-10-07, on by default
+  CHECK(shown(0x8002 + 8 * 30) == "HOSTNAME=KITCHEN");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -5432,6 +5438,222 @@ void testCe150Globe() {
   std::printf("  wrote %s\n", (f->sdDir / "globe_lines.txt").string().c_str());
 }
 
+// The command history (2026-10-07, MCONF HISTORY, RP2350/cmd_history.h).
+// On by default, it arms the keyboard driver at boot without BLKBD (the
+// hook's history-only entry: the external keyboard's window bytes aren't
+// read). Commands ENTERed at the prompt are kept, a program's INPUT reply
+// isn't; DEF+Up/Down browse them, DEF+Left searches; ENTER runs one, Left
+// puts it up to edit, CL leaves with the line as it was, BREAK leaves too;
+// HISTORY=0 gives the arrows back to ROM1.
+void testCommandHistory() {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  std::printf("SKIP: testCommandHistory -- built without the firmware sources.\n");
+#else
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomDir =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom/";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomDir + "rom_8800.bin");
+  std::vector<uint8_t> romBin = readFile(kExpRomDir + "rom.bin");
+  if (rom.empty() || expRom.empty() || romBin.size() < 0x800) {
+    std::printf("SKIP: testCommandHistory -- ROM1.BIN, rom_8800.bin and/or rom.bin not found.\n");
+    return;
+  }
+  const uint16_t kbdLoop = static_cast<uint16_t>((expRom[0x11] << 8) | expRom[0x12]);
+  const uint16_t kDriverIdle = static_cast<uint16_t>(kbdLoop + (0xE2AA - 0xE24A));
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_history");
+  auto m = std::make_unique<BootedMachine>();
+  m->bus.ioPort().useManualRtcClock();
+  m->bus.loadME0(0xC000, rom.data(), rom.size());
+  m->bus.setExtRam0000Size(0x4000);
+  m->bus.setExtRamExtSize(0x2800);
+  m->bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x8800, /*requirePv=*/false,
+                             /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
+                             /*dataWindowSize=*/0x800, /*instructionAddr=*/0x87FF, romBin.data(), 0x800);
+  m->bus.expansionMock().setRootDir(sdDir);
+  pc1500::ExpansionMock& mock = m->bus.expansionMock();
+  auto idle = [&]() {
+    for (long i = 0; i < 6'000'000; i++) {
+      if (m->cpu.halted() && (m->cpu.p() == kIdleAddr || m->cpu.p() == kDriverIdle)) return true;
+      stepOne(*m);
+    }
+    return false;
+  };
+  auto key = [&](pc1500::Key k) {
+    tapKey(*m, k);
+    for (long i = 0; i < 200'000; i++) stepOne(*m);  // a few timer wakes: the history loop's too
+  };
+  auto enter = [&](const std::string& text) {
+    m->bus.writeME0(kErlAbs, 0);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, text);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(idle());
+  };
+  auto shown = [&]() {  // the history's line, as the MCU put it in the window
+    std::string t;
+    for (int i = 0; i < 26; i++) t += static_cast<char>(m->bus.readME0(static_cast<uint16_t>(0x8000 + i)));
+    return t.substr(0, t.find_last_not_of(' ') + 1);
+  };
+  auto line = [&]() {  // BASIC's line, to its 0DH
+    std::string t;
+    for (int i = 0; i < 80; i++) {
+      uint8_t c = m->bus.readME0(static_cast<uint16_t>(0x7BB0 + i));
+      if (c == 0x0D) break;
+      t += static_cast<char>(c);
+    }
+    return t;
+  };
+  auto number = [&](uint16_t at) {
+    return (m->bus.readME0(at) << 8) | m->bus.readME0(static_cast<uint16_t>(at + 2));
+  };
+  auto history = [&]() { return mock.history().entries(); };
+  auto mode = [&](uint8_t bit) {  // 764FH: RUN 40H, PRO 20H (NEW0 leaves it in PRO)
+    for (int i = 0; i < 3 && !(m->bus.readME0(0x764F) & bit); i++) {
+      key(pc1500::Key::Cl);
+      key(pc1500::Key::Mode);
+      CHECK(idle());
+    }
+    CHECK(m->bus.readME0(0x764F) & bit);
+  };
+
+  m->cpu.reset();
+  for (long c = 0; !m->cpu.halted() && c < 20'000'000; c++) stepOne(*m);
+  for (long i = 0; i < 4'000'000; i++) stepOne(*m);
+  enter("NEW0");
+  // armed, at the history-only entry: not KBD_HOOK (880EH)
+  CHECK(m->bus.readME0(0x79D4) == 0x55);
+  CHECK(!(m->bus.readME0(0x785B) == 0x88 && m->bus.readME0(0x785C) == 0x0E));
+  mode(0x40);
+  mock.history().clear();
+
+  enter("B=3");
+  enter("C=B*2");
+  enter("C=B*2");  // the same again: kept once
+  CHECK(history().size() == 2 && history()[0] == "C=B*2" && history()[1] == "B=3");
+
+  // DEF+Up: the newest; Up older, Down newer; ENTER runs it
+  enter("C=0");
+  key(pc1500::Key::Def);
+  key(pc1500::Key::Up);
+  CHECK(mock.history().terminal());
+  CHECK(shown() == "C=0");
+  key(pc1500::Key::Up);
+  CHECK(shown() == "C=B*2");
+  key(pc1500::Key::Up);
+  key(pc1500::Key::Up);
+  CHECK(shown() == "B=3");  // the oldest: stays
+  key(pc1500::Key::Down);
+  key(pc1500::Key::Down);
+  CHECK(shown() == "C=0");
+  key(pc1500::Key::Up);
+  CHECK(shown() == "C=B*2");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(idle());
+  CHECK(!mock.history().terminal());
+  CHECK(number(0x7910) == 0x0060);  // C = 6: it ran
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+  CHECK(history()[0] == "C=B*2");  // and is the newest now
+
+  // Left: up to edit, the cursor at its end; ENTER runs the edited line
+  enter("C=0");
+  key(pc1500::Key::Def);
+  key(pc1500::Key::Up);
+  key(pc1500::Key::Up);
+  CHECK(shown() == "C=B*2");
+  key(pc1500::Key::Left);
+  CHECK(idle());
+  CHECK(m->bus.readME0(0x7880) == 0x40 && line() == "C=B*2" && m->bus.readME0(0x787B) == 0x08 + 5);
+  typeText(*m, "+1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(idle());
+  CHECK(number(0x7910) == 0x0070);  // C = 7
+  CHECK(history()[0] == "C=B*2+1");
+
+  // CL leaves with the line as it was, half typed, the cursor at its end
+  tapKey(*m, pc1500::Key::Cl);
+  typeText(*m, "B=");
+  key(pc1500::Key::Def);
+  key(pc1500::Key::Up);
+  CHECK(mock.history().terminal());
+  key(pc1500::Key::Cl);
+  CHECK(idle());
+  CHECK(!mock.history().terminal());
+  CHECK(line() == "B=" && m->bus.readME0(0x7880) == 0x40);
+  typeText(*m, "9");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(idle());
+  CHECK(number(0x7908) == 0x0090);  // B = 9
+
+  // from an empty line, CL leaves it empty, and the next command is as typed
+  tapKey(*m, pc1500::Key::Cl);
+  CHECK(idle());
+  key(pc1500::Key::Def);
+  key(pc1500::Key::Up);
+  CHECK(mock.history().terminal());
+  key(pc1500::Key::Cl);
+  CHECK(idle());
+  CHECK(!mock.history().terminal() && (line().empty() || line() == ">"));  // ROM1 shows its prompt
+  enter("D=2");
+  CHECK(number(0x7918) == 0x0020 && m->bus.readME0(kErlAbs) == 0);
+
+  // DEF+Left: search -- the newest holding "B=", ENTER runs it
+  key(pc1500::Key::Def);
+  key(pc1500::Key::Left);
+  CHECK(mock.history().terminal());
+  key(pc1500::Key::B);
+  key(pc1500::Key::Equals);
+  CHECK(shown() == "B=> B=9");
+  key(pc1500::Key::Def);
+  key(pc1500::Key::Left);  // the next older
+  CHECK(shown() == "B=> B=3");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(idle());
+  CHECK(number(0x7908) == 0x0030);  // B = 3
+
+  // BREAK leaves; from an empty line, the prompt again
+  tapKey(*m, pc1500::Key::Cl);
+  key(pc1500::Key::Def);
+  key(pc1500::Key::Up);
+  CHECK(mock.history().terminal());
+  m->cpu.pressOnKey();
+  m->bus.ioPort().setOnKeyLine(true);
+  m->cpu.requestMI();
+  m->bus.ioPort().setOnKeyLine(false);
+  CHECK(idle());
+  CHECK(!mock.history().terminal());
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+  enter("C=1");
+  CHECK(number(0x7910) == 0x0010);
+
+  // a program's INPUT reply isn't a command; nor is a line typed in PRO mode
+  // (last: RUN clears the variables the rest uses)
+  mode(0x20);
+  std::string err;
+  bool typed = pc1500::basic::typeBasicProgramText(m->bus, m->cpu, "10 INPUT D\n", kCyclesPerFrame,
+                                                    kCyclesPerTimerTick, &err);
+  if (!typed) std::printf("  typing the program: %s\n", err.c_str());
+  CHECK(typed);
+  mode(0x40);
+  enter("RUN");
+  typeText(*m, "7");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(idle());
+  CHECK(number(0x7918) == 0x0070);  // D = 7
+  CHECK(history()[0] == "RUN" && history()[1] == "C=1");
+
+  // HISTORY=0: DEF+Up is ROM1's Up again
+  mock.setConfigValue(pc1500::ExpansionMock::kConfigHistory, 0);
+  size_t kept = history().size();
+  enter("C=2");
+  CHECK(history().size() == kept);  // nothing kept either
+  key(pc1500::Key::Def);
+  key(pc1500::Key::Up);
+  CHECK(!mock.history().terminal());
+  CHECK(idle());
+#endif
+}
+
 // The external keyboard's driver (2026-10-04). With MCONF BLKBD=1 the boot
 // hook copies ROM1's keyboard wait loop to the MCU, which patches it into
 // the ROM image at KBD_LOOP (RP2350/kbd_seq.c kbd_loop_install(), in the
@@ -5508,7 +5730,9 @@ void testExternalKeyboardDriver() {
     return (m->bus.readME0(at) << 8) | m->bus.readME0(static_cast<uint16_t>(at + 2));
   };
 
-  // BLKBD defaults to 0: no driver.
+  // BLKBD defaults to 0: no driver (with the command history off too --
+  // MCONF HISTORY, on by default, arms it on its own: testCommandHistory).
+  mock.setConfigValue(pc1500::ExpansionMock::kConfigHistory, 0);
   resetAndBoot();
   CHECK(m->bus.readME0(0x79D4) == 0x00);
   CHECK(m->bus.readME0(kbdLoop) != rom[0xE24A - 0xC000]);
@@ -6089,6 +6313,7 @@ int main(int argc, char** argv) {
   RUN(testFnKeysAndStateSaveRestore);
   RUN(testKeywordsInProgramWithExpressions);
   RUN(testExternalKeyboardDriver);
+  RUN(testCommandHistory);
   RUN(testBlkbdPairsKeyboard);
   RUN(testExternalKeyboardOldRom);
   RUN(testBlkeyLoadSaveTranslation);
@@ -6192,4 +6417,3 @@ int main(int argc, char** argv) {
   std::printf("%d test(s) failed.\n", g_failures);
   return 1;
 }
-
