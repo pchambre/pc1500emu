@@ -469,6 +469,11 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       window[0] = logInfoEnabled_ ? 1 : 0;
       return kStatusSuccess;
     default:
+      if (cmd == 0x67 || cmd == 0x70) return ssh_.pingCommand(cmd, window, !wifiSsid_.empty());  // WFPING
+      if (cmd >= kCommandSshFirst && cmd <= kCommandSshLast) {  // SSH (2026-10-07)
+        if (cmd == kCommandSshTerm) sshWindow_ = &window;
+        return ssh_.command(cmd, window, !wifiSsid_.empty(), rootDir_, hostName());
+      }
       // Matches DoCommand()'s own default: case -- every command this
       // mock doesn't implement (TEST_COPY_STRING, the MLOG commands, ...)
       // reports NOT_IMPLEMENTED rather than silently succeeding, so ROM

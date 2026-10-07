@@ -31,6 +31,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -4211,12 +4212,12 @@ struct BleFixture {
 
   // The line's error number (0 = none). ERL keeps the last error until
   // another one, so it's cleared first.
-  int run(const std::string& line) {
+  int run(const std::string& line, long maxInstructions = 2'000'000) {
     m->bus.writeME0(kErlAbs, 0);
     tapKey(*m, pc1500::Key::Cl);
     typeText(*m, line);
     tapKey(*m, pc1500::Key::Ent);
-    CHECK(waitForIdle(*m));
+    CHECK(waitForIdle(*m, maxInstructions));
     return m->bus.readME0(kErlAbs);
   }
   // A SHOW's text is at 0x8000; a listing's first entry at 0x8002.
@@ -5871,6 +5872,164 @@ void testBlkeyReadsEitherKeyboard() {
 #endif
 }
 
+// WFPING (2026-10-07, RP2350/net_ping.h): four rounds, then the summary;
+// the host here is this machine, which always answers.
+void testWifiPing() {
+  auto f = bleFixture("testWifiPing");
+  if (!f) return;
+  CHECK(f->run("WFPING \"127.0.0.1\"") == 0);  // no Wi-Fi yet
+  CHECK(f->shown() == "SSH: NO WI-FI - WFCON");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->m->bus.readME0(kErlAbs) == 40);
+  CHECK(f->run("WFPING") == 1);
+  CHECK(f->run("WFPING \"\"") == 1);
+  CHECK(f->run("WFCON \"HOST\"") == 0);
+  f->key(pc1500::Key::Ent);
+  CHECK(f->run("WFPING \"127.0.0.1\"", 40'000'000) == 0);
+  std::printf("  %s\n", f->shown().c_str());
+  CHECK(f->shown().rfind("4/4 REPLIES ", 0) == 0);
+  for (long i = 0; i < 1'000'000; i++) stepOne(*f->m);
+  f->key(pc1500::Key::Ent);
+  CHECK(f->m->bus.readME0(kErlAbs) == 0);
+}
+
+// SSH (2026-10-07, RP2350/ssh_session.h): the arguments, the errors that
+// need no host, SSHKEY's file and SSHFORGET. A session on a real host is
+// testSshSessionLive's.
+void testSshArgumentsAndErrors() {
+  auto f = bleFixture("testSshArgumentsAndErrors");
+  if (!f) return;
+  CHECK(f->run("SSH \"paul@host\"") == 0);  // no Wi-Fi yet
+  CHECK(f->shown() == "SSH: NO WI-FI - WFCON");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->m->bus.readME0(kErlAbs) == 40);
+  CHECK(f->run("SSH \"nouser\"") == 1);
+  CHECK(f->run("SSH \"@host\"") == 1);
+  CHECK(f->run("SSH \"paul@\"") == 1);
+  CHECK(f->run("SSH \"paul@host:\"") == 1);
+  CHECK(f->run("SSH \"paul@host:0\"") == 1);
+  CHECK(f->run("SSH \"paul@host:99999\"") == 1);
+  CHECK(f->run("SSH \"paul@host:2X\"") == 1);
+  CHECK(f->run("SSH") == 1);
+
+  CHECK(f->run("WFCON \"HOST\"") == 0);
+  f->key(pc1500::Key::Ent);
+  CHECK(f->run("SSH \"paul@127.0.0.1:1\"", 20'000'000) == 0);  // nothing listens there (Windows takes ~2s to say so)
+  CHECK(f->shown() == "SSH: NO CONNECTION");
+  // The mock holds the emulated clock while a command blocks, so the ~2s
+  // connect took no emulated time: ROM1's key gate after the Enter that
+  // started it is still shut. Let it open, as those seconds would.
+  for (long i = 0; i < 1'000'000; i++) stepOne(*f->m);
+  f->key(pc1500::Key::Ent);
+  CHECK(f->m->bus.readME0(kErlAbs) == 40);
+
+  CHECK(f->run("SSHKEY") == 0);
+  CHECK(f->shown().rfind("SSHKEY.PUB ", 0) == 0);
+  f->key(pc1500::Key::Ent);
+  {
+    std::ifstream in(f->sdDir / "SSHKEY.PUB");
+    std::string line;
+    std::getline(in, line);
+    CHECK(line.rfind("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI", 0) == 0);
+    CHECK(line.size() > 12 && line.substr(line.size() - 19) == " pc1500@PC-1500 EMU");
+  }
+  CHECK(f->run("SSHKEY 1") == 1);
+  CHECK(f->run("SSHFORGET \"host\"") == 40);  // not known
+  CHECK(f->run("SSHFORGET") == 0);
+  CHECK(f->shown() == "FORGET ALL HOSTS Y/N");
+  f->key(pc1500::Key::Y);
+}
+
+// A session on a real host -- only with PC1500_SSH_TEST_HOST ("user@host")
+// and PC1500_SSH_TEST_KEY (an unencrypted OpenSSH ed25519 key the host has
+// in authorized_keys) set. Refusing the new host's key, then accepting it;
+// a command typed on the PC-1500's keys, its output; BREAK as Ctrl-C;
+// "exit" back to BASIC; the host known the next time.
+static void tapTerminalText(BleFixture& f, const std::string& text) {
+  for (char c : text) {
+    pc1500::Key k = pc1500::Key::Space;
+    if (c >= 'a' && c <= 'z') k = static_cast<pc1500::Key>(static_cast<int>(pc1500::Key::A) + (c - 'a'));
+    else if (c == '\r') k = pc1500::Key::Ent;
+    else if (c != ' ') continue;
+    tapKey(*f.m, k);
+  }
+}
+
+static bool stepUntil(BleFixture& f, const std::function<bool()>& done, long maxInstructions = 60'000'000) {
+  for (long i = 0; i < maxInstructions; i++) {
+    if (i % 1000 == 0 && done()) return true;
+    stepOne(*f.m);
+  }
+  return done();
+}
+
+static bool shellPrinted(BleFixture& f, const std::string& text) {
+  for (const auto& line : f.mock->ssh().lines())
+    if (line.find(text) != std::string::npos) return true;
+  return false;
+}
+
+void testSshSessionLive() {
+  const char* target = std::getenv("PC1500_SSH_TEST_HOST");
+  const char* keyFile = std::getenv("PC1500_SSH_TEST_KEY");
+  if (!target || !keyFile) {
+    std::printf("SKIP: testSshSessionLive -- PC1500_SSH_TEST_HOST/PC1500_SSH_TEST_KEY not set.\n");
+    return;
+  }
+  auto f = bleFixture("testSshSessionLive");
+  if (!f) return;
+  CHECK(f->mock->ssh().loadDeviceKeyFile(keyFile));
+  CHECK(f->run("WFCON \"HOST\"") == 0);
+  f->key(pc1500::Key::Ent);
+  std::string ssh = std::string("SSH \"") + target + "\"";
+  std::string host = std::string(target).substr(std::string(target).find('@') + 1);
+
+  CHECK(f->run(ssh) == 0);
+  CHECK(f->shown().rfind("NEW HOST ", 0) == 0);
+  CHECK(f->shown().size() == 26 && f->shown().substr(22) == " Y/N");
+  std::printf("  %s\n", f->shown().c_str());
+  f->key(pc1500::Key::N);  // refused: back to BASIC, not remembered
+  CHECK(f->m->bus.readME0(kErlAbs) == 0);
+  CHECK(!f->mock->ssh().knowsHost(host));
+
+  CHECK(f->run(ssh) == 0);
+  tapKey(*f->m, pc1500::Key::Y);
+  CHECK(f->mock->ssh().knowsHost(host));
+  CHECK(stepUntil(*f, [&] { return f->mock->ssh().terminal(); }));
+  CHECK(stepUntil(*f, [&] {
+    auto lines = f->mock->ssh().lines();
+    return !lines.empty() && lines.back().find("$ ") != std::string::npos;
+  }));
+  tapTerminalText(*f, "echo pc fifteen hundred\r");
+  CHECK(stepUntil(*f, [&] {
+    for (const auto& line : f->mock->ssh().lines())
+      if (line == "pc fifteen hundred") return true;
+    return false;
+  }));
+  CHECK(f->shown().find('$') != std::string::npos);  // the prompt again, on the display
+
+  tapTerminalText(*f, "sleep thirty\r");  // not a number: "sleep: invalid time interval"...
+  CHECK(stepUntil(*f, [&] { return shellPrinted(*f, "sleep: invalid"); }));
+  tapTerminalText(*f, "cat\r");  // BREAK (Ctrl-C) ends it
+  for (long i = 0; i < 2'000'000; i++) stepOne(*f->m);
+  f->m->cpu.pressOnKey();
+  f->m->bus.ioPort().setOnKeyLine(true);
+  f->m->cpu.requestMI();
+  f->m->bus.ioPort().setOnKeyLine(false);
+  CHECK(stepUntil(*f, [&] { return shellPrinted(*f, "^C"); }));
+
+  tapTerminalText(*f, "exit\r");
+  CHECK(waitForIdle(*f->m, 60'000'000));  // the session over: back at BASIC's prompt
+  CHECK(f->m->bus.readME0(kErlAbs) == 0);
+  for (const auto& line : f->mock->ssh().lines()) std::printf("  | %s\n", line.c_str());
+
+  CHECK(f->run(ssh) == 0);  // known now: no question
+  CHECK(f->shown().rfind("NEW HOST", 0) != 0);
+  CHECK(stepUntil(*f, [&] { return f->mock->ssh().terminal(); }));
+  tapTerminalText(*f, "exit\r");
+  CHECK(waitForIdle(*f->m, 60'000'000));
+}
+
 int main(int argc, char** argv) {
   // expansion_keyword_test [part of a test's name]: only the tests whose
   // names contain it (the whole suite takes about 11 minutes).
@@ -5909,6 +6068,9 @@ int main(int argc, char** argv) {
   RUN(testWifiScanConnectAndPassword);
   RUN(testWifiConnectByNameAndForget);
   RUN(testWifiStatAndMlogClear);
+  RUN(testWifiPing);
+  RUN(testSshArgumentsAndErrors);
+  RUN(testSshSessionLive);
   RUN(testBlePutToPeer);
   RUN(testBleGetFromPeer);
   RUN(testBleMessaging);

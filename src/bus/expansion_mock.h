@@ -20,6 +20,7 @@
 
 #include "ble_backend.h"
 #include "plot_paper.h"
+#include "ssh_mock.h"
 
 struct kbd_seq;  // RP2350/kbd_seq.h -- see ExpansionMock::kbdChar()
 
@@ -142,7 +143,16 @@ class ExpansionMock {
   uint8_t pollStatusPaced();
 
   // The emulated clock, from Bus::advanceCycles() -- see pollStatusPaced().
-  void advanceCycles(int cycles) { emulatedCycles_ += static_cast<uint64_t>(cycles); }
+  // Also the SSH terminal's turn (2026-10-07): while the TERM action has
+  // the window, the session runs about once per emulated millisecond, as
+  // the firmware runs it on core1 between commands.
+  void advanceCycles(int cycles) {
+    emulatedCycles_ += static_cast<uint64_t>(cycles);
+    if (sshWindow_ && ssh_.terminal() && emulatedCycles_ - sshPolledCycles_ >= kSshPollCycles) {
+      sshPolledCycles_ = emulatedCycles_;
+      ssh_.poll(*sshWindow_, kbdNowMs());
+    }
+  }
   static constexpr double kCpuHz = 1300000.0;
 
   // The external keyboard (2026-10-04): the firmware's own key sequencer
@@ -337,6 +347,10 @@ class ExpansionMock {
   static constexpr uint8_t kCommandWifiStatus = 0x64;
   static constexpr uint8_t kCommandWifiForget = 0x65;
   static constexpr uint8_t kCommandFnWfstat = 0x66;  // the WFSTAT function's value
+  // SSH (2026-10-07): EXP_COMMAND_SSH_OPEN..FORGET, 0x68-0x6F -- ssh_mock.h
+  static constexpr uint8_t kCommandSshFirst = 0x68, kCommandSshTerm = 0x6C, kCommandSshLast = 0x6F;
+  static constexpr uint64_t kSshPollCycles = 1300;  // 1ms
+  SshMock& ssh() { return ssh_; }
   static constexpr int kWifiSsidMax = 32, kWifiPwMax = 63, kWifiRemembered = 4;
   static constexpr uint8_t kWifiPwNone = 0xFF;
   static constexpr uint8_t kWifiErrFailed = 0, kWifiErrNotFound = 1, kWifiErrBadPassword = 2,
@@ -775,6 +789,9 @@ class ExpansionMock {
   std::vector<WifiNetwork> wifiFound_;  // the last scan, strongest first
   std::vector<std::pair<std::string, std::string>> wifiKnown_;  // ssid, password; most recent first
   std::string wifiSsid_;
+  SshMock ssh_;
+  std::vector<uint8_t>* sshWindow_ = nullptr;  // the data window, from the TERM command
+  uint64_t sshPolledCycles_ = 0;
   // The fake BLE peer -- see blePeers().
   std::vector<std::string> blePeers_ = {"MARVIN"};
   bool bleConnected_ = false;

@@ -3,6 +3,7 @@ add_library(pc1500bus STATIC
   expansion_mock.cpp
   ble_link_core.cpp  # the PC-1500 Link protocol over a host Transport (2026-09-28)
   plot_paper.cpp     # what PLOT frames drew: the CE-150 stand-in's paper (2026-09-30)
+  ssh_mock.cpp       # the SSH keyword's session, over a host socket (2026-10-07)
 )
 target_include_directories(pc1500bus PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # std::thread: the mock's command worker, the BLE core's server thread
@@ -10,6 +11,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(pc1500bus PUBLIC lh5801cpu pc1500keyboard Threads::Threads)
 if(WIN32)
   target_link_libraries(pc1500bus PRIVATE crypt32)  # DPAPI: the Link's pairing file
+  target_link_libraries(pc1500bus PRIVATE ws2_32 iphlpapi)   # SSH's socket, WFPING's echo (ssh_mock.cpp)
 endif()
 
 # The expansion board's keyword executor (2026-09-25) is portable C in the
@@ -34,6 +36,11 @@ if(EXISTS "${PC1500_EXPANSION_FIRMWARE_DIR}/keywords.c")
     "${PC1500_EXPANSION_FIRMWARE_DIR}/kbd_seq.c"
     # the Link's pairing and sealed frames (2026-10-03, BLE_PROTOCOL.md sec.7)
     "${PC1500_EXPANSION_FIRMWARE_DIR}/link_secure.c"
+    # SSH (2026-10-07): the protocol, the terminal, the keys
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/ssh_client.c"
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/ssh_term.c"
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/ssh_keys.c"
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/sha256.c"
     "${PC1500_EXPANSION_FIRMWARE_DIR}/third_party/monocypher/monocypher.c"
     "${PC1500_EXPANSION_FIRMWARE_DIR}/third_party/monocypher/monocypher-ed25519.c")
   target_include_directories(pc1500bus PRIVATE "${PC1500_EXPANSION_FIRMWARE_DIR}")
