@@ -36,6 +36,7 @@
 #include <memory>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <vector>
 #if defined(_MSC_VER) && defined(_DEBUG)
 #include <crtdbg.h>
@@ -4014,14 +4015,23 @@ void testMconfShowsAndSetsSettings() {
   CHECK(run("MCONF KBDLAYOUT=8") == 0);
   CHECK(mock.configValue(9) == 8);
 
-  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (9th)
+  // BRIDGEINT (2026-10-08): the SD bridge's INT pin, on by default.
+  CHECK(run("MCONF BRIDGEINT") == 0);
+  CHECK(shown() == "BRIDGEINT=1");
+  tapKey(*m, pc1500::Key::Ent);
+  CHECK(waitForIdle(*m));
+  CHECK(run("MCONF BRIDGEINT=0") == 0);
+  CHECK(mock.configValue(11) == 0);
+
+  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (10th)
   CHECK(shown(0x8002) == "LED=0");
   CHECK(shown(0x8002 + 3 * 30) == "AUTOSTAGE=1");
   CHECK(shown(0x8002 + 4 * 30) == "BLKBD=1");
   CHECK(shown(0x8002 + 5 * 30) == "POWMANDELAY=0");
   CHECK(shown(0x8002 + 6 * 30) == "KBDLAYOUT=8");
   CHECK(shown(0x8002 + 7 * 30) == "HISTORY=1");  // 2026-10-07, on by default
-  CHECK(shown(0x8002 + 8 * 30) == "HOSTNAME=KITCHEN");
+  CHECK(shown(0x8002 + 8 * 30) == "BRIDGEINT=0");
+  CHECK(shown(0x8002 + 9 * 30) == "HOSTNAME=KITCHEN");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -4037,6 +4047,8 @@ void testMconfShowsAndSetsSettings() {
   CHECK(run("MCONF KBDLAYOUT=1") == 1);     // a country code with no layout (Arabic)
   CHECK(run("MCONF KBDLAYOUT=34") == 1);    // beyond US, the highest
   CHECK(mock.configValue(9) == 8);
+  CHECK(run("MCONF BRIDGEINT=2") == 1);    // 0 or 1 only
+  CHECK(mock.configValue(11) == 0);
   CHECK(run("MCONF COLOUR=1") == 1);       // unknown setting
   CHECK(run("MCONF SLEEPWAIT=") == 1);     // no value
   CHECK(mock.configValue(1) == 1000);
@@ -5588,12 +5600,16 @@ void testCommandHistory() {
   // from an empty line, CL leaves it empty, and the next command is as typed
   tapKey(*m, pc1500::Key::Cl);
   CHECK(idle());
+  uint8_t modeBefore = m->bus.readME0(0x7880);
   key(pc1500::Key::Def);
   key(pc1500::Key::Up);
   CHECK(mock.history().terminal());
   key(pc1500::Key::Cl);
   CHECK(idle());
   CHECK(!mock.history().terminal() && (line().empty() || line() == ">"));  // ROM1 shows its prompt
+  // ... as it was: no line typed (7880H 00H), so no cursor after the ">"
+  // (2026-10-08: 40H here put one there, unlike BREAK)
+  CHECK(modeBefore != 0x40 && m->bus.readME0(0x7880) == modeBefore);
   enter("D=2");
   CHECK(number(0x7918) == 0x0020 && m->bus.readME0(kErlAbs) == 0);
 
@@ -5641,6 +5657,30 @@ void testCommandHistory() {
   CHECK(idle());
   CHECK(number(0x7918) == 0x0070);  // D = 7
   CHECK(history()[0] == "RUN" && history()[1] == "C=1");
+
+  // A command run from the history ends as if typed: SDLS's listing gets no
+  // blinking block (787CH bit 0, ROM1 LE315H) at its left, as it did when
+  // RUN went through ROM1's recall (2026-10-08)
+  {
+    auto cursor = [&]() {
+      for (long i = 0; i < 3'000'000; i++) stepOne(*m);
+      return std::make_tuple(m->bus.readME0(0x787C), m->bus.readME0(0x787D), m->bus.readME0(0x787E),
+                             m->bus.readME0(0x787F));
+    };
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "SDLS");
+    tapKey(*m, pc1500::Key::Ent);
+    auto typedState = cursor();
+    CHECK((std::get<0>(typedState) & 0x01) == 0);
+    key(pc1500::Key::Cl);
+    key(pc1500::Key::Def);
+    key(pc1500::Key::Up);
+    CHECK(mock.history().terminal() && shown() == "SDLS");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(cursor() == typedState);
+    key(pc1500::Key::Cl);
+    CHECK(idle());
+  }
 
   // HISTORY=0: DEF+Up is ROM1's Up again
   mock.setConfigValue(pc1500::ExpansionMock::kConfigHistory, 0);

@@ -287,7 +287,7 @@ class ExpansionMock {
   // value. The mock keeps them in memory (real firmware: flash).
   static constexpr uint8_t kCommandConfigGet = 0x30;
   static constexpr uint8_t kCommandConfigSet = 0x31;
-  static constexpr int kConfigCount = 11;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY -- mcu_config.h
+  static constexpr int kConfigCount = 12;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY, BRIDGEINT -- mcu_config.h
   static constexpr int kConfigAutostage = 6;
   static constexpr int kConfigBlkbd = 7;
   static constexpr int kConfigHistory = 10;
@@ -787,7 +787,7 @@ class ExpansionMock {
   int romCopyBeginCount_ = 0;
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
-  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on)
+  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1, 1};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on, BRIDGEINT on)
   std::atomic<bool> kbdLoopInstalled_{false};
   int kbdPairStep_ = -1;  // -1: no pairing; then SEARCHING, CODE, CONNECTED
   size_t kbdLoopOffset_ = 0;
