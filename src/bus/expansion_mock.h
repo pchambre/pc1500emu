@@ -176,6 +176,14 @@ class ExpansionMock {
   uint8_t kbdBreakCell();
   static constexpr size_t kKbdKeyOffset = 0x7EF;    // pc_exp.h EXP_KBD_KEY
   static constexpr size_t kKbdBreakOffset = 0x7F5;  // EXP_KBD_BREAK
+  // Their complements, which the driver checks first (EXP_KBD_KEY_CHK,
+  // EXP_KBD_BREAK_CHK, 2026-10-13: the card's MCU sleeps between keys).
+  static constexpr size_t kKbdKeyChkOffset = 0x7D8;
+  static constexpr size_t kKbdBreakChkOffset = 0x7D9;
+  // A sleeping card, for the tests: 0-255 makes those four cells all read
+  // as that byte, as a bus nobody drives might; -1 (default) serves them.
+  void setKbdWindowAsleep(int value) { kbdAsleep_ = value; }
+  int kbdWindowAsleep() const { return kbdAsleep_; }
 
   // Test-only: blocks until whatever command processCommand() most
   // recently started has fully finished. Real ROM/CPU code never needs
@@ -650,6 +658,7 @@ class ExpansionMock {
   // thread and the emulation both reach it, hence the mutex.
   std::unique_ptr<::kbd_seq, void (*)(::kbd_seq*)> kbd_{nullptr, nullptr};
   std::mutex kbdMutex_;
+  int kbdAsleep_ = -1;  // setKbdWindowAsleep()
   ::kbd_seq* kbdState();
   uint32_t kbdNowMs() const { return static_cast<uint32_t>(emulatedCycles_ * 1000 / 1300000); }
   uint64_t commandStartCycles_ = 0;

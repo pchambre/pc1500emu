@@ -265,6 +265,7 @@ void Upd1990ac::commitShiftRegisterToTime() {
   tmv.tm_hour = hour;
   tmv.tm_min = minute;
   tmv.tm_sec = second;
+  tmv.tm_isdst = -1;  // the set date's own DST, not today's (a winter time set in summer was an hour off)
   std::time_t newT = std::mktime(&tmv);
   auto newTimePoint = std::chrono::system_clock::from_time_t(newT);
   timeOffset_ = std::chrono::duration_cast<std::chrono::seconds>(newTimePoint - now);
@@ -439,10 +440,20 @@ uint8_t Bus::readME0(uint16_t addr) {
         if (m.hasDataWindow && addr == m.instructionAddr) return expansionMock_.pollStatusPaced();
         // The external keyboard's two bytes (2026-10-04) come from the
         // mock's key sequencer, which runs on the emulated clock.
+        if (m.hasDataWindow && expansionMock_.kbdWindowAsleep() >= 0 &&
+            (addr == m.dataWindowBase + ExpansionMock::kKbdKeyOffset ||
+             addr == m.dataWindowBase + ExpansionMock::kKbdBreakOffset ||
+             addr == m.dataWindowBase + ExpansionMock::kKbdKeyChkOffset ||
+             addr == m.dataWindowBase + ExpansionMock::kKbdBreakChkOffset))
+          return static_cast<uint8_t>(expansionMock_.kbdWindowAsleep());
         if (m.hasDataWindow && addr == m.dataWindowBase + ExpansionMock::kKbdKeyOffset)
           return expansionMock_.kbdKeyCell();
         if (m.hasDataWindow && addr == m.dataWindowBase + ExpansionMock::kKbdBreakOffset)
           return expansionMock_.kbdBreakCell();
+        if (m.hasDataWindow && addr == m.dataWindowBase + ExpansionMock::kKbdKeyChkOffset)
+          return static_cast<uint8_t>(~expansionMock_.kbdKeyCell());
+        if (m.hasDataWindow && addr == m.dataWindowBase + ExpansionMock::kKbdBreakChkOffset)
+          return static_cast<uint8_t>(~expansionMock_.kbdBreakCell());
         return v;
       }
     }

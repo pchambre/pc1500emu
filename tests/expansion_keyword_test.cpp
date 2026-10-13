@@ -5799,6 +5799,25 @@ void testExternalKeyboardDriver() {
   CHECK(mock.kbdTap(0xB5, false));  // CL
   CHECK(external(""));
 
+  // The card asleep between keystrokes (2026-10-13): its window reads as
+  // whatever the bus holds, and the driver must take none of it as a key
+  // or an ON -- the real keyboard types on as ever. Before the check bytes
+  // (EXP_KBD_KEY_CHK), each key typed was cleared at once, as BREAK.
+  for (int held : {0x00, 0xFF, 0x87, 0xEF, 0xF5}) {
+    mock.setKbdWindowAsleep(held);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, "H=5");
+    for (int i = 0; i < 2'000'000; i++) stepOne(*m);
+    CHECK(readDisplayBuffer(m->bus) == "H=5");
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(idle());
+    CHECK(number(0x7938) == 0x0050);  // H = 5
+    CHECK(m->bus.readME0(kErlAbs) == 0);
+    m->bus.writeME0(0x7938, 0);
+    m->bus.writeME0(0x793A, 0);
+  }
+  mock.setKbdWindowAsleep(-1);
+
   // ON = BREAK: a program waiting at INPUT stops, and the next line typed is
   // a command again, not INPUT's answer.
   std::string typeError;
