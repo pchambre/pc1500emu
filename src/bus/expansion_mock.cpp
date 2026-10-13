@@ -13,6 +13,7 @@
 #include "kbd_seq.h"
 #include "keywords.h"
 #include "plotter.h"
+#include "time_zone.h"
 #endif
 
 namespace pc1500 {
@@ -426,6 +427,55 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       if (ble) ble->setName(name);
       return kStatusSuccess;
     }
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+    // The clock (2026-10-08) -- RP2350/time_sync.c's, with the fake peer's
+    // or the host's clock in place of the app's and SNTP's.
+    case kCommandTimeGet: {
+      int64_t utcMs;
+      int32_t offsetS;
+      if (config_[kConfigTimeSync] == 0) return kStatusError;
+      if (window[0] == kTimeSourceBle) {
+        if (auto ble = bleBackend()) {
+          if (!ble->hostTime(&utcMs, &offsetS)) return kStatusError;
+        } else {
+          if (!bleConnected_ || !blePeerClock_) return kStatusError;
+          utcMs = blePeerUtcMs_;
+          offsetS = blePeerOffsetS_;
+        }
+      } else if (window[0] == kTimeSourceWifi) {
+        char canonical[TZ_NAME_MAX + 1];
+        tz_zone_t zone;
+        if (wifiSsid_.empty() ||
+            !tz_find(timeZone_.c_str(), static_cast<uint8_t>(timeZone_.size()), canonical, &zone))
+          return kStatusError;
+        utcMs = sntpUtcMs_ >= 0 ? sntpUtcMs_
+                                : std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::system_clock::now().time_since_epoch())
+                                      .count();
+        offsetS = tz_offset_at(&zone, utcMs / 1000);
+      } else {
+        return kStatusError;
+      }
+      int64_t local = utcMs + static_cast<int64_t>(offsetS) * 1000;
+      tz_clock_bytes(local >= 0 ? (local + 500) / 1000 : -((-local + 500) / 1000), window.data());
+      return kStatusSuccess;
+    }
+    case kCommandConfigTzGet:
+      window[0] = static_cast<uint8_t>(timeZone_.size());
+      std::copy(timeZone_.begin(), timeZone_.end(), window.begin() + 1);
+      return kStatusSuccess;
+    case kCommandConfigTzSet: {
+      char canonical[TZ_NAME_MAX + 1];
+      tz_zone_t zone;
+      if (window[0] > TZ_NAME_MAX ||
+          !tz_find(reinterpret_cast<const char*>(window.data() + 1), window[0], canonical, &zone))
+        return kStatusError;
+      for (const char* c = canonical; *c; c++)
+        if (*c < 0x20 || *c > 0x7E || *c == '"') return kStatusError;
+      timeZone_ = canonical;
+      return kStatusSuccess;
+    }
+#endif
     case kCommandBleScan:
     case kCommandBleConnect:
     case kCommandBleConnectName:

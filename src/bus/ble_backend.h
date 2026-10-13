@@ -28,6 +28,15 @@ class BleBackend {
 
   // This PC-1500's name on the link (MCONF HOSTNAME), for HELLO.
   virtual void setName(const std::string& name) = 0;
+
+  // Right after BLCON (2026-10-08, RP2350/time_sync.h): the host app's
+  // clock -- UTC in Unix ms and its UTC offset in seconds -- for setting
+  // the PC-1500's. False with no link, a link to another PC-1500 (never
+  // asked), or an app that can't tell.
+  virtual bool hostTime(int64_t* utcMs, int32_t* offsetS) {
+    (void)utcMs, (void)offsetS;
+    return false;
+  }
 };
 
 }  // namespace pc1500

@@ -85,6 +85,7 @@ class LinkCore : public BleBackend {
   uint8_t read(std::vector<uint8_t>& window) override;
   uint8_t close() override;
   void setName(const std::string& name) override;
+  bool hostTime(int64_t* utcMs, int32_t* offsetS) override;
 
   // The UI's controls and views.
   bool setAdvertising(bool on);
@@ -168,6 +169,7 @@ class LinkCore : public BleBackend {
   bool asServer_ = false;
   bool advertising_ = false;
   std::string peerName_;
+  uint8_t peerKind_ = 0;  // its HELLO's: 1 PC-1500, 2 server (the app)
   std::vector<Peer> listed_;
   uint8_t txSeq_ = 0;
   // the two receive slots (BLE_PROTOCOL.md sec.4): the answer to our frame

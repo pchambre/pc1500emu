@@ -4023,7 +4023,7 @@ void testMconfShowsAndSetsSettings() {
   CHECK(run("MCONF BRIDGEINT=0") == 0);
   CHECK(mock.configValue(11) == 0);
 
-  CHECK(run("MCONF") == 0);  // browse: first entry is LED, HOSTNAME last (10th)
+  CHECK(run("MCONF") == 0);  // browse: first entry is LED, the text ones last (HOSTNAME, TZ)
   CHECK(shown(0x8002) == "LED=0");
   CHECK(shown(0x8002 + 3 * 30) == "AUTOSTAGE=1");
   CHECK(shown(0x8002 + 4 * 30) == "BLKBD=1");
@@ -4031,7 +4031,9 @@ void testMconfShowsAndSetsSettings() {
   CHECK(shown(0x8002 + 6 * 30) == "KBDLAYOUT=8");
   CHECK(shown(0x8002 + 7 * 30) == "HISTORY=1");  // 2026-10-07, on by default
   CHECK(shown(0x8002 + 8 * 30) == "BRIDGEINT=0");
-  CHECK(shown(0x8002 + 9 * 30) == "HOSTNAME=KITCHEN");
+  CHECK(shown(0x8002 + 9 * 30) == "TIMESYNC=1");  // 2026-10-08, on by default
+  CHECK(shown(0x8002 + 10 * 30) == "HOSTNAME=KITCHEN");
+  CHECK(shown(0x8002 + 11 * 30) == "TZ=UTC");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -6346,6 +6348,97 @@ void testSshSessionLive() {
   CHECK(waitForIdle(*f->m, 60'000'000));
 }
 
+// The clock (2026-10-08, RP2350/time_sync.h): WFCON sets it from SNTP in
+// MCONF TZ's local time (an IANA name, any case, ' ' for '_'; DST
+// included), BLCON from the host app's own local time -- never from
+// another PC-1500 (the fake peer without a clock). MCONF TIMESYNC=0 leaves
+// it alone; an unknown zone is ERROR 1. TIME is read back with BLPRINT,
+// as mmddhh.mmss; the emulated uPD1990AC runs on the host's clock, so a
+// second or two may pass before it's read.
+void testClockSetOnConnect() {
+  auto f = bleFixture("testClockSetOnConnect");
+  if (!f) return;
+  auto said = [&](const std::string& expr) {
+    f->mock->clearBleText();
+    CHECK(f->run("BLPRINT " + expr) == 0);
+    std::string t = f->mock->bleText();
+    return t.empty() ? t : t.substr(0, t.size() - 1);
+  };
+  // TIME as seconds from the start of the (31-day-month) year, to compare
+  // allowing for the clock having ticked.
+  auto clock = [&] {
+    double t = std::stod(said("TIME"));
+    long whole = static_cast<long>(t), frac = std::lround((t - static_cast<double>(whole)) * 10000);
+    long month = whole / 10000, day = whole / 100 % 100, hour = whole % 100;
+    return (((month * 31 + day) * 24 + hour) * 60 + frac / 100) * 60 + frac % 100;
+  };
+  auto at = [](long month, long day, long hour, long minute, long second) {
+    return (((month * 31 + day) * 24 + hour) * 60 + minute) * 60 + second;
+  };
+  auto near = [](long got, long want) {
+    bool ok = got >= want && got <= want + 3;
+    if (!ok) std::printf("  clock %ld, expected %ld\n", got, want);
+    return ok;
+  };
+
+  f->connect();  // MARVIN: another PC-1500 (no clock), only to read values with BLPRINT
+
+  CHECK(f->run("MCONF TZ") == 0);
+  CHECK(f->shown() == "TZ=UTC");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->run("MCONF TZ=\"NOWHERE/X\"") == 1);
+  CHECK(f->mock->timeZone() == "UTC");
+  CHECK(f->run("MCONF TZ=\"ASIA/TOKYO\"") == 0);
+  CHECK(f->mock->timeZone() == "Asia/Tokyo");
+  CHECK(f->run("MCONF TIMESYNC") == 0);
+  CHECK(f->shown() == "TIMESYNC=1");
+  f->key(pc1500::Key::Ent);
+
+  // 2026-07-04 23:59:30 UTC: 07-05 08:59:30 in Tokyo
+  f->mock->setSntpUtcMs(1783209570000LL);
+  CHECK(f->run("WFCON \"HOST\"") == 0);
+  CHECK(f->shown() == "CONNECTED: 192.168.1.15");
+  f->key(pc1500::Key::Ent);
+  CHECK(near(clock(), at(7, 5, 8, 59, 30)));
+
+  // Los Angeles, summer (PDT, UTC-7) then winter (PST, UTC-8)
+  CHECK(f->run("MCONF TZ=\"AMERICA/LOS ANGELES\"") == 0);
+  CHECK(f->mock->timeZone() == "America/Los_Angeles");
+  CHECK(f->run("WFCON \"HOST\"") == 0);
+  f->key(pc1500::Key::Ent);
+  CHECK(near(clock(), at(7, 4, 16, 59, 30)));
+  f->mock->setSntpUtcMs(1768075200000LL);  // 2026-01-10 20:00:00 UTC
+  CHECK(f->run("WFCON \"HOST\"") == 0);
+  f->key(pc1500::Key::Ent);
+  CHECK(near(clock(), at(1, 10, 12, 0, 0)));
+
+  // A POSIX rule works too, as typed.
+  CHECK(f->run("MCONF TZ=\"EST5\"") == 0);
+  CHECK(f->mock->timeZone() == "EST5");
+  CHECK(f->run("WFCON \"HOST\"") == 0);
+  f->key(pc1500::Key::Ent);
+  CHECK(near(clock(), at(1, 10, 15, 0, 0)));
+
+  // TIMESYNC=0: WFCON leaves the clock alone.
+  CHECK(f->run("MCONF TIMESYNC=0") == 0);
+  f->mock->setSntpUtcMs(1783209570000LL);
+  CHECK(f->run("WFCON \"HOST\"") == 0);
+  CHECK(f->shown() == "CONNECTED: 192.168.1.15");
+  f->key(pc1500::Key::Ent);
+  CHECK(near(clock(), at(1, 10, 15, 0, 0)));
+  CHECK(f->run("MCONF TIMESYNC=1") == 0);
+
+  // BLCON to another PC-1500 isn't asked the time...
+  long kept = clock();
+  f->connect();
+  CHECK(near(clock(), kept));
+  // ...the host app is: its local time, 2026-03-15 12:00:00.6 UTC at
+  // UTC-5, rounded to 07:00:01.
+  f->mock->setBlePeerClock(1773576000600LL, -5 * 3600);
+  f->connect();
+  CHECK(near(clock(), at(3, 15, 7, 0, 1)));
+}
+
 int main(int argc, char** argv) {
   // expansion_keyword_test [part of a test's name]: only the tests whose
   // names contain it (the whole suite takes about 11 minutes).
@@ -6386,6 +6479,7 @@ int main(int argc, char** argv) {
   RUN(testWifiConnectByNameAndForget);
   RUN(testWifiStatAndMlogClear);
   RUN(testWifiPing);
+  RUN(testClockSetOnConnect);
   RUN(testSshArgumentsAndErrors);
   RUN(testSshSessionLive);
   RUN(testBlePutToPeer);

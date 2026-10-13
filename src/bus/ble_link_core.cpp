@@ -42,6 +42,7 @@ constexpr uint8_t kAck = 0x7E, kErr = 0x7F;
 constexpr uint8_t kErrBadFrame = 1, kErrUnsupported = 2, kErrNotFound = 3, kErrExists = 4, kErrIo = 5,
                   kErrBusy = 6, kErrAborted = 7, kErrNotPaired = 8, kErrAuthFailed = 9;
 constexpr uint8_t kVersion = 2, kKindPc1500 = 1, kTargetServer = 0, kKindUnknown = 0xFF;  // 2: sec.7
+constexpr uint8_t kKindServer = 2;
 constexpr size_t kSealOverhead = 20;  // LS_OVERHEAD: a sealed frame's counter and tag
 constexpr size_t kIdLen = 8, kNonceLen = 16, kKeyLen = 32, kProofLen = 16;
 constexpr uint32_t kSizeUnknown = 0xFFFFFFFFu;
@@ -58,6 +59,7 @@ constexpr uint8_t kCmdPlot = 0x57;  // the CE-150 stand-in's drawing (2026-09-30
 constexpr uint8_t kCmdPairBegin = 0x58, kCmdPairConfirm = 0x59, kCmdPairAnswer = 0x5A, kCmdUnpair = 0x5B;  // sec.7
 constexpr uint8_t kStatusPairAsk = 0x20;
 constexpr uint8_t kPlot = 0x40;
+constexpr uint8_t kTime = 0x41;  // the server's clock, in its ACK (2026-10-08)
 // EXP_BLE_STATUS_*
 constexpr uint8_t kStatusLinked = 0x01, kStatusAdvertising = 0x02, kStatusOfferIn = 0x04, kStatusAnswered = 0x08,
                   kStatusAccepted = 0x10;
@@ -718,6 +720,7 @@ uint8_t LinkCore::helloExchange(std::vector<uint8_t>& w, bool authenticate) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     peerName_.assign(p.begin() + 3, p.begin() + 3 + static_cast<long>(nn));
+    peerKind_ = p[1];
   }
   uint8_t proof[kProofLen], ltk[kKeyLen];
   {
@@ -766,6 +769,29 @@ uint8_t LinkCore::helloExchange(std::vector<uint8_t>& w, bool authenticate) {
   std::copy(peerName_.begin(), peerName_.begin() + w[0], w.begin() + 1);
   return kStatusSuccess;
 #endif
+}
+
+bool LinkCore::hostTime(int64_t* utcMs, int32_t* offsetS) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!helloDone_ || asServer_ || peerKind_ != kKindServer) return false;  // never another PC-1500
+  }
+  int r = request(kTime, {});
+  if (r != 0) {
+    log(r == kErrUnsupported ? "The app can't tell the time" : "The app didn't answer TIME");
+    return false;
+  }
+  std::vector<uint8_t> d;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    d = answerData_;
+  }
+  if (d.size() < 10) return false;
+  uint64_t ms = 0;
+  for (int i = 7; i >= 0; i--) ms = ms << 8 | d[static_cast<size_t>(i)];
+  *utcMs = static_cast<int64_t>(ms);
+  *offsetS = static_cast<int16_t>(d[8] | d[9] << 8) * 60;
+  return true;
 }
 
 void LinkCore::disconnectLink() {

@@ -295,7 +295,8 @@ class ExpansionMock {
   // value. The mock keeps them in memory (real firmware: flash).
   static constexpr uint8_t kCommandConfigGet = 0x30;
   static constexpr uint8_t kCommandConfigSet = 0x31;
-  static constexpr int kConfigCount = 12;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY, BRIDGEINT -- mcu_config.h
+  static constexpr int kConfigCount = 13;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY, BRIDGEINT, TIMESYNC -- mcu_config.h
+  static constexpr int kConfigTimeSync = 12;
   static constexpr int kConfigAutostage = 6;
   static constexpr int kConfigBlkbd = 7;
   static constexpr int kConfigHistory = 10;
@@ -365,6 +366,9 @@ class ExpansionMock {
   SshMock& ssh() { return ssh_; }
   // The command history (2026-10-07, MCONF HISTORY): HIST_ADD/HIST_BEGIN, 0x71-0x72 -- history_mock.h
   static constexpr uint8_t kCommandHistAdd = 0x71, kCommandHistBegin = 0x72;
+  // The clock from WFCON/BLCON, MCONF TZ (2026-10-08) -- RP2350/time_sync.h
+  static constexpr uint8_t kCommandTimeGet = 0x73, kCommandConfigTzGet = 0x74, kCommandConfigTzSet = 0x75;
+  static constexpr uint8_t kTimeSourceWifi = 0, kTimeSourceBle = 1;
   HistoryMock& history() { return history_; }
   static constexpr int kWifiSsidMax = 32, kWifiPwMax = 63, kWifiRemembered = 4;
   static constexpr uint8_t kWifiPwNone = 0xFF;
@@ -508,6 +512,18 @@ class ExpansionMock {
   int32_t blePlotY() const { return blePaper_.penY(); }
   uint8_t blePlotPen() const { return blePaper_.pen(); }
   void setBlePeerPlots(bool plots) { blePeerPlots_ = plots; }
+  // Test-only, the clock (2026-10-08): with a clock, the fake peer is the
+  // host app, which BLCON asks for the time (UTC ms, UTC offset in s);
+  // without one (the default) it's another PC-1500, which isn't asked.
+  void setBlePeerClock(int64_t utcMs, int32_t offsetS) {
+    blePeerClock_ = true;
+    blePeerUtcMs_ = utcMs;
+    blePeerOffsetS_ = offsetS;
+  }
+  // What SNTP tells WFCON, in place of the host's own clock.
+  void setSntpUtcMs(int64_t utcMs) { sntpUtcMs_ = utcMs; }
+  // MCONF TZ, as the MCU stores it.
+  const std::string& timeZone() const { return timeZone_; }
 
   // Test-only, Wi-Fi (2026-10-06): the networks a WFSCAN finds, in place of
   // the CYW43's radio. Until a test changes them there's one, "HOST", open:
@@ -796,7 +812,7 @@ class ExpansionMock {
   int romCopyBeginCount_ = 0;
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
-  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1, 1};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on, BRIDGEINT on)
+  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1, 1, 1};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on, BRIDGEINT on, TIMESYNC on)
   std::atomic<bool> kbdLoopInstalled_{false};
   int kbdPairStep_ = -1;  // -1: no pairing; then SEARCHING, CODE, CONNECTED
   size_t kbdLoopOffset_ = 0;
@@ -849,6 +865,11 @@ class ExpansionMock {
   PlotPaper blePaper_;
   int blePlotFrames_ = 0;
   bool blePeerPlots_ = true;
+  bool blePeerClock_ = false;
+  int64_t blePeerUtcMs_ = 0;
+  int32_t blePeerOffsetS_ = 0;
+  int64_t sntpUtcMs_ = -1;          // -1: the host's clock
+  std::string timeZone_ = "UTC";    // MCONF TZ (mcu_config.h's default)
   std::set<std::string> bleUnpaired_;  // upper-cased names
   std::string blePairing_;             // a BLPAIR under way, with this peer
   bool blePairAccept_ = true;

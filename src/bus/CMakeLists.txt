@@ -43,6 +43,9 @@ if(EXISTS "${PC1500_EXPANSION_FIRMWARE_DIR}/keywords.c")
     "${PC1500_EXPANSION_FIRMWARE_DIR}/ssh_keys.c"
     "${PC1500_EXPANSION_FIRMWARE_DIR}/sha256.c"
     "${PC1500_EXPANSION_FIRMWARE_DIR}/cmd_history.c"
+    # the clock's time zones (2026-10-08): MCONF TZ, WFCON's SNTP time
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/time_zone.c"
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/tz_table.c"
     "${PC1500_EXPANSION_FIRMWARE_DIR}/third_party/monocypher/monocypher.c"
     "${PC1500_EXPANSION_FIRMWARE_DIR}/third_party/monocypher/monocypher-ed25519.c")
   target_include_directories(pc1500bus PRIVATE "${PC1500_EXPANSION_FIRMWARE_DIR}")
