@@ -5644,7 +5644,7 @@ void testCommandHistory() {
   enter("C=1");
   CHECK(number(0x7910) == 0x0010);
 
-  // a program's INPUT reply isn't a command; nor is a line typed in PRO mode
+  // a program's INPUT reply isn't a command; nor is a program line typed in PRO mode
   // (last: RUN clears the variables the rest uses)
   mode(0x20);
   std::string err;
@@ -5658,7 +5658,25 @@ void testCommandHistory() {
   tapKey(*m, pc1500::Key::Ent);
   CHECK(idle());
   CHECK(number(0x7918) == 0x0070);  // D = 7
-  CHECK(history()[0] == "RUN" && history()[1] == "C=1");
+  // the typer's NEW0 (typed in PRO mode) is a command, kept since PRO mode
+  // has the history too (2026-10-16); its "10 INPUT D" isn't
+  CHECK(history()[0] == "RUN" && history()[1] == "NEW0" && history()[2] == "C=1");
+
+  // PRO mode too (2026-10-16): a command is kept, a program line -- a digit
+  // first, spaces skipped -- isn't, and DEF+Up browses there as well
+  mode(0x20);
+  enter("E=4");
+  CHECK(history()[0] == "E=4");
+  enter(" 20 E=5");
+  CHECK(history()[0] == "E=4");
+  key(pc1500::Key::Cl);
+  key(pc1500::Key::Def);
+  key(pc1500::Key::Up);
+  CHECK(mock.history().terminal() && shown() == "E=4");
+  key(pc1500::Key::Cl);
+  CHECK(idle());
+  CHECK(!mock.history().terminal());
+  mode(0x40);
 
   // A command run from the history ends as if typed: SDLS's listing gets no
   // blinking block (787CH bit 0, ROM1 LE315H) at its left, as it did when
