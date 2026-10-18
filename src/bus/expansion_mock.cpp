@@ -359,6 +359,7 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandFnBlstat:  // keywords as BASIC functions (2026-09-29): BLSTAT, SDEOF(n)
     case kCommandFnSdeof:
     case kCommandFnWfstat:
+    case kCommandFnBlmsgs:
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
       if (window.size() < 2048) return kStatusError;
       kwWindow_ = &window;
@@ -502,6 +503,7 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandBlePairConfirm:
     case kCommandBlePairAnswer:
     case kCommandBleUnpair:
+    case kCommandBleDisplayClear:
       return bleCommand(cmd, window);
     case kCommandWifiScan:
     case kCommandWifiConnect:
@@ -509,7 +511,11 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandWifiDisconnect:
     case kCommandWifiStatus:
     case kCommandWifiForget:
+    case kCommandWifiConfig:
       return wifiCommand(cmd, window);
+    case kCommandFactoryReset:  // the real firmware restarts after it
+      factoryResets_++;
+      return kStatusSuccess;
     case kCommandLogClear:
       return kStatusSuccess;
     case kCommandLogSetInfoEnabled:
@@ -858,7 +864,8 @@ uint8_t ExpansionMock::wifiCommand(uint8_t cmd, std::vector<uint8_t>& window) {
         for (const auto& net : wifiFound_)
           if (const std::string* known = wifiRemembered(net.ssid)) {
             WifiNetwork copy = net;
-            return wifiJoin(&copy, copy.ssid, *known, window);
+            std::string pw = *known;  // a copy: wifiJoin() re-files the entry `known` points into
+            return wifiJoin(&copy, copy.ssid, pw, window);
           }
         return fail(kWifiErrNoneKnown);
       }
@@ -883,6 +890,31 @@ uint8_t ExpansionMock::wifiCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       std::copy(wifiSsid_.begin(), wifiSsid_.end(), window.begin() + 2);
       window[2 + wifiSsid_.size()] = static_cast<uint8_t>(ip.size());
       std::copy(ip.begin(), ip.end(), window.begin() + 3 + static_cast<long>(wifiSsid_.size()));
+      return kStatusSuccess;
+    }
+    case kCommandWifiConfig: {  // the firmware's lines (wifi_link.c config_listing())
+      if (wifiSsid_.empty()) {
+        window[0] = 0;
+        return kStatusError;
+      }
+      auto line = [](const std::string& label, const std::string& value) {
+        std::string text = label;
+        text.resize(12, ' ');
+        return text + " " + value;
+      };
+      const std::string lines[] = {line("IP ADDRESS", kWifiIp),      line("SUBNET MASK", "255.255.255.0"),
+                                   line("GATEWAY", "192.168.1.1"),  line("DNS SERVER", "192.168.1.1"),
+                                   line("ACCESS POINT", wifiSsid_), line("MAC", "28:CD:C1:00:15:00")};
+      size_t count = 0;
+      for (const std::string& text : lines) {
+        size_t at = 2 + count * kDirRecordSize;
+        std::fill(window.begin() + static_cast<long>(at), window.begin() + static_cast<long>(at + kDirRecordSize), 0);
+        writeText(text, window, at, kDirNameLen + kDirSizeTextLen);
+        count++;
+      }
+      window[0] = 0;
+      window[1] = static_cast<uint8_t>(count);
+      writeText("HOSTNAME " + hostName(), window, 2 + count * kDirRecordSize, kSummaryLineLen);
       return kStatusSuccess;
     }
     case kCommandWifiForget: {
@@ -943,6 +975,7 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
   if (auto ble = bleBackend()) return ble->command(cmd, window);  // a real link
   auto connected = [&](const std::string& name) {
     bleConnected_ = true;
+    bleLastHost_ = name;
     bleLinkedName_ = name;
     bleInbox_.clear();  // a new link empties the inbox (BLE_PROTOCOL.md)
     bleAdvertising_ = false;
@@ -977,6 +1010,8 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       return connected(blePeers_[window[0]]);
     case kCommandBleConnectName: {
       std::string wanted = upper(bleNameFromSlot(window));
+      if (wanted.empty()) wanted = upper(bleLastHost_);  // BLCON with no name
+      if (wanted.empty()) return fail(0);
       for (const std::string& name : blePeers_)
         if (upper(name) == wanted) return blePeerPaired(name) ? connected(name) : fail(8);
       return fail(0);
@@ -1195,6 +1230,10 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       bleInbox_.pop_front();
       return kStatusSuccess;
     }
+    case kCommandBleDisplayClear:  // a DISPLAY CLEAR record to the peer
+      if (!bleConnected_) return fail(0);
+      bleScreenClears_++;
+      return kStatusSuccess;
     case kCommandBleMsgCount:
       bleDeliver();
       window[0] = static_cast<uint8_t>(bleInbox_.size());

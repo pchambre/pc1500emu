@@ -352,6 +352,7 @@ class ExpansionMock {
   static constexpr uint8_t kCommandBlePairConfirm = 0x59;
   static constexpr uint8_t kCommandBlePairAnswer = 0x5A;
   static constexpr uint8_t kCommandBleUnpair = 0x5B;
+  static constexpr uint8_t kCommandBleDisplayClear = 0x5C;  // BLCLS: the peer's screen pane (2026-10-18)
   // Wi-Fi (2026-10-06, RP2350/wifi_link.h) -- EXP_COMMAND_WIFI_*, EXP_WIFI_*.
   static constexpr uint8_t kCommandWifiScan = 0x60;
   static constexpr uint8_t kCommandWifiConnect = 0x61;
@@ -359,6 +360,9 @@ class ExpansionMock {
   static constexpr uint8_t kCommandWifiDisconnect = 0x63;
   static constexpr uint8_t kCommandWifiStatus = 0x64;
   static constexpr uint8_t kCommandWifiForget = 0x65;
+  static constexpr uint8_t kCommandWifiConfig = 0x7A;    // WFCONFIG's listing (2026-10-18)
+  static constexpr uint8_t kCommandFactoryReset = 0x7B;  // ECINIT's erase (2026-10-18)
+  static constexpr uint8_t kCommandFnBlmsgs = 0x7C;  // the BLMSGS function's value (2026-10-18)
   static constexpr uint8_t kCommandFnWfstat = 0x66;  // the WFSTAT function's value
   // SSH (2026-10-07): EXP_COMMAND_SSH_OPEN..FORGET, 0x68-0x6F -- ssh_mock.h
   static constexpr uint8_t kCommandSshFirst = 0x68, kCommandSshTerm = 0x6C, kCommandSshLast = 0x6F;
@@ -512,6 +516,10 @@ class ExpansionMock {
   int32_t blePlotY() const { return blePaper_.penY(); }
   uint8_t blePlotPen() const { return blePaper_.pen(); }
   void setBlePeerPlots(bool plots) { blePeerPlots_ = plots; }
+  // Test-only: how many times BLCLS cleared the peer's screen pane.
+  int bleScreenClears() const { return bleScreenClears_; }
+  // Test-only: how many times ECINIT erased everything.
+  int factoryResets() const { return factoryResets_; }
   // Test-only, the clock (2026-10-08): with a clock, the fake peer is the
   // host app, which BLCON asks for the time (UTC ms, UTC offset in s);
   // without one (the default) it's another PC-1500, which isn't asked.
@@ -865,6 +873,9 @@ class ExpansionMock {
   PlotPaper blePaper_;
   int blePlotFrames_ = 0;
   bool blePeerPlots_ = true;
+  int bleScreenClears_ = 0;
+  std::string bleLastHost_;  // BLCON with no name connects to it (2026-10-18)
+  int factoryResets_ = 0;
   bool blePeerClock_ = false;
   int64_t blePeerUtcMs_ = 0;
   int32_t blePeerOffsetS_ = 0;

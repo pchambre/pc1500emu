@@ -57,9 +57,11 @@ constexpr uint8_t kCmdAdvertise = 0x47, kCmdStatus = 0x48, kCmdOffer = 0x49, kCm
 constexpr uint8_t kCmdMsgSend = 0x51, kCmdMsgWait = 0x52, kCmdMsgRecv = 0x53, kCmdMsgCount = 0x54;
 constexpr uint8_t kCmdPlot = 0x57;  // the CE-150 stand-in's drawing (2026-09-30)
 constexpr uint8_t kCmdPairBegin = 0x58, kCmdPairConfirm = 0x59, kCmdPairAnswer = 0x5A, kCmdUnpair = 0x5B;  // sec.7
+constexpr uint8_t kCmdDisplayClear = 0x5C;  // BLCLS: the peer's screen pane (2026-10-18)
 constexpr uint8_t kStatusPairAsk = 0x20;
 constexpr uint8_t kPlot = 0x40;
 constexpr uint8_t kTime = 0x41;  // the server's clock, in its ACK (2026-10-08)
+constexpr uint8_t kDisplay = 0x50;  // the PC-1500's screen text (2026-10-17)
 // EXP_BLE_STATUS_*
 constexpr uint8_t kStatusLinked = 0x01, kStatusAdvertising = 0x02, kStatusOfferIn = 0x04, kStatusAnswered = 0x08,
                   kStatusAccepted = 0x10;
@@ -610,6 +612,11 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
       return pairConfirm(w);
     case kCmdConnectName: {
       std::string wanted = nameFromSlot(w);
+      if (wanted.empty()) wanted = lastHost_;  // BLCON with no name: the last host (2026-10-18)
+      if (wanted.empty()) {
+        log("No last host to connect to");
+        return fail(0);
+      }
       for (const Peer& p : transport_->scan(3000))
         if (sameName(p.name, wanted)) return connectTo(p, w);
       log("No peer named " + wanted);
@@ -617,6 +624,10 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
     }
     case kCmdText:
       return text(w);
+    case kCmdDisplayClear: {  // a DISPLAY CLEAR record; a peer without a screen pane takes it as done
+      int r = request(kDisplay, std::vector<uint8_t>{4, 0});
+      return r == 0 || r == kErrUnsupported ? kStatusSuccess : fail(r > 0 ? r : 0);
+    }
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
     case kCmdPlot: {  // a PLOT payload (RP2350/plotter.h) as frames, each ACKed
       uint16_t len = static_cast<uint16_t>(std::min<size_t>((static_cast<size_t>(w[0]) << 8) | w[1], 1000));
@@ -680,7 +691,9 @@ uint8_t LinkCore::connectTo(const Peer& peer, std::vector<uint8_t>& w, bool auth
       txSeq_ = 0;
     }
   }
-  return helloExchange(w, authenticate);
+  uint8_t status = helloExchange(w, authenticate);
+  if (status == kStatusSuccess && !peer.name.empty()) lastHost_ = peer.name;  // for BLCON with no name
+  return status;
 }
 
 uint8_t LinkCore::helloExchange(std::vector<uint8_t>& w, bool authenticate) {

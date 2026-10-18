@@ -169,6 +169,7 @@ class LinkCore : public BleBackend {
   bool asServer_ = false;
   bool advertising_ = false;
   std::string peerName_;
+  std::string lastHost_;  // the last peer connected to: BLCON with no name (2026-10-18)
   uint8_t peerKind_ = 0;  // its HELLO's: 1 PC-1500, 2 server (the app)
   std::vector<Peer> listed_;
   uint8_t txSeq_ = 0;

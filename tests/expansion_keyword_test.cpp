@@ -4310,6 +4310,12 @@ void testBleScanConnectAndDisconnect() {
   CHECK(f->run("BLCON \"marvin\"") == 0);
   f->key(pc1500::Key::Ent);
   CHECK(f->mock->bleConnected());
+  // BLCON with no name (2026-10-18): back to the last host.
+  CHECK(f->run("BLDISC") == 0);
+  CHECK(f->run("BLCON") == 0);
+  CHECK(f->shown() == "CONNECTED: MARVIN");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->mock->bleConnected());
   f->mock->blePeers().clear();
   CHECK(f->run("BLSCAN 1") == 0);
   CHECK(f->shown() == "BLE: NO PEERS FOUND");
@@ -4370,6 +4376,21 @@ void testWifiScanConnectAndPassword() {
   CHECK(said("WFSTAT") == "0");
   CHECK(f->run("WFCON") == 0);  // the strongest remembered network
   CHECK(f->shown() == "CONNECTED: 192.168.1.15");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->mock->wifiConnectedSsid() == "HomeNet");
+
+  // WFCONFIG (2026-10-18): the interface's settings, a listing to step
+  // through; not connected, it says so.
+  CHECK(f->run("WFCONFIG") == 0);
+  CHECK(f->shown(0x8002).rfind("IP ADDRESS   ", 0) == 0);  // a listing: [count hi][count lo], then records
+  CHECK(f->shown(0x8002 + 30) == "SUBNET MASK  255.255.255.0");
+  f->key(pc1500::Key::Cl);
+  CHECK(f->run("WFCONFIG 1") == 1);
+  CHECK(f->run("WFDISC") == 0);
+  CHECK(f->run("WFCONFIG") == 0);
+  CHECK(f->shown() == "WIFI: NOT CONNECTED");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->run("WFCON") == 0);
   f->key(pc1500::Key::Ent);
   CHECK(f->mock->wifiConnectedSsid() == "HomeNet");
 
@@ -4472,12 +4493,18 @@ void testBlePrintText() {
   CHECK(f->run("BLPRINT") == 0);
   CHECK(f->mock->bleText() == "ABCD\r\r");
 
-  // BLCLS: a form feed, which clears the app's console; BLPRINT CHR$(12)
-  // is the same thing spelled out.
+  // BLCLC: a form feed, which clears the app's console; BLPRINT CHR$(12)
+  // is the same thing spelled out. BLCLS (2026-10-18) clears its screen
+  // pane instead: a DISPLAY CLEAR record, no text.
   f->mock->clearBleText();
-  CHECK(f->run("BLCLS") == 0);
+  CHECK(f->run("BLCLC") == 0);
   CHECK(f->mock->bleText() == "\f");
   CHECK(f->run("BLPRINT CHR$(12);") == 0);
+  CHECK(f->mock->bleText() == "\f\f");
+  CHECK(f->run("BLCLC 1") == 1);
+  int clears = f->mock->bleScreenClears();
+  CHECK(f->run("BLCLS") == 0);
+  CHECK(f->mock->bleScreenClears() == clears + 1);
   CHECK(f->mock->bleText() == "\f\f");
   CHECK(f->run("BLCLS 1") == 1);
   // CHR$ leaves C1H, not D0H, in the arithmetic register (TRM p.123); the
@@ -4665,7 +4692,8 @@ void testSdsaveBareSavesAsLastLoaded() {
 
 // Peer messaging (2026-09-29, BLE_PROTOCOL.md "Peer messaging"): BLSEND
 // sends one message of value chunks, BLRECV takes the oldest into
-// variables, and the function BLSTAT counts what's waiting. The fake peer
+// variables, and the function BLMSGS counts what's waiting (BLSTAT did,
+// until 2026-10-18; it's the link's state now, as WFSTAT). The fake peer
 // plays the other PC-1500. Values are checked by BLPRINTing them to it.
 void testBleMessaging() {
   auto f = bleFixture("testBleMessaging");
@@ -4677,11 +4705,14 @@ void testBleMessaging() {
     return t.empty() ? t : t.substr(0, t.size() - 1);  // without the CR
   };
   CHECK(f->run("BLSEND 1") == 40);  // no link
-  // BLSTAT is a function, like MEM (2026-09-29).
-  CHECK(f->run("S=BLSTAT") == 0);
+  // BLMSGS and BLSTAT are functions, like MEM (2026-09-29).
+  CHECK(f->run("S=BLMSGS") == 0);
+  CHECK(f->run("L=BLSTAT") == 0);
   f->connect();
   CHECK(said("S") == "-1");  // no link then, nothing waiting
-  CHECK(said("BLSTAT") == "0");  // evaluated inside another keyword
+  CHECK(said("L") == "0");   // no link then
+  CHECK(said("BLMSGS") == "0");  // evaluated inside another keyword
+  CHECK(said("BLSTAT") == "2");  // linked
 
   // BLSEND: any expressions, as one message of chunks.
   CHECK(f->run("A=5") == 0);
@@ -4696,17 +4727,17 @@ void testBleMessaging() {
 
   // BLRECV: back into variables, in order.
   f->mock->bleMessageToUs(msg);
-  CHECK(f->run("S=BLSTAT*10+1") == 0);
+  CHECK(f->run("S=BLMSGS*10+1") == 0);
   CHECK(said("S") == "11");
   // In a running program too (IF ... THEN LET: LET is needed after THEN).
-  CHECK(f->typeProgram("10 T=0:IF BLSTAT>0 THEN LET T=BLSTAT+4\n20 END\n"));
+  CHECK(f->typeProgram("10 T=0:IF BLMSGS>0 THEN LET T=BLMSGS+4\n20 END\n"));
   f->key(pc1500::Key::Mode);  // PRO -> RUN mode; RUN in PRO mode is ERROR 26
   CHECK(f->run("RUN") == 0);
   CHECK(said("T") == "5");
   // Alone at the prompt it's shown, as MEM is. The number goes straight
   // to the LCD, which 7BB0H doesn't hold (MEM leaves only its token there
   // too), so only "no error" is checked here.
-  CHECK(f->run("BLSTAT") == 0);
+  CHECK(f->run("BLMSGS") == 0);
   CHECK(f->run("BLRECV X,Y$,Z") == 0);
   CHECK(said("X;Y$;Z") == "10HI!3");
   // Fewer values than variables: the rest become 0 / blank.
@@ -4876,6 +4907,14 @@ void testBlePairing() {
   CHECK(f->run("BLUNPAIR") == 0);
   f->key(pc1500::Key::Y);
   CHECK(!f->mock->blePeerPaired("MARVIN"));
+
+  // ECINIT (2026-10-18): asks first; anything but Y leaves everything be.
+  // (Y erases and restarts both machines -- REBOOT -- not run here.)
+  CHECK(f->run("ECINIT 1") == 1);
+  CHECK(f->run("ECINIT") == 0);
+  CHECK(f->shown() == "ERASE ALL SETTINGS? Y/N");
+  f->key(pc1500::Key::N);
+  CHECK(f->mock->factoryResets() == 0);
 
   // BLADV: a connector asks to pair; Y pairs and links it.
   CHECK(f->run("BLDISC") == 0);
