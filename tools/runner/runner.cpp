@@ -26,6 +26,8 @@
 //   s             print the screen
 //   u:TEXT:MS     run until the screen contains TEXT, at most MS; fails on
 //                 timeout
+//   a:TEXT:MS:KEY tap KEY (a name as for k:, or a character) every 500 ms
+//                 until the screen contains TEXT, at most MS; fails on timeout
 //   e:TEXT        fail unless the screen contains TEXT now
 //                 (in u:/e: TEXT, '_' stands for a space)
 //   r:ADDR:N      print N bytes from ADDR
@@ -358,6 +360,21 @@ int main(int argc, char** argv) {
       }
       if (t >= maxMs && screen(m).find(text) == std::string::npos) fail(tok, "timed out");
       else if (!quiet) std::printf("%8.2fs |%s|\n", m.seconds(), screen(m).c_str());
+    } else if (tok.rfind("a:", 0) == 0) {
+      // a:TEXT:MS:KEY -- tap KEY every half second until TEXT shows (or MS)
+      size_t c2 = arg.rfind(':');
+      size_t c1 = arg.rfind(':', c2 - 1);
+      std::string text = spaces(arg.substr(0, c1));
+      long maxMs = std::stol(arg.substr(c1 + 1, c2 - c1 - 1)), t = 0;
+      std::string key = arg.substr(c2 + 1);
+      auto it = names.find(key);
+      while (t < maxMs && screen(m).find(text) == std::string::npos) {
+        if (it != names.end()) m.tap(it->second);
+        else m.type(key);
+        m.ms(500);
+        t += 500;
+      }
+      if (screen(m).find(text) == std::string::npos) fail(tok, "timed out");
     } else if (tok.rfind("e:", 0) == 0) {
       if (screen(m).find(spaces(arg)) == std::string::npos) fail(tok, "not on screen");
     } else if (tok.rfind("r:", 0) == 0 || tok.rfind("p:", 0) == 0 || tok.rfind("x:", 0) == 0) {
