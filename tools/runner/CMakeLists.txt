@@ -1,0 +1,2 @@
+add_executable(pc1500runner runner.cpp)
+target_link_libraries(pc1500runner PRIVATE pc1500basic pc1500bus pc1500lcd pc1500keyboard lh5801cpu)

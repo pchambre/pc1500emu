@@ -9,6 +9,9 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 add_subdirectory(src)
+# pc1500runner: runs a machine-code program headlessly with a key script
+# (used by sdcc-pc1500's LH5801 regression tests)
+add_subdirectory(tools/runner)
 
 enable_testing()
 add_subdirectory(tests)
