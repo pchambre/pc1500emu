@@ -31,6 +31,7 @@ struct ExpansionMock::ZtermState {
   std::vector<uint8_t> text;
   uint16_t seed = 0x1234;
   std::filesystem::path storyPath;
+  uint16_t* config = nullptr;  // the mock's MCONF settings: the console's are there
 };
 
 
@@ -2049,9 +2050,17 @@ uint8_t ExpansionMock::ztermCommand(std::vector<uint8_t>& window) {
         return pos < t.size() ? t[pos] : 0;
       },
       [](void* c) -> uint16_t { return static_cast<ZtermState*>(c)->seed; },
+      [](void* c, uint8_t id) -> uint16_t {  // as zterm_session.c: MCONF ZWRAP
+        auto* z = static_cast<ZtermState*>(c);
+        return id == ZT_SETTING_WRAP ? z->config[kConfigZwrap] : 0;
+      },
+      [](void* c, uint8_t id, uint16_t value) {
+        if (id == ZT_SETTING_WRAP) static_cast<ZtermState*>(c)->config[kConfigZwrap] = value;
+      },
   };
   zt_store_t store = kStore;
   store.ctx = &z;
+  z.config = config_;
   if (window[0] == kZtermOpen) {  // the story's path, for a POWMAN wake
     uint8_t channel = window[1];
     z.storyPath.clear();
@@ -2095,6 +2104,7 @@ void ExpansionMock::simulatePowmanWake() {
 void ExpansionMock::reopenAfterPowmanPrepare() {
   for (SdChannel& ch : channels_) {
     if (!ch.isOpen) continue;
+    reopenPending_ = true;
     ch.file.close();
     ch.file.open(ch.path, ch.writable ? std::ios::binary | std::ios::in | std::ios::out
                                       : std::ios::binary | std::ios::in);
@@ -2237,6 +2247,11 @@ void ExpansionMock::pumpCommands() {
   if (pendingCmd_ < 0 || stampDueCycles_ != 0 || emulatedCycles_ < answerFromCycles_ ||
       emulatedCycles_ < nextStartCycles_)
     return;
+  if (reopenPending_) {  // the files first (setPowmanReopen())
+    reopenPending_ = false;
+    nextStartCycles_ = emulatedCycles_ + powmanReopenCycles_;
+    if (powmanReopenCycles_ != 0) return;
+  }
   uint8_t cmd = static_cast<uint8_t>(pendingCmd_);
   pendingCmd_ = -1;
   startCommand(cmd);
@@ -2260,6 +2275,7 @@ void ExpansionMock::simulateColdBoot(bool keepStaged) {
   workerActive_ = false;
   pendingCmd_ = -1;
   stampDueCycles_ = 0;
+  reopenPending_ = false;
   kbdLoopInstalled_.store(false, std::memory_order_release);
   romImage_ = romImageBuilt_;
   for (int i = 0; i < kMaxSdChannels; i++)
@@ -2304,6 +2320,13 @@ void ExpansionMock::windowWriteUnserved(std::vector<uint8_t>& window, size_t ins
                 static_cast<int>(sleepState_));
   if (sleepState_ == SleepState::PowmanPreparing) {  // latched: CancelPowman() once prepared
     powmanLatched_ = true;
+    return;
+  }
+  if (sleepState_ == SleepState::Dormant && dormantWakeAsAlarm_ && config_[kConfigPowmanDelay] != 0xFFFF &&
+      config_[kConfigPowmanDelay] != 0) {  // the old bug: taken for the alarm
+    sleepState_ = SleepState::PowmanPreparing;
+    sleepEventCycles_ = emulatedCycles_ + powmanPrepareCycles_;
+    powmanLatched_ = false;
     return;
   }
   if (sleepState_ != SleepState::Dormant && sleepState_ != SleepState::Powman) return;  // booting

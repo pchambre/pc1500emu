@@ -273,6 +273,16 @@ class ExpansionMock {
   void setStampDelay(uint64_t cycles) { stampDelayCycles_ = cycles; }
   void setPowmanPrepare(uint64_t cycles) { powmanPrepareCycles_ = cycles; }
   int powmanCancels() const { return powmanCancels_; }
+  // The first command after a POWMAN wake (or a called-off one) reopens the
+  // SDOPEN channels and ZIP's console first (monitor.c "PM reopen"): this
+  // long when there was anything to reopen. The dongle, its SD card behind
+  // the I2C bridge: ~260 ms with Zork's story (2026-11-01); the card's SPI
+  // SD is much quicker.
+  void setPowmanReopen(uint64_t cycles) { powmanReopenCycles_ = cycles; }
+  // The bug until 2026-11-01 (monitor.c SleepUntilBusTriggerOrAlarm()): with
+  // POWMANDELAY n >= 1, a write that ends DORMANT was taken for the n-second
+  // alarm -- the write lost, and on to POWMAN.
+  void setDormantWakeAsAlarm(bool on) { dormantWakeAsAlarm_ = on; }
   void setSleepEntryDeaf(uint64_t cycles) { sleepEntryDeafCycles_ = cycles; }
   int deafWrites() const { return deafWrites_; }
   int sleepCount() const { return sleepCount_; }
@@ -293,6 +303,7 @@ class ExpansionMock {
   // PreparePowman(): ZIP's record, the channels saved to flash, the files
   // closed, a log line -- an estimate (not measured): ~10 ms.
   static constexpr uint64_t kPowmanPrepareCycles = 13000;
+  static constexpr uint64_t kPowmanReopenCycles = 338000;  // 260 ms: the dongle's "PM reopen" (see setPowmanReopen())
   static constexpr uint64_t kStrayWakeCycles = 130000;  // 100 ms: STRAY_WAKE_TIMEOUT_US
   static constexpr uint64_t kHistorySleepWaitCycles = 130000;  // 100 ms: HISTORY_SLEEP_WAIT_MS
   static constexpr uint64_t kSleepEntryDeafCycles = 65000;     // 50 ms: see setSleepEntryDeaf()
@@ -408,8 +419,9 @@ class ExpansionMock {
   // value. The mock keeps them in memory (real firmware: flash).
   static constexpr uint8_t kCommandConfigGet = 0x30;
   static constexpr uint8_t kCommandConfigSet = 0x31;
-  static constexpr int kConfigCount = 13;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY, BRIDGEINT, TIMESYNC -- mcu_config.h
+  static constexpr int kConfigCount = 15;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY, BRIDGEINT, TIMESYNC, BLDISP, ZWRAP -- mcu_config.h
   static constexpr int kConfigTimeSync = 12;
+  static constexpr int kConfigZwrap = 14;  // ZIP/1500's word wrap (zterm.h ZT_SETTING_WRAP)
   static constexpr int kConfigAutostage = 6;
   static constexpr int kConfigSleepWait = 1;
   static constexpr int kConfigPowmanDelay = 8;
@@ -975,6 +987,9 @@ class ExpansionMock {
   uint8_t asleepValue_ = 0xFD;
   std::function<uint8_t(size_t)> asleepPattern_;
   uint64_t powmanPrepareCycles_ = kPowmanPrepareCycles;
+  uint64_t powmanReopenCycles_ = kPowmanReopenCycles;
+  bool reopenPending_ = false;  // the next command reopens first
+  bool dormantWakeAsAlarm_ = false;
   bool powmanLatched_ = false;
   int powmanCancels_ = 0;
   SleepState sleepState_ = SleepState::Awake;
@@ -993,7 +1008,7 @@ class ExpansionMock {
   int sleepCount_ = 0, powmanCount_ = 0, wakeCount_ = 0;
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
-  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1, 1, 1};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on, BRIDGEINT on, TIMESYNC on)
+  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1, 1, 1, 0, 1};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on, BRIDGEINT on, TIMESYNC on, BLDISP off, ZWRAP on)
   std::atomic<bool> kbdLoopInstalled_{false};
   std::vector<uint8_t> windowSeed_;  // setWindowSeed()
   std::vector<uint8_t> romImageBuilt_;  // romImage_ before KBD_INSTALL: the firmware's flash copy

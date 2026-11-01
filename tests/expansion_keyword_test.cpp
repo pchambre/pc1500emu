@@ -4074,8 +4074,9 @@ void testMconfShowsAndSetsSettings() {
   CHECK(shown(0x8002 + 7 * 30) == "HISTORY=1");  // 2026-10-07, on by default
   CHECK(shown(0x8002 + 8 * 30) == "BRIDGEINT=0");
   CHECK(shown(0x8002 + 9 * 30) == "TIMESYNC=1");  // 2026-10-08, on by default
-  CHECK(shown(0x8002 + 10 * 30) == "HOSTNAME=KITCHEN");
-  CHECK(shown(0x8002 + 11 * 30) == "TZ=UTC");
+  CHECK(shown(0x8002 + 10 * 30) == "ZWRAP=1");  // 2026-11-01, ZIP's word wrap, on by default
+  CHECK(shown(0x8002 + 11 * 30) == "HOSTNAME=KITCHEN");
+  CHECK(shown(0x8002 + 12 * 30) == "TZ=UTC");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -5331,6 +5332,226 @@ void testZipZork1() { zipPlay("testZipZork1", "zork1", "zork1.z3", 20, true); }
 void testZipZiptestDormant() { zipPlay("testZipZiptestDormant", "ziptest", "ziptest.z3", 0, false, 0xFFFF); }
 void testZipZiptestPowman() { zipPlay("testZipZiptestPowman", "ziptest", "ziptest.z3", 0, false, 0); }
 void testZipZork1Powman() { zipPlay("testZipZork1Powman", "zork1", "zork1.z3", 0, true, 0); }
+
+// Typing in ZIP (2026-11-01: slow on the dongle, SLEEPWAIT 1000 and
+// POWMANDELAY 10). One key at a time, at a typist's pace, as on the
+// hardware: the time from the key going down to each step of KEYLOOP --
+// KEYSCAN_WAIT handing it over, the wake, KEY sent, the LCD line drawn,
+// DONE -- in ms of LH5801 time. Measures; checks only that the keys land.
+static uint16_t zipLabel(const std::string& text) {  // its address, from zip.rst
+  std::ifstream in(fs::path(kZipDir) / "zip.rst");
+  std::string line;
+  while (std::getline(in, line)) {
+    size_t at = line.find(text);
+    if (at == std::string::npos || line.size() < 7) continue;
+    unsigned a = 0;
+    if (std::sscanf(line.c_str(), " %4x", &a) == 1) return static_cast<uint16_t>(a);
+  }
+  return 0;
+}
+
+// ZIP/1500's console, milestone 2 (2026-11-01, zterm.c): F1 shows the
+// status lines -- the location, then the score and moves -- and back; any
+// other key there only goes back. F2 is the settings menu: word wrap, kept
+// as MCONF ZWRAP. With wrap off a line is up to 80 characters and < and >
+// move along it while reading; turning it back on rewraps the scrollback.
+void testZipConsoleKeys() {
+  auto g = zipStart("testZipConsoleKeys", "zork1.z3");
+  if (!g) return;
+  pc1500::ExpansionMock& mock = *g->f->mock;
+  auto lcd = [&]() {  // the line ZIP drew: the KEY answer at 8001H
+    std::string t;
+    for (uint16_t a = 0x8001; a < 0x8001 + 26; a++) t += static_cast<char>(g->f->m->bus.readME0(a));
+    return t;
+  };
+  auto press = [&](pc1500::Key k) {
+    g->tap(k);
+    CHECK(g->settle());
+    return lcd();
+  };
+  auto starts = [](const std::string& t, const std::string& with) { return t.compare(0, with.size(), with) == 0; };
+  g->keyAction(pc1500::Key::Ent, false, pc1500::basic::kIdleFrames);
+
+  // F1: the location, the score and moves, the text again.
+  std::string text = lcd();
+  CHECK(starts(press(pc1500::Key::F1), "West of House"));
+  CHECK(starts(lcd(), "West of House"));
+  CHECK(starts(press(pc1500::Key::F1), "Score: 0  Moves: 0"));
+  CHECK(press(pc1500::Key::F1) == text);
+  // Another key on a status line only goes back to the text.
+  press(pc1500::Key::F1);
+  CHECK(press(pc1500::Key::X) == text);
+
+  // F2: the menu; ENTER turns word wrap off (MCONF ZWRAP 0); F2 leaves.
+  CHECK(starts(press(pc1500::Key::F2), "Word wrap: on"));
+  CHECK(starts(press(pc1500::Key::Ent), "Word wrap: off"));
+  CHECK(mock.configValue(pc1500::ExpansionMock::kConfigZwrap) == 0);
+  press(pc1500::Key::F2);
+
+  // Wrap off: the opening's long line is one line (to 80); > and < move along it.
+  const std::string longLine =
+      "You are standing in an open field west of a white house, with a boarded front door.";
+  std::string shown = lcd();
+  for (int i = 0; i < 20 && !starts(shown, "You are standing"); i++) shown = press(pc1500::Key::Down);
+  CHECK(starts(shown, "You are standing in an ope"));
+  CHECK(press(pc1500::Key::Right) == longLine.substr(13, 26));
+  CHECK(press(pc1500::Key::Right) == longLine.substr(26, 26));
+  CHECK(press(pc1500::Key::Left) == longLine.substr(13, 26));
+  CHECK(press(pc1500::Key::Left) == longLine.substr(0, 26));
+  std::printf("  wrap off: \"%s\"\n", lcd().c_str());
+
+  // Wrap on again: the same line, now 26 wide.
+  press(pc1500::Key::F2);
+  CHECK(starts(press(pc1500::Key::Right), "Word wrap: on"));
+  CHECK(mock.configValue(pc1500::ExpansionMock::kConfigZwrap) == 1);
+  CHECK(starts(press(pc1500::Key::Cl), "You are standing in an  "));
+
+  // And the game goes on.
+  CHECK(g->command("OPEN MAILBOX"));
+  CHECK(g->transcript().find("Opening the small mailbox reveals a leaflet.") != std::string::npos);
+}
+
+// MCONF ZWRAP, the console's word wrap from BASIC (BASIC tokenizes its own
+// keywords inside an argument, so a new name is worth a run).
+void testMconfZwrap() {
+  auto f = bleFixture("testMconfZwrap");
+  if (!f) return;
+  CHECK(f->run("MCONF ZWRAP=0") == 0);
+  CHECK(f->mock->configValue(pc1500::ExpansionMock::kConfigZwrap) == 0);
+  CHECK(f->run("MCONF ZWRAP=1") == 0);
+  CHECK(f->mock->configValue(pc1500::ExpansionMock::kConfigZwrap) == 1);
+  CHECK(f->run("MCONF ZWRAP=2") == 1);
+}
+
+// The codes KEYSCAN_WAIT hands ZIP for the keys the console may use
+// (KEYLOOP keeps the last in KEYC, V+96 = 6860H). Prints them.
+void testZipKeyCodes() {
+  auto g = zipStart("testZipKeyCodes", "zork1.z3");
+  if (!g) return;
+  g->keyAction(pc1500::Key::Ent, false, pc1500::basic::kIdleFrames);
+  struct { pc1500::Key k; const char* name; } keys[] = {
+      {pc1500::Key::F1, "F1"},   {pc1500::Key::F2, "F2"},     {pc1500::Key::F3, "F3"},
+      {pc1500::Key::F4, "F4"},   {pc1500::Key::F5, "F5"},     {pc1500::Key::F6, "F6"},
+      {pc1500::Key::Left, "<"},  {pc1500::Key::Right, ">"},   {pc1500::Key::Up, "UP"},
+      {pc1500::Key::Down, "DN"}, {pc1500::Key::Rcl, "RCL"},   {pc1500::Key::Sml, "SML"},
+      {pc1500::Key::Cl, "CL"},   {pc1500::Key::Mode, "MODE"},
+  };
+  for (const auto& k : keys) {
+    g->f->m->bus.writeME0(0x6860, 0xEE);
+    g->tap(k.k);
+    CHECK(g->settle());
+    std::printf("  %-4s -> %02X\n", k.name, g->f->m->bus.readME0(0x6860));
+  }
+}
+
+void testZipTypingSpeed() {
+  auto g = zipStart("testZipTypingSpeed", "zork1.z3", 10);
+  if (!g) return;
+  g->f->mock->setConfigValue(pc1500::ExpansionMock::kConfigSleepWait, 1000);
+  // KEYLOOP's steps: the line after "sjp KEYWAIT" (3$), ZTSTART, ZTSEND,
+  // DISP26 (the ROM's), SDONE.
+  std::ifstream in(fs::path(kZipDir) / "zip.rst");
+  std::string line;
+  uint16_t keyBack = 0;
+  bool inLoop = false, next = false;
+  while (std::getline(in, line) && !keyBack) {
+    if (line.find("KEYLOOP: sta") != std::string::npos) inLoop = true;
+    if (!inLoop) continue;
+    unsigned a = 0;
+    if (next && std::sscanf(line.c_str(), " %4x", &a) == 1) keyBack = static_cast<uint16_t>(a);
+    if (line.find("sjp KEYWAIT") != std::string::npos) next = true;
+  }
+  const uint16_t zstart = zipLabel("ZTSTART: psh"), zsend = zipLabel("ZTSEND: ldi");
+  const uint16_t sdone = zipLabel("SDONE:  ldi"), disp = 0xED3B;
+  CHECK(keyBack && zstart && zsend && sdone);
+  std::printf("  KEYLOOP's key %04X, ZTSTART %04X, ZTSEND %04X, SDONE %04X\n", keyBack, zstart, zsend, sdone);
+  const double ms = 1300.0;  // cycles per ms
+  // KEYSCAN_WAIT holds the last key (the ENTER that started the game) until
+  // it has scanned no key a few times (ZipGame::command()).
+  g->keyAction(pc1500::Key::Ent, false, pc1500::basic::kIdleFrames);
+  // Typing, then a pause before the last few keys: 1.5 s (past SLEEPWAIT
+  // 1000: DORMANT), then 12 s (past POWMANDELAY 10: POWMAN).
+  const std::string text = "OPEN MAILBOX";
+  for (size_t i = 0; i < text.size(); i++) {
+    char c = text[i];
+    long pauseMs = i == 5 ? 1500 : i == 8 ? 12000 : 0;
+    for (long k = 0; k < pauseMs * 1300; k++) g->step();
+    if (pauseMs) std::printf("  (%ld ms without a key)\n", pauseMs);
+    std::deque<pc1500::basic::QueuedKeyAction> actions;
+    if (!pc1500::basic::charToTapActions(c, &actions)) continue;
+    long long t0 = g->cycles, tKey = -1, tWake = -1, tSend = -1, tDisp = -1, tDone = -1;
+    bool sawDisp = false;
+    for (const auto& a : actions) {
+      g->f->m->bus.setKeyState(a.key, a.pressed);
+      for (long i = 0; i < static_cast<long>(a.framesToWait) * kCyclesPerFrame; i++) {
+        uint16_t pc = g->f->m->cpu.p();
+        if (tKey < 0 && pc == keyBack) tKey = g->cycles;
+        if (tKey >= 0 && tWake < 0 && pc == zstart) tWake = g->cycles;
+        if (tWake >= 0 && tSend < 0 && pc == zsend) tSend = g->cycles;
+        if (tSend >= 0 && !sawDisp && pc == disp) { tDisp = g->cycles; sawDisp = true; }
+        if (sawDisp && tDone < 0 && pc == sdone) tDone = g->cycles;
+        g->step();
+      }
+    }
+    CHECK(g->settle());
+    auto at = [&](long long t) { return t < 0 ? -1.0 : (t - t0) / ms; };
+    std::printf("  '%c': key read %6.1f, wake %6.1f, KEY sent %6.1f, LCD %6.1f, DONE %6.1f ms; asleep %d\n", c,
+                at(tKey), at(tWake), at(tSend), at(tDisp), at(tDone), g->f->mock->asleepNow());
+  }
+  CHECK(g->f->mock->sleepCount() > 0 && g->f->mock->powmanCount() > 0);  // both pauses slept
+
+  // SLEEPWAIT 0 with POWMANDELAY 10 (the dongle, 2026-11-01): a DORMANT
+  // sleep after every key, which the next key's write ends at once. With the
+  // old bug -- that write taken for the 10 s alarm -- every key was a POWMAN
+  // sleep and wake instead, the story reopened over the SD bridge: ~0.3 s.
+  g->f->mock->setConfigValue(pc1500::ExpansionMock::kConfigSleepWait, 0);
+  auto doneMs = [&](char c) {  // the key down to KEYLOOP's DONE
+    std::deque<pc1500::basic::QueuedKeyAction> actions;
+    if (!pc1500::basic::charToTapActions(c, &actions)) return -1.0;
+    long long t0 = g->cycles, tDone = -1;
+    bool sawDisp = false;
+    for (const auto& a : actions) {
+      g->f->m->bus.setKeyState(a.key, a.pressed);
+      for (long i = 0; i < static_cast<long>(a.framesToWait) * kCyclesPerFrame; i++) {
+        uint16_t pc = g->f->m->cpu.p();
+        if (pc == disp) sawDisp = true;
+        if (sawDisp && tDone < 0 && pc == sdone) tDone = g->cycles;
+        g->step();
+      }
+    }
+    for (long i = 0; i < 2'000'000 && tDone < 0; i++) {  // a slow key: on until its DONE
+      uint16_t pc = g->f->m->cpu.p();
+      if (pc == disp) sawDisp = true;
+      if (sawDisp && pc == sdone) tDone = g->cycles;
+      g->step();
+    }
+    CHECK(g->settle());
+    return tDone < 0 ? -1.0 : (tDone - t0) / ms;
+  };
+  for (int bug = 0; bug < 2; bug++) {
+    g->f->mock->setDormantWakeAsAlarm(bug != 0);
+    int powman0 = g->f->mock->powmanCount();
+    double worst = 0;
+    for (char c : std::string("NORTH")) {
+      int deaf0 = g->f->mock->deafWrites();
+      double t = doneMs(c);
+      std::printf("    '%c' %.1f ms, %d writes lost going to sleep\n", c, t, g->f->mock->deafWrites() - deaf0);
+      CHECK(t > 0);
+      if (t > worst) worst = t;
+    }
+    int powmans = g->f->mock->powmanCount() - powman0;
+    std::printf("  SLEEPWAIT 0, POWMANDELAY 10%s: slowest key %.1f ms, %d POWMAN sleeps\n",
+                bug ? ", the old alarm bug" : "", worst, powmans);
+    if (bug) {
+      CHECK(powmans >= 4);
+      CHECK(worst > 250);
+    } else {
+      CHECK(powmans == 0);
+      CHECK(worst < 150);  // a key may lose a write or two in DORMANT's deaf entry: ~41 ms each
+    }
+  }
+  g->f->mock->setDormantWakeAsAlarm(false);
+}
 
 // BREAK at a key wait leaves the game at once, as QUIT does.
 void testZipBreak() {
@@ -7459,6 +7680,10 @@ int main(int argc, char** argv) {
   RUN(testZipZiptestDormant);
   RUN(testZipZiptestPowman);
   RUN(testZipZork1Powman);
+  RUN(testZipConsoleKeys);
+  RUN(testMconfZwrap);
+  RUN(testZipTypingSpeed);
+  RUN(testZipKeyCodes);
   RUN(testBlePrintText);
   RUN(testBleListMatchesDetokenizer);
   RUN(testBleListBreak);
