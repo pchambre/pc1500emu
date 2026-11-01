@@ -122,8 +122,8 @@ void testRoundTrip() {
   CHECK(bus2.readME0(0x8800) == 0x7E);
   CHECK(bus2.readME0(0x88FE) == 0xFF);  // untouched byte still at its power-up default
   // 0x88FF is the instruction/status byte: it reads the mock's live status
-  // (idle = READY), not the stored byte.
-  CHECK(bus2.readME0(0x88FF) == pc1500::ExpansionMock::kStatusReady);
+  // (idle = AWAKE, as the firmware's boot leaves it), not the stored byte.
+  CHECK(bus2.readME0(0x88FF) == pc1500::ExpansionMock::kStatusAwake);
 
   CHECK(cpu2.p() == 0x1234);
   CHECK(cpu2.s() == 0x7A00);

@@ -437,6 +437,8 @@ uint8_t Bus::readME0(uint16_t addr) {
         // what lets a still-in-progress command genuinely read back as
         // BUSY rather than whatever the worker thread's writes have
         // gotten to so far.
+        // Asleep (ExpansionMock::setSleepEmulation()), nothing serves it.
+        if (m.hasDataWindow && !expansionMock_.windowServed()) return expansionMock_.asleepValue(addr - m.dataWindowBase);
         if (m.hasDataWindow && addr == m.instructionAddr) return expansionMock_.pollStatusPaced();
         // The external keyboard's two bytes (2026-10-04) come from the
         // mock's key sequencer, which runs on the emulated clock.
@@ -513,6 +515,12 @@ void Bus::writeME0(uint16_t addr, uint8_t value) {
           expansionMock_.setSramByte(addr - m.base, value);
           return;
         }
+      }
+      // Asleep: the write is lost, and it's the wake.
+      if (m.hasDataWindow && !expansionMock_.windowServed() && pv_ == m.requirePv &&
+          addr >= m.dataWindowBase && addr < m.dataWindowBase + m.dataWindow.size()) {
+        expansionMock_.windowWriteUnserved(m.dataWindow, m.instructionAddr - m.dataWindowBase);
+        return;
       }
       if (!m.tryWrite(addr, pv_, value)) continue;
       if (m.hasDataWindow && addr == m.instructionAddr) {

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <map>
 #include <set>
@@ -149,6 +150,8 @@ class ExpansionMock {
   // the firmware runs it on core1 between commands.
   void advanceCycles(int cycles) {
     emulatedCycles_ += static_cast<uint64_t>(cycles);
+    pumpCommands();
+    if (sleepOn_ || sleepState_ != SleepState::Awake) stepSleep();
     if (sshWindow_ && (ssh_.terminal() || history_.terminal()) &&
         emulatedCycles_ - sshPolledCycles_ >= kSshPollCycles) {
       sshPolledCycles_ = emulatedCycles_;
@@ -191,17 +194,115 @@ class ExpansionMock {
   // hardware polls the status byte -- but a test calling processCommand()
   // directly (bypassing Bus/the CPU entirely) needs an explicit way to
   // wait for the async result before checking pollStatus().
-  void waitUntilIdleForTest() {
-    if (worker_.joinable()) worker_.join();
-  }
+  void waitUntilIdleForTest();
 
+  ExpansionMock();  // (out of line: zterm_'s type is the .cpp's)
   ~ExpansionMock();
+
+  // ZIP/1500's console (EXP_COMMAND_ZTERM): the transcript the game has
+  // printed so far (CR line ends), the seed OPEN hands the game's RANDOM,
+  // and a POWMAN sleep and wake as the firmware does it: every SD channel
+  // closed and the console's RAM state gone, then the open game's session
+  // record (the story's channel, the console state) restored and the story
+  // reopened on its channel.
+  std::string ztermTranscript() const;
+  void setZtermSeed(uint16_t seed);
+  void simulatePowmanWake();
+  struct ZtermState;
+
+  // STAGE RAM sleep (2026-10-30): the firmware's DORMANT and POWMAN sleep
+  // between commands (RP2350/monitor.c, "STAGE RAM sleep" and "POWMAN
+  // power-down"), on the emulated clock, so the ROM's and ZIP's wake and
+  // wait logic can be tested. Off unless a test turns it on. As there:
+  // - It sleeps only with the ROM staged (romStagedVerified()), once DONE
+  //   is SLEEPWAIT ms old (MCONF SLEEPWAIT, -1 never) with no command in
+  //   flight; a wake with no command within 100 ms sleeps again. A DONE
+  //   after HIST_ADD/HIST_BEGIN waits at least kHistorySleepWaitCycles
+  //   (monitor.c HISTORY_SLEEP_WAIT_MS).
+  // - Going to DORMANT is deaf for a while: a write within
+  //   setSleepEntryDeaf() cycles of the sleep's start is lost and wakes
+  //   nothing, so it sleeps on (the dongle, 2026-10-30/31: writes 13-47 ms
+  //   into a DORMANT entry, and one just after the history floor, never
+  //   woke it).
+  // - Going to POWMAN, core1 first saves and closes the channels and ZIP's
+  //   console (PreparePowman(), setPowmanPrepare() cycles) with the bus
+  //   stopped: a write then is lost but latched, and calls the sleep off
+  //   (CancelPowman()) -- awake again, AWAKE, the channels and the console
+  //   reopened as after a wake (powmanCancels() counts them).
+  // - MCONF POWMANDELAY picks the sleep: -1 DORMANT, 0 POWMAN, n DORMANT
+  //   and then POWMAN after n seconds asleep.
+  // - Asleep, the window isn't served: reads give asleepValue() (or
+  //   setAsleepPattern()'s byte for the address), writes are lost, and a
+  //   write is also the wake.
+  // - DORMANT's wake keeps the window and sets AWAKE kDormantWakeCycles
+  //   later. POWMAN's is a reboot: kPowmanPowerUpCycles from the write to
+  //   the chip starting, then nothing served for kPowmanBootCycles,
+  //   then a cleared window reading AWAKE, and the channels and ZIP's
+  //   console back, as simulatePowmanWake(). READY is only ever
+  //   kCommandReady's answer (the two-phase wake, pc_exp.h).
+  // - The latest write wins (pc_exp.h, 2026-11-01): a write's BUSY stamp
+  //   is at once (setStampDelay() for a late one, as when the stamp's DMA
+  //   read flash during a log write); the newest command written is
+  //   started once the running one is done and forwardCycles (core0
+  //   handing it to core1) have passed, and older unstarted ones are
+  //   dropped. A command a newer write overtook doesn't publish its status.
+  // - Booting, the bus is served before anything is answered: POWMAN's
+  //   boot serves at kPowmanBootCycles and answers from kPowmanLoopCycles;
+  //   simulateColdBoot() (power-on: main.c's monitor_setup_pio() comes
+  //   before the GreenPAK/config/log/CYW43 set-up) serves at
+  //   kColdBootServeCycles and answers from kColdBootLoopCycles. Writes
+  //   in between are stamped BUSY; the newest is answered.
+  // missWakes(n): the next n wakes don't happen (a write that should have
+  // woken it doesn't), for the ROM's own timeouts.
+  void setSleepEmulation(bool on) { sleepOn_ = on; }
+  void setAsleepValue(uint8_t value) { asleepValue_ = value; }
+  // A floating bus that isn't the same everywhere (the first dongle: bit 7
+  // following A0 at 8000H-8003H): the byte for each window offset.
+  void setAsleepPattern(std::function<uint8_t(size_t offset)> pattern) { asleepPattern_ = std::move(pattern); }
+  uint8_t asleepValue(size_t offset) const { return asleepPattern_ ? asleepPattern_(offset) : asleepValue_; }
+  bool windowServed() const { return sleepState_ == SleepState::Awake || sleepState_ == SleepState::DormantWaking; }
+  void windowWriteUnserved(std::vector<uint8_t>& window, size_t instructionOffset);
+  void missWakes(int n) { missWakes_ = n; }
+  // Power-on (the module's power with the PC-1500's): the MCU's cold boot
+  // as above, its RAM state gone -- SD channels, the keyboard loop patched
+  // into its ROM image -- and the staged ROM too unless keepStaged (the
+  // GreenPAKs and SRAM kept powered). Config, history and the log are in
+  // flash and stay.
+  void simulateColdBoot(bool keepStaged);
+  void setForwardCycles(uint64_t cycles) { forwardCycles_ = cycles; }
+  void setStampDelay(uint64_t cycles) { stampDelayCycles_ = cycles; }
+  void setPowmanPrepare(uint64_t cycles) { powmanPrepareCycles_ = cycles; }
+  int powmanCancels() const { return powmanCancels_; }
+  void setSleepEntryDeaf(uint64_t cycles) { sleepEntryDeafCycles_ = cycles; }
+  int deafWrites() const { return deafWrites_; }
+  int sleepCount() const { return sleepCount_; }
+  int powmanCount() const { return powmanCount_; }
+  int wakeCount() const { return wakeCount_; }
+  bool asleepNow() const { return !windowServed(); }
+  static constexpr uint64_t kDormantWakeCycles = 390;   // ~0.3 ms: the wake check (hardware log, 2026-10-30)
+  // ~40 ms from the waking write to the reboot (2026-11-01, the dongle: with
+  // numbered wakes ~41 ms apart, "W1 71>02 85ms" -- the first command 85 ms
+  // after the reboot -- on every POWMAN wake: the write 41 ms after the
+  // waking one was lost too, so the reboot came ~40 ms after the edge).
+  static constexpr uint64_t kPowmanPowerUpCycles = 52000;
+  static constexpr uint64_t kPowmanBootCycles = 2600;   // ~2 ms: the boot to serving the bus (same log)
+  static constexpr uint64_t kPowmanLoopCycles = 4810;   // 3.7 ms: ...to answering ("LOOP 3755us", 2026-11-01)
+  static constexpr uint64_t kColdBootServeCycles = 6500;    // ~5 ms: power-on to serving (main.c, early)
+  static constexpr uint64_t kColdBootLoopCycles = 715000;   // 550 ms: ...to answering ("LOOP 548-553ms")
+  static constexpr uint64_t kForwardCycles = 130;           // ~100 us: one command done to the next started
+  // PreparePowman(): ZIP's record, the channels saved to flash, the files
+  // closed, a log line -- an estimate (not measured): ~10 ms.
+  static constexpr uint64_t kPowmanPrepareCycles = 13000;
+  static constexpr uint64_t kStrayWakeCycles = 130000;  // 100 ms: STRAY_WAKE_TIMEOUT_US
+  static constexpr uint64_t kHistorySleepWaitCycles = 130000;  // 100 ms: HISTORY_SLEEP_WAIT_MS
+  static constexpr uint64_t kSleepEntryDeafCycles = 65000;     // 50 ms: see setSleepEntryDeaf()
 
   // PC_EXP.h mirrors -- see that file for the authoritative definitions.
   // 4, not 0, since 2026-09-24 -- a sleeping RP2350 leaves the data window
   // reading 0xFF, and READY must differ from both 0x00 and 0xFF (see the
   // real firmware's pc_exp.h EXP_STATUS_READY/EXP_COMMAND_DONE).
-  static constexpr uint8_t kStatusReady = 4;
+  static constexpr uint8_t kStatusReady = 4;  // kCommandReady's answer only
+  static constexpr uint8_t kStatusAwake = 5;  // the MCU up: boot, a wake, kCommandWake's answer
   static constexpr uint8_t kStatusBusy = 1;
   static constexpr uint8_t kStatusSuccess = 2;
   static constexpr uint8_t kStatusEof = 3;  // kCommandSdReadValue only -- see PC_EXP.h's own comment
@@ -238,6 +339,18 @@ class ExpansionMock {
   static constexpr uint8_t kCommandSdReadValue = 28;
   static constexpr uint8_t kCommandSdSkipValues = 29;
   static constexpr uint8_t kCommandSdChannelEof = 31;  // SDEOF(n) (2026-09-30)
+  // SDREAD/SDWRITE (2026-10-29): raw bytes at a channel's byte position --
+  // pc_exp.h's EXP_COMMAND_SD_READ_BYTES block.
+  static constexpr uint8_t kCommandSdReadBytes = 0x3C;
+  static constexpr uint8_t kCommandSdWriteBytes = 0x3D;
+  static constexpr uint8_t kCommandSdChannelInfo = 0x3E;
+  static constexpr int kSdBytesData = 8;
+  static constexpr uint32_t kSdPosCurrent = 0xFFFFFFFFu;
+  static constexpr uint8_t kSdOpenWrite = 1;  // SD_OPEN_CHANNEL mode: FOR W
+  // ZIP/1500's console (2026-10-29): pc_exp.h's EXP_COMMAND_ZTERM, run by
+  // the firmware's own zterm.c.
+  static constexpr uint8_t kCommandZterm = 0x7D;
+  static constexpr uint8_t kZtermOpen = 1;  // its sub-ops: EXP_ZTERM_*
   // Validates+uppercase-folds, in place, the length-prefixed raw name
   // SD_PARSE_QUOTED_NAME (rom.asm) has already staged at window offset 0
   // -- ported from the LH5801 state machine that used to live there (see
@@ -298,6 +411,8 @@ class ExpansionMock {
   static constexpr int kConfigCount = 13;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY, BRIDGEINT, TIMESYNC -- mcu_config.h
   static constexpr int kConfigTimeSync = 12;
   static constexpr int kConfigAutostage = 6;
+  static constexpr int kConfigSleepWait = 1;
+  static constexpr int kConfigPowmanDelay = 8;
   static constexpr int kConfigBlkbd = 7;
   static constexpr int kConfigHistory = 10;
   // The external keyboard's driver (2026-10-04): ROM1's wait loop, copied
@@ -346,6 +461,8 @@ class ExpansionMock {
   static constexpr uint8_t kCommandBleMsgCount = 0x54;
   static constexpr uint8_t kCommandFnBlstat = 0x55;  // the BLSTAT function's value
   static constexpr uint8_t kCommandFnSdeof = 0x56;   // SDEOF(n)'s value
+  static constexpr uint8_t kCommandFnSdlof = 0x5D;   // SDLOF(n): the file size (2026-10-29)
+  static constexpr uint8_t kCommandFnSdpos = 0x5E;   // SDPOS(n): the SDREAD/SDWRITE position
   static constexpr uint8_t kCommandBlePlot = 0x57;   // the CE-150 stand-in's drawing (2026-09-30)
   // Pairing (2026-10-03, BLE_PROTOCOL.md sec.7) -- EXP_COMMAND_BLE_PAIR_BEGIN..UNPAIR.
   static constexpr uint8_t kCommandBlePairBegin = 0x58;
@@ -384,7 +501,8 @@ class ExpansionMock {
   static constexpr int kBleFileArgs = 42;
   static constexpr int kStoreParams = 0x7F0;
 
-  static constexpr uint8_t kCommandClearStatus = 0xFF;
+  static constexpr uint8_t kCommandWake = 0xFF;   // the wake's two phases (pc_exp.h EXP_COMMAND_WAKE)
+  static constexpr uint8_t kCommandReady = 0xFE;
 
   // EXP_BLOCK_CHECKSUM_PAGE(7)*256 + EXP_BLOCK_CHECKSUM_ADDRESS(0xFB) -
   // window base -- 2-byte BE per-block checksum GET_BLOCK stamps into the
@@ -399,9 +517,15 @@ class ExpansionMock {
   // Bus::loadExpansionModule() right after it sets the module's own
   // `data`, so this never needs to be called separately -- mirrors
   // setRootDir()'s own "setter called once at load time" shape.
+  // The data window as the module is built (Bus::loadExpansionModule()'s
+  // seed): what the firmware's monitor_init_buffer() puts back at a POWMAN
+  // wake's boot -- the STAGE copy routine at 0x8400 among it.
+  void setWindowSeed(std::vector<uint8_t> seed) { windowSeed_ = std::move(seed); }
+
   void setRomImage(std::vector<uint8_t> image) {
     kbdLoopInstalled_ = false;
     romImage_ = std::move(image);
+    romImageBuilt_ = romImage_;
     sram_.assign(romImage_.size(), 0xFF);
     remapActive_ = false;
     romCopyActive_ = false;
@@ -674,7 +798,7 @@ class ExpansionMock {
   // from dispatchCommand()'s own worker thread, never the caller's.
   void throttleForBytes(uint32_t bytes) const;
 
-  std::atomic<uint8_t> pendingStatus_{kStatusReady};
+  std::atomic<uint8_t> pendingStatus_{kStatusAwake};
   // pollStatusPaced(): when the command in flight started, in emulated
   // cycles and real time; the worker signals doneCv_ when it finishes.
   uint64_t emulatedCycles_ = 0;
@@ -690,6 +814,24 @@ class ExpansionMock {
   std::mutex doneMutex_;
   std::condition_variable doneCv_;
   std::thread worker_;
+  // The dispatch (see the sleep model's comment): on the emulation thread,
+  // except workerDone_, which the worker sets, and newerWrite_, under
+  // doneMutex_ with the status it decides on.
+  void pumpCommands();
+  bool commandInFlight() const { return workerActive_ || pendingCmd_ >= 0; }
+  void startCommand(uint8_t cmd);
+  int pendingCmd_ = -1;             // the newest command written and not started
+  bool newerWrite_ = false;         // a write since the running command started
+  uint64_t stampDelayCycles_ = 0, stampDueCycles_ = 0;
+  bool workerActive_ = false;
+  std::atomic<bool> workerDone_{false};
+  uint8_t activeCmd_ = 0;
+  uint64_t nextStartCycles_ = 0;    // forwardCycles_ after the last answer
+  uint64_t answerFromCycles_ = 0;   // a boot's loop start
+  uint64_t forwardCycles_ = kForwardCycles;
+  std::vector<uint8_t>* cmdWindow_ = nullptr;
+  size_t cmdInstr_ = 0;
+  bool coldBoot_ = false;           // PowmanBooting is a cold boot (simulateColdBoot())
   uint32_t sdRateLimitBytesPerSec_ = 0;
   uint32_t simulatedFatScanBytes_ = 0;
 
@@ -780,6 +922,10 @@ class ExpansionMock {
   uint8_t openSdChannel(std::vector<uint8_t>& window);
   uint8_t closeSdChannel(std::vector<uint8_t>& window);
   uint8_t listSdChannels(std::vector<uint8_t>& window);
+  uint8_t sdChannelBytes(uint8_t cmd, std::vector<uint8_t>& window);
+  uint8_t sdChannelInfo(std::vector<uint8_t>& window);
+  uint8_t ztermCommand(std::vector<uint8_t>& window);
+  std::unique_ptr<ZtermState> zterm_;
   uint8_t writeSdValue(std::vector<uint8_t>& window);
   uint8_t readSdValue(std::vector<uint8_t>& window);
   uint8_t skipSdValues(std::vector<uint8_t>& window);
@@ -818,10 +964,39 @@ class ExpansionMock {
   int romCopyBlockIndex_ = 0;
   bool romStagedVerified_ = false;
   int romCopyBeginCount_ = 0;
+  // setSleepEmulation(): state, on the main (emulation) thread only.
+  enum class SleepState { Awake, Dormant, PowmanPreparing, Powman, DormantWaking, PowmanBooting };
+  void reopenAfterPowmanPrepare();
+  void stepSleep();
+  void enterSleep(bool powman);
+  bool sleepOn_ = false;
+  // The dongle asleep (2026-11-01, PEEK from a program after a sleep):
+  // &87DA and &87FF read 253, &8001 229 -- the bus floating, not 0xFF.
+  uint8_t asleepValue_ = 0xFD;
+  std::function<uint8_t(size_t)> asleepPattern_;
+  uint64_t powmanPrepareCycles_ = kPowmanPrepareCycles;
+  bool powmanLatched_ = false;
+  int powmanCancels_ = 0;
+  SleepState sleepState_ = SleepState::Awake;
+  bool sleepRequested_ = false;    // DONE seen, no command since
+  uint64_t sleepRequestedCycles_ = 0;
+  bool awaitingFirst_ = false;     // woken, no command yet (the stray-wake rule)
+  uint64_t wokeCycles_ = 0;        // READY set, for the stray-wake rule
+  uint64_t sleepEventCycles_ = 0;  // the wake's end (READY) or DORMANT's POWMAN time
+  std::vector<uint8_t>* sleepWindow_ = nullptr;
+  size_t sleepInstr_ = 0;
+  int missWakes_ = 0;
+  bool historyAdded_ = false, sleepAfterHistory_ = false;  // HISTORY_SLEEP_WAIT_MS
+  uint64_t sleepEnteredCycles_ = 0;
+  uint64_t sleepEntryDeafCycles_ = kSleepEntryDeafCycles;
+  int deafWrites_ = 0;
+  int sleepCount_ = 0, powmanCount_ = 0, wakeCount_ = 0;
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
   uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1, 1, 1};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on, BRIDGEINT on, TIMESYNC on)
   std::atomic<bool> kbdLoopInstalled_{false};
+  std::vector<uint8_t> windowSeed_;  // setWindowSeed()
+  std::vector<uint8_t> romImageBuilt_;  // romImage_ before KBD_INSTALL: the firmware's flash copy
   int kbdPairStep_ = -1;  // -1: no pairing; then SEARCHING, CODE, CONNECTED
   size_t kbdLoopOffset_ = 0;
   // The fake Wi-Fi -- see wifiNetworks().
@@ -922,8 +1097,11 @@ class ExpansionMock {
   struct SdChannel {
     std::fstream file;
     std::string name;
+    std::filesystem::path path;  // as resolved at SDOPEN
     bool isOpen = false;
+    bool writable = false;  // SDOPEN ... FOR W
     uint32_t readPos = 0;
+    uint32_t bytePos = 0;  // SDREAD/SDWRITE's, apart from readPos
   };
   std::array<SdChannel, kMaxSdChannels> channels_;
 };

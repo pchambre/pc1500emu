@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <exception>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -2785,7 +2786,7 @@ void testSdopenCreatesFileAndListsChannel() {
 
   m->bus.writeME0(kErlAbs, 0xEE);
   tapKey(*m, pc1500::Key::Cl);
-  typeText(*m, "SDOPEN \"CHAN1.SDF\" AS 1");
+  typeText(*m, "SDOPEN \"CHAN1.SDF\" FOR W AS 1");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
   CHECK(m->bus.readME0(kErlAbs) != 1);
@@ -2836,12 +2837,12 @@ void testSdopenReusingChannelClosesPrevious() {
   CHECK(waitForIdle(*m));
 
   tapKey(*m, pc1500::Key::Cl);
-  typeText(*m, "SDOPEN \"FIRST.SDF\" AS 1");
+  typeText(*m, "SDOPEN \"FIRST.SDF\" FOR W AS 1");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
   tapKey(*m, pc1500::Key::Cl);
-  typeText(*m, "SDOPEN \"SECOND.SDF\" AS 1");
+  typeText(*m, "SDOPEN \"SECOND.SDF\" FOR W AS 1");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -2886,11 +2887,11 @@ void testSdcloseClosesOneAndAll() {
   CHECK(waitForIdle(*m));
 
   tapKey(*m, pc1500::Key::Cl);
-  typeText(*m, "SDOPEN \"A.SDF\" AS 1");
+  typeText(*m, "SDOPEN \"A.SDF\" FOR W AS 1");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
   tapKey(*m, pc1500::Key::Cl);
-  typeText(*m, "SDOPEN \"B.SDF\" AS 2");
+  typeText(*m, "SDOPEN \"B.SDF\" FOR W AS 2");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -2960,7 +2961,7 @@ void testSdprintSdinputNumericRoundTrip() {
   for (int i = 0; i < 8; i++) original.push_back(m->bus.readME0(static_cast<uint16_t>(kVarA + i)));
 
   tapKey(*m, pc1500::Key::Cl);
-  typeText(*m, "SDOPEN \"NUMS.SDF\" AS 1");
+  typeText(*m, "SDOPEN \"NUMS.SDF\" FOR W AS 1");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -2987,6 +2988,47 @@ void testSdprintSdinputNumericRoundTrip() {
   CHECK(waitForIdle(*m));
 
   for (int i = 0; i < 8; i++) CHECK(m->bus.readME0(static_cast<uint16_t>(kVarA + i)) == original[i]);
+}
+
+// A POWMAN sleep keeps SDOPEN channels (2026-10-30): after a wake the
+// channel is still open and SDINPUT# goes on from where it was.
+void testSdopenChannelSurvivesPowman() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomPath =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
+      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.empty() || expRom.empty()) {
+    std::printf("SKIP: testSdopenChannelSurvivesPowman -- ROM1.BIN and/or rom_8800.bin not found.\n");
+    return;
+  }
+
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_sdopen_powman");
+  auto m = bootAndSettle(rom);
+  loadExpansionRom(*m, expRom, sdDir);
+
+  auto line = [&](const char* text) {
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, text);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m));
+  };
+  line("NEW0");
+  line("SDOPEN \"NUMS.SDF\" FOR W AS 1");
+  line("A=1");
+  line("SDPRINT#1,A");
+  line("A=2");
+  line("SDPRINT#1,A");
+  std::vector<uint8_t> two;
+  for (int i = 0; i < 8; i++) two.push_back(m->bus.readME0(static_cast<uint16_t>(kVarA + i)));
+
+  line("SDOPEN \"NUMS.SDF\" AS 1");  // the read cursor back to the start
+  line("SDINPUT#1,A");                // the first value, 1
+  m->bus.expansionMock().simulatePowmanWake();
+  line("A=0");
+  line("SDINPUT#1,A");                // the second, 2: the cursor was kept
+  for (int i = 0; i < 8; i++) CHECK(m->bus.readME0(static_cast<uint16_t>(kVarA + i)) == two[i]);
 }
 
 // Same round trip for a string variable (T$) -- exercises the zero-padded
@@ -3018,7 +3060,7 @@ void testSdprintSdinputStringRoundTrip() {
   CHECK(waitForIdle(*m));
 
   tapKey(*m, pc1500::Key::Cl);
-  typeText(*m, "SDOPEN \"STR.SDF\" AS 3");
+  typeText(*m, "SDOPEN \"STR.SDF\" FOR W AS 3");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -3082,7 +3124,7 @@ void testSdinputEofFillsZeroAndBlank() {
   CHECK(waitForIdle(*m));
 
   tapKey(*m, pc1500::Key::Cl);
-  typeText(*m, "SDOPEN \"EMPTY.SDF\" AS 1");  // freshly created -- no stored values
+  typeText(*m, "SDOPEN \"EMPTY.SDF\" FOR W AS 1");  // freshly created -- no stored values
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -3124,7 +3166,7 @@ void testSdskipAdvancesAndRaisesError40PastEnd() {
   CHECK(waitForIdle(*m));
 
   tapKey(*m, pc1500::Key::Cl);
-  typeText(*m, "SDOPEN \"SKIP.SDF\" AS 1");
+  typeText(*m, "SDOPEN \"SKIP.SDF\" FOR W AS 1");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -4116,7 +4158,7 @@ void testKeywordsInProgramWithExpressions() {
   std::string typeError;
   CHECK(pc1500::basic::typeBasicProgramText(
       m->bus, m->cpu,
-      "10 SDOPEN \"PROG.SDF\" AS 1:A=5:SDPRINT #1,A*2,\"X\"+\"Y\":SDCLOSE 1\n"
+      "10 SDOPEN \"PROG.SDF\" FOR W AS 1:A=5:SDPRINT #1,A*2,\"X\"+\"Y\":SDCLOSE 1\n"
       "20 F$=\"PROG.SDF\":SDOPEN F$,2:SDINPUT #2,B,T$:SDCLOSE 2:C=7\n",
       kCyclesPerFrame, kCyclesPerTimerTick, &typeError));
   tapKey(*m, pc1500::Key::Cl);
@@ -4270,8 +4312,10 @@ struct BleFixture {
 };
 
 // extRam0000Bytes/extRamExtBytes: expansion RAM, as bootAndSettle().
+// stageable: the module loaded with the ROM image STAGE copies (rom.bin),
+// as the STAGE tests load it.
 static std::unique_ptr<BleFixture> bleFixture(const char* testName, size_t extRam0000Bytes = 0x4000,
-                                              size_t extRamExtBytes = 0x2800) {
+                                              size_t extRamExtBytes = 0x2800, bool stageable = false) {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   const std::string kExpRomPath =
       "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
@@ -4285,7 +4329,20 @@ static std::unique_ptr<BleFixture> bleFixture(const char* testName, size_t extRa
   auto f = std::make_unique<BleFixture>();
   f->m = bootAndSettle(rom, extRam0000Bytes, extRamExtBytes);
   f->sdDir = makeTempTestDir(testName);
-  loadExpansionRom(*f->m, expRom, f->sdDir);
+  if (stageable) {
+    std::vector<uint8_t> romBin = readFile(
+        "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom.bin");
+    if (romBin.size() < 0x800) {
+      std::printf("SKIP: %s -- rom.bin not found.\n", testName);
+      return nullptr;
+    }
+    f->m->bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x8800, /*requirePv=*/false,
+                                  /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
+                                  /*dataWindowSize=*/0x800, /*instructionAddr=*/0x87FF, romBin.data(), 0x800);
+    f->m->bus.expansionMock().setRootDir(f->sdDir);
+  } else {
+    loadExpansionRom(*f->m, expRom, f->sdDir);
+  }
   f->mock = &f->m->bus.expansionMock();
   f->run("NEW0");
   return f;
@@ -4801,7 +4858,7 @@ void testSdeofEndsReadLoop() {
     return t.empty() ? t : t.substr(0, t.size() - 1);
   };
   f->connect();
-  CHECK(f->run("SDOPEN \"D.DAT\" AS 1") == 0);
+  CHECK(f->run("SDOPEN \"D.DAT\" FOR W AS 1") == 0);
   CHECK(f->run("SDPRINT #1,10,20,30") == 0);
   CHECK(said("SDEOF(1)") == "0");  // inside another keyword
   CHECK(f->run("C=1") == 0);
@@ -4822,6 +4879,470 @@ void testSdeofEndsReadLoop() {
   CHECK(f->run("E=SDEOF(17)") == 1);  // not a channel
   CHECK(f->run("E=SDEOF(0)") == 1);
   CHECK(f->run("SDCLOSE ALL") == 0);
+}
+
+// SDOPEN's modes (2026-10-30): read-only by default, the file must exist;
+// FOR W creates it if needed and keeps an existing one's contents; FOR R
+// is the default spelled out.
+void testSdopenModes() {
+  auto f = bleFixture("testSdopenModes");
+  if (!f) return;
+  auto said = [&](const std::string& expr) {
+    f->mock->clearBleText();
+    CHECK(f->run("BLPRINT " + expr) == 0);
+    std::string t = f->mock->bleText();
+    return t.empty() ? t : t.substr(0, t.size() - 1);
+  };
+  f->connect();
+
+  CHECK(f->run("SDOPEN \"NOPE.SDF\" AS 1") == 40);  // not there, not created
+  CHECK(!fs::exists(f->sdDir / "NOPE.SDF"));
+
+  CHECK(f->run("SDOPEN \"M.SDF\" FOR W AS 1") == 0);  // created
+  CHECK(f->run("SDPRINT #1,10,20") == 0);
+  CHECK(f->run("SDCLOSE 1") == 0);
+
+  CHECK(f->run("SDOPEN \"M.SDF\" AS 2") == 0);
+  CHECK(f->run("SDPRINT #2,30") == 40);  // read-only
+  CHECK(f->run("SDCLOSE 2") == 0);
+
+  CHECK(f->run("SDOPEN \"M.SDF\" FOR W AS 3") == 0);  // kept, not truncated
+  CHECK(f->run("SDPRINT #3,30") == 0);
+  CHECK(f->run("SDCLOSE 3") == 0);
+
+  CHECK(f->run("SDOPEN \"M.SDF\" FOR R AS 1") == 0);
+  CHECK(f->run("SDINPUT #1,A,B,C") == 0);
+  CHECK(said("A+B+C") == "60");
+  CHECK(f->run("SDCLOSE ALL") == 0);
+
+  CHECK(f->run("F$=\"M.SDF\"") == 0);  // the comma form, for an expression name
+  CHECK(f->run("SDOPEN F$ FOR W,1") == 0);
+  CHECK(f->run("SDPRINT #1,40") == 0);
+  CHECK(f->run("SDCLOSE ALL") == 0);
+}
+
+// SDREAD/SDWRITE (2026-10-29): raw bytes between RAM and a channel's file
+// at a byte position, 1K per round trip; SDLOF/SDPOS give the size and the
+// position. Values are checked by BLPRINTing them, as SDEOF's.
+void testSdreadSdwriteRawBytes() {
+  auto f = bleFixture("testSdreadSdwriteRawBytes");
+  if (!f) return;
+  auto said = [&](const std::string& expr) {
+    f->mock->clearBleText();
+    CHECK(f->run("BLPRINT " + expr) == 0);
+    std::string t = f->mock->bleText();
+    return t.empty() ? t : t.substr(0, t.size() - 1);
+  };
+  auto poke = [&](uint16_t at, const std::vector<uint8_t>& bytes) {
+    for (size_t i = 0; i < bytes.size(); i++) f->m->bus.writeME0(static_cast<uint16_t>(at + i), bytes[i]);
+  };
+  auto peek = [&](uint16_t at, size_t n) {
+    std::vector<uint8_t> v(n);
+    for (size_t i = 0; i < n; i++) v[i] = f->m->bus.readME0(static_cast<uint16_t>(at + i));
+    return v;
+  };
+  f->connect();
+
+  // 2000 bytes, zeros among them, in two chunks each way.
+  std::vector<uint8_t> data(2000);
+  for (size_t i = 0; i < data.size(); i++) data[i] = static_cast<uint8_t>(i % 5 == 0 ? 0 : i * 7 + 3);
+  poke(0x3000, data);
+  CHECK(f->run("SDOPEN \"RAW.BIN\" FOR W AS 1") == 0);
+  CHECK(f->run("SDWRITE 1,&3000,2000") == 0);
+  CHECK(readFile((f->sdDir / "RAW.BIN").string()) == data);
+  CHECK(said("SDPOS(1)") == "2000");
+  CHECK(said("SDLOF(1)") == "2000");
+  CHECK(f->run("SDREAD #1,&1000,2000,0") == 0);
+  CHECK(peek(0x1000, 2000) == data);
+  CHECK(said("SDPOS(1)") == "2000");
+
+  // Over the middle, at a position given by expressions; the size stays.
+  poke(0x3000, {0xAA, 0xBB, 0xCC, 0xDD});
+  CHECK(f->run("A=12288") == 0);
+  CHECK(f->run("P=10") == 0);
+  CHECK(f->run("SDWRITE 1,A,4,P") == 0);
+  std::vector<uint8_t> expect = data;
+  for (int i = 0; i < 4; i++) expect[10 + i] = static_cast<uint8_t>(0xAA + 0x11 * i);
+  CHECK(readFile((f->sdDir / "RAW.BIN").string()) == expect);
+  CHECK(said("SDPOS(1)") == "14");
+  CHECK(said("SDLOF(1)") == "2000");
+
+  // Past the end and past 64K: the file grows, the gap is zeros.
+  CHECK(f->run("SDWRITE 1,&3000,4,70000") == 0);
+  CHECK(said("SDLOF(1)") == "70004");
+  CHECK(said("SDPOS(1)") == "70004");
+  std::vector<uint8_t> grown = readFile((f->sdDir / "RAW.BIN").string());
+  CHECK(grown.size() == 70004);
+  if (grown.size() == 70004) {
+    CHECK(grown[2000] == 0 && grown[69999] == 0);
+    CHECK(grown[70000] == 0xAA && grown[70003] == 0xDD);
+  }
+
+  // A read that runs off the end stops there; the RAM past it is untouched.
+  poke(0x1000, std::vector<uint8_t>(16, 0x55));
+  CHECK(f->run("SDREAD 1,&1000,16,70000") == 0);
+  std::vector<uint8_t> tail = {0xAA, 0xBB, 0xCC, 0xDD};
+  tail.resize(16, 0x55);
+  CHECK(peek(0x1000, 16) == tail);
+  CHECK(said("SDPOS(1)") == "70004");
+  CHECK(f->run("SDREAD 1,&1000,16") == 0);  // at the end: nothing, no error
+  CHECK(peek(0x1000, 16) == tail);
+
+  // Errors.
+  CHECK(f->run("SDREAD 2,&1000,16") == 40);   // not open
+  CHECK(f->run("E=SDLOF(2)") == 40);
+  CHECK(f->run("E=SDPOS(17)") == 1);         // not a channel
+  CHECK(f->run("SDREAD 1,&8000,16") == 1);    // the module's own window
+  CHECK(f->run("SDWRITE 1,&7FF8,16") == 1);   // runs into it
+  CHECK(f->run("SDREAD 1,&FFF0,32") == 1);    // past FFFFH
+  CHECK(f->run("SDREAD 1,&1000") == 1);
+  CHECK(f->run("SDCLOSE ALL") == 0);
+}
+
+// The same READ_BYTES from machine code, as the Z-machine interpreter will
+// use it: wake the MCU, send the command, copy the bytes out of the window,
+// send DONE. Assembled with sdaslh5801 (routine at 3800H):
+//   ldi a,FFH / sta (87FFH) / W1: lda (87FFH) / cpi a,05H / bzr W1   (WAKE until AWAKE)
+//   ldi a,FEH / sta (87FFH) / W2: lda (87FFH) / cpi a,04H / bzr W2   (READY until READY)
+//   [01][00 00 00 02][00 10] -> 8000H; ldi a,3CH / sta (87FFH)
+//   W3: lda (87FFH) / cpi a,01H / bzs W3 / sta (3910H)
+//   X=8000H, Y=3900H, UL=10H; C1: tin / dec ul / bzr C1
+//   ldi a,2CH / sta (87FFH) / W4: lda (87FFH) / cpi a,01H / bzs W4 / rtn
+void testSdReadBytesFromMachineCode() {
+  auto f = bleFixture("testSdReadBytesFromMachineCode");
+  if (!f) return;
+  static const uint8_t kRoutine[] = {
+      0xB5, 0xFF, 0xAE, 0x87, 0xFF, 0xA5, 0x87, 0xFF, 0xB7, 0x05, 0x99, 0x07, 0xB5, 0xFE, 0xAE, 0x87, 0xFF,
+      0xA5, 0x87, 0xFF, 0xB7, 0x04, 0x99, 0x07, 0xB5, 0x01, 0xAE, 0x80, 0x00, 0xB5, 0x00, 0xAE, 0x80, 0x01,
+      0xAE, 0x80, 0x02, 0xAE, 0x80, 0x03, 0xB5, 0x02, 0xAE, 0x80, 0x04, 0xB5, 0x00, 0xAE, 0x80, 0x05, 0xB5,
+      0x10, 0xAE, 0x80, 0x06, 0xB5, 0x3C, 0xAE, 0x87, 0xFF, 0xA5, 0x87, 0xFF, 0xB7, 0x01, 0x9B, 0x07, 0xAE,
+      0x39, 0x10, 0x48, 0x80, 0x4A, 0x00, 0x58, 0x39, 0x5A, 0x00, 0x6A, 0x10, 0xF5, 0x62, 0x99, 0x04, 0xB5,
+      0x2C, 0xAE, 0x87, 0xFF, 0xA5, 0x87, 0xFF, 0xB7, 0x01, 0x9B, 0x07, 0x9A,
+  };
+  for (size_t i = 0; i < sizeof kRoutine; i++)
+    f->m->bus.writeME0(static_cast<uint16_t>(0x3800 + i), kRoutine[i]);
+  std::vector<uint8_t> data(64);
+  for (size_t i = 0; i < data.size(); i++) data[i] = static_cast<uint8_t>(0xF0 - i);
+  {
+    std::ofstream out(f->sdDir / "STORY.DAT", std::ios::binary);
+    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  }
+  CHECK(f->run("SDOPEN \"STORY.DAT\" AS 1") == 0);
+  CHECK(f->run("CALL &3800", 5'000'000) == 0);
+  CHECK(f->m->bus.readME0(0x3910) == 0x02);  // SUCCESS
+  bool same = true;
+  for (int i = 0; i < 16; i++) same = same && f->m->bus.readME0(static_cast<uint16_t>(0x3900 + i)) == data[2 + i];
+  CHECK(same);
+  CHECK(f->run("SDCLOSE ALL") == 0);
+}
+
+// ZIP/1500 (2026-10-29, PC1500-PSOC5 zmachine/DESIGN.md): the LH5801
+// Z-machine plays a story off the card. SDLOAD M "ZIP" loads it and calls
+// it; it pages the story in with SD_READ_BYTES and talks to the console
+// (EXP_COMMAND_ZTERM, the firmware's zterm.c) for its text and every key.
+// The transcript is checked against zmachine/tools/zref.py's, made with
+// the same seed: zmachine/tests/<story>.txt from <story>.cmd.
+// ZTRACE=<file> writes the Z address of every instruction, as zref.py
+// --trace does, to find where the two part.
+static const char* kZipDir = "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/zmachine";
+
+// `ms` of emulated time at BASIC's prompt (or a key wait): also what a
+// key needs after a long operation, which KEYSCAN_WAIT would otherwise
+// take as the last key still held.
+static void idleMs(BleFixture& f, int ms) {
+  long cycles = 1300L * ms;
+  for (long c = 0; c < cycles; c += kCyclesPerFrame) runKeyAction(*f.m, pc1500::Key::Cl, false, 1);
+}
+
+// STAGE RAM, then the dongle's sleep model (ExpansionMock::
+// setSleepEmulation()) with MCONF POWMANDELAY = powmanDelay.
+static void sleepOn(BleFixture& f, uint16_t powmanDelay) {
+  CHECK(f.run("STAGE RAM", 200'000'000) == 0);
+  idleMs(f, 100);
+  f.key(pc1500::Key::Ent);  // "STAGE: OK", then DONE
+  CHECK(f.mock->romStagedVerified());
+  f.mock->setConfigValue(pc1500::ExpansionMock::kConfigPowmanDelay, powmanDelay);
+  f.mock->setSleepEmulation(true);
+}
+
+// Keywords across the sleep model's sleeps (2026-10-30): each one finds the
+// dongle asleep, wakes it with EC_WAKE and runs; SDOPEN's channel and its
+// read cursor survive POWMAN's reboot; a missed wake is ERROR 1 (EC_WAKE's
+// own timeout) and the next keyword wakes it again. For DORMANT, POWMAN,
+// and DORMANT that turns into POWMAN after a second.
+void testSleepKeywordsWake() {
+  for (uint16_t delay : {static_cast<uint16_t>(0xFFFF), static_cast<uint16_t>(0), static_cast<uint16_t>(1)}) {
+    auto f = bleFixture("testSleepKeywordsWake", 0x4000, 0x2800, true);
+    if (!f) return;
+    sleepOn(*f, delay);
+    idleMs(*f, delay == 1 ? 1500 : 200);
+    CHECK(f->mock->asleepNow());
+    int powman0 = f->mock->powmanCount();
+    if (delay != 0xFFFF) CHECK(powman0 >= 1);
+    else CHECK(powman0 == 0);
+
+    for (int i = 0; i < 3; i++) {
+      int wakes = f->mock->wakeCount();
+      CHECK(f->run("MLOGMSG \"HI\"") == 0);
+      CHECK(f->mock->lastUserLogMessage() == "HI");
+      CHECK(f->mock->wakeCount() == wakes + 1);
+      idleMs(*f, delay == 1 ? 1500 : 200);
+      CHECK(f->mock->asleepNow());
+    }
+
+    CHECK(f->run("SDOPEN \"S.SDF\" FOR W AS 1") == 0);
+    idleMs(*f, 200);
+    CHECK(f->run("A=7") == 0);
+    CHECK(f->run("SDPRINT #1,A") == 0);
+    idleMs(*f, 200);
+    CHECK(f->run("A=8") == 0);
+    CHECK(f->run("SDPRINT #1,A") == 0);
+    CHECK(f->run("SDOPEN \"S.SDF\" AS 2") == 0);
+    CHECK(f->run("SDINPUT #2,A") == 0);
+    idleMs(*f, delay == 1 ? 1500 : 200);
+    CHECK(f->run("SDINPUT #2,B") == 0);  // after a sleep: the next value
+    CHECK(f->run("C=A*10+B") == 0);
+    CHECK(f->m->bus.readME0(0x7910) == 0x01 && f->m->bus.readME0(0x7912) == 0x78);  // C = 78
+    CHECK(f->run("SDCLOSE ALL") == 0);
+
+    idleMs(*f, 200);
+    f->mock->missWakes(1);
+    CHECK(f->run("MLOGMSG \"AGAIN\"", 20'000'000) == 0);  // the wake missed: EC_WAKE's next write wakes it
+    CHECK(f->mock->lastUserLogMessage() == "AGAIN");
+    idleMs(*f, delay == 1 ? 1500 : 200);
+    f->mock->missWakes(1000);
+    CHECK(f->run("MLOGMSG \"LOST\"", 20'000'000) == 1);  // every write's wake missed: EC_WAKE gives up
+    f->mock->missWakes(0);
+    idleMs(*f, 100);
+    CHECK(f->run("MLOGMSG \"BACK\"") == 0);
+    CHECK(f->mock->lastUserLogMessage() == "BACK");
+  }
+}
+
+struct ZipGame {
+  std::unique_ptr<BleFixture> f;
+  uint16_t mloop = 0, spage = 0, rdpage = 0, waitFrom = 0, waitTo = 0;
+  FILE* trace = nullptr;
+  long instructions = 0;
+  // ZSTATS: per command, the turn's LH5801 cycles, Z instructions and page
+  // reads (from ENTER to the next prompt).
+  bool stats = false;
+  long long cycles = 0, zops = 0, pages = 0, waited = 0;  // waited: polling the MCU
+  // ZPROF=<file>: the cycles spent at each LH5801 address, over the game.
+  std::vector<long long> profile;
+
+  ~ZipGame() {
+    if (trace) std::fclose(trace);
+    if (const char* name = std::getenv("ZPROF")) {
+      if (FILE* out = std::fopen(name, "w")) {
+        for (size_t a = 0; a < profile.size(); a++)
+          if (profile[a]) std::fprintf(out, "%04zx %lld\n", a, profile[a]);
+        std::fclose(out);
+      }
+    }
+  }
+  // One LH5801 instruction, traced at the top of the instruction loop.
+  void step() {
+    if (trace && f->m->cpu.p() == mloop) {
+      uint32_t zpc = (static_cast<uint32_t>(f->m->bus.readME0(spage)) << 16) |
+                     (static_cast<uint32_t>(f->m->bus.readME0(static_cast<uint16_t>(spage + 1))) << 8) |
+                     (f->m->cpu.y() & 0xFF);
+      std::fprintf(trace, "%05x %02x\n", zpc, f->m->bus.readME0(f->m->cpu.y()));
+    }
+    uint16_t p = f->m->cpu.p();
+    zops += p == mloop;
+    pages += p == rdpage;
+    int c = f->m->cpu.step();  // (stepOne, counting the cycles)
+    int used = (c > 0) ? c : 1;
+    cycles += used;
+    if (p >= waitFrom && p < waitTo) waited += used;
+    if (!profile.empty()) profile[p] += used;
+    f->m->cyclesSinceTimerTick += used;
+    f->m->bus.advanceCycles(used);
+    while (f->m->cyclesSinceTimerTick >= kCyclesPerTimerTick) {
+      f->m->cpu.tickTimer();
+      f->m->cyclesSinceTimerTick -= kCyclesPerTimerTick;
+    }
+    instructions++;
+  }
+  // A key down or up, then `frames` frames run (runKeyAction, traced).
+  void keyAction(pc1500::Key key, bool pressed, int frames) {
+    f->m->bus.setKeyState(key, pressed);
+    for (int i = 0; i < frames; i++)
+      for (int c = 0; c < kCyclesPerFrame; c++) step();
+  }
+  void tap(pc1500::Key key) {
+    keyAction(key, true, pc1500::basic::kTapFrames);
+    keyAction(key, false, pc1500::basic::kIdleFrames);
+  }
+  void type(const std::string& text) {
+    for (char c : text) {
+      std::deque<pc1500::basic::QueuedKeyAction> actions;
+      if (!pc1500::basic::charToTapActions(c, &actions)) continue;
+      for (const auto& a : actions) keyAction(a.key, a.pressed, a.framesToWait);
+    }
+  }
+  // Runs until the interpreter waits for a key (BASIC's idle HLT, which
+  // KEYSCAN_WAIT shares), at most `budget` LH5801 instructions.
+  bool settle(long budget = 400'000'000) {
+    for (long i = 0; i < budget; i++) {
+      if (f->m->cpu.p() == kIdleAddr && f->m->cpu.halted()) return true;
+      step();
+    }
+    return false;
+  }
+  // A command, as typed: the keys, then ENTER. (An empty one is ENTER
+  // twice: the view starts at the turn's first line, and ENTER there only
+  // goes down to the prompt.)
+  bool command(const std::string& line) {
+    // KEYSCAN_WAIT takes the last key (the ENTER before this turn) as held
+    // until it has scanned no key a few times, and it scans only while it
+    // runs: a key the moment the prompt is up would be lost. A person
+    // can't be that quick.
+    keyAction(pc1500::Key::Ent, false, pc1500::basic::kIdleFrames);
+    for (size_t i = 0; i < line.size(); i++) {
+      if (line.compare(i, 6, "{LEFT}") == 0) {  // the console's backspace
+        tap(pc1500::Key::Left);
+        i += 5;
+      } else {
+        type(std::string(1, line[i]));
+      }
+      if (!settle()) return false;
+    }
+    if (line.empty()) {
+      tap(pc1500::Key::Ent);
+      if (!settle()) return false;
+    }
+    tap(pc1500::Key::Ent);
+    long long c0 = cycles, z0 = zops, p0 = pages, w0 = waited;
+    bool ok = settle();
+    if (stats) {
+      long long work = (cycles - c0) - (waited - w0);
+      std::printf("    %-16s %8lld cycles (%.2f s at 1.3 MHz) not waiting on the MCU, %5lld Z ops, %3lld pages\n",
+                  line.c_str(), work, work / 1.3e6, zops - z0, pages - p0);
+    }
+    return ok;
+  }
+  std::string transcript() {
+    std::string t = f->mock->ztermTranscript();
+    std::replace(t.begin(), t.end(), '\r', '\n');
+    return t;
+  }
+};
+
+static void sleepOn(BleFixture& f, uint16_t powmanDelay);
+
+// Copies the interpreter and `story` to the card, opens the story on
+// channel 1 and starts the game: it's waiting for its first command. With
+// sleep >= 0: STAGE RAM first and the dongle's sleep model on, POWMANDELAY
+// = sleep (0xFFFF: DORMANT only).
+static std::unique_ptr<ZipGame> zipStart(const char* testName, const std::string& story, int sleep = -1) {
+  auto g = std::make_unique<ZipGame>();
+  g->f = bleFixture(testName, 0x4000, 0x2800, sleep >= 0);
+  if (!g->f) return nullptr;
+  if (sleep >= 0) sleepOn(*g->f, static_cast<uint16_t>(sleep));
+  fs::path zip = fs::path(kZipDir) / "ZIP";
+  fs::path src = fs::path(kZipDir) / "tests" / story;
+  if (!fs::exists(zip) || !fs::exists(src)) {
+    std::printf("SKIP: %s -- build zmachine/ZIP (build.ps1) and put %s in zmachine/tests\n", testName,
+                story.c_str());
+    return nullptr;
+  }
+  fs::copy_file(zip, g->f->sdDir / "ZIP", fs::copy_options::overwrite_existing);
+  fs::copy_file(src, g->f->sdDir / "ZORK1.Z3", fs::copy_options::overwrite_existing);
+  std::vector<uint8_t> m = readFile((g->f->sdDir / "ZIP").string());
+  uint16_t org = static_cast<uint16_t>(m[0] << 8 | m[1]);
+  g->mloop = static_cast<uint16_t>(m[4 + 4] << 8 | m[4 + 5]);
+  g->spage = static_cast<uint16_t>(m[4 + 6] << 8 | m[4 + 7]);
+  g->rdpage = static_cast<uint16_t>(m[4 + 8] << 8 | m[4 + 9]);
+  g->waitFrom = static_cast<uint16_t>(m[4 + 10] << 8 | m[4 + 11]);
+  g->waitTo = static_cast<uint16_t>(m[4 + 12] << 8 | m[4 + 13]);
+  g->stats = std::getenv("ZSTATS") != nullptr;
+  if (std::getenv("ZPROF")) g->profile.assign(0x10000, 0);
+  (void)org;
+  if (const char* t = std::getenv("ZTRACE")) g->trace = std::fopen(t, "w");
+  CHECK(g->f->run("SDOPEN \"ZORK1.Z3\" AS 1") == 0);
+  g->f->m->bus.writeME0(kErlAbs, 0);
+  g->tap(pc1500::Key::Cl);
+  g->type("SDLOAD M \"ZIP\"");
+  g->tap(pc1500::Key::Ent);
+  CHECK(g->settle());
+  return g;
+}
+
+static std::string readText(const fs::path& p) {
+  std::ifstream in(p, std::ios::binary);
+  std::string s((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
+  return s;
+}
+
+// Plays zmachine/tests/<name>.cmd and compares with <name>.txt. With
+// powmanAfter > 0, a POWMAN sleep and wake after that many commands: the
+// story is reopened under the interpreter and the game goes on. With quits,
+// the script ends with the game's QUIT: ENTER leaves the last text, and
+// BASIC is back.
+static void zipPlay(const char* testName, const std::string& name, const std::string& storyFile,
+                    int powmanAfter = 0, bool quits = false, int sleep = -1) {
+  auto g = zipStart(testName, storyFile, sleep);
+  if (!g) return;
+  fs::path dir = fs::path(kZipDir) / "tests";
+  std::ifstream cmds(dir / (name + ".cmd"));
+  std::string line;
+  int done = 0;
+  while (std::getline(cmds, line)) {
+    if (powmanAfter > 0 && done++ == powmanAfter) g->f->mock->simulatePowmanWake();
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    std::string up = line;
+    for (char& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (!g->command(up)) {
+      std::printf("  %s: no prompt after \"%s\"\n", testName, line.c_str());
+      CHECK(false);
+      break;
+    }
+  }
+  if (quits) {
+    g->tap(pc1500::Key::Ent);
+    CHECK(g->settle());
+    CHECK(g->f->run("A=5") == 0);
+    CHECK(g->f->m->bus.readME0(0x7900) == 0x00 && g->f->m->bus.readME0(0x7902) == 0x50);  // A = 5
+  }
+  std::string got = g->transcript();
+  std::string want = readText(dir / (name + ".txt"));
+  if (got != want) {
+    size_t at = 0;
+    while (at < got.size() && at < want.size() && got[at] == want[at]) at++;
+    std::printf("  %s: transcripts part at %zu:\n  got:  \"%s\"\n  want: \"%s\"\n", testName, at,
+                got.substr(at > 40 ? at - 40 : 0, 120).c_str(), want.substr(at > 40 ? at - 40 : 0, 120).c_str());
+    std::ofstream(dir / (name + ".got.txt"), std::ios::binary) << got;
+  }
+  CHECK(got == want);
+  std::printf("  %s: %ld LH5801 instructions", testName, g->instructions);
+  if (sleep >= 0)
+    std::printf(", %d sleeps (%d POWMAN), %d wakes", g->f->mock->sleepCount(), g->f->mock->powmanCount(),
+                g->f->mock->wakeCount());
+  std::printf("\n");
+}
+
+void testZipZiptest() { zipPlay("testZipZiptest", "ziptest", "ziptest.z3"); }
+void testZipZork1() { zipPlay("testZipZork1", "zork1", "zork1.z3", 20, true); }
+// The same games with the dongle sleeping between commands (2026-10-30):
+// DORMANT only, straight to POWMAN, and the Zork run as on the hardware.
+void testZipZiptestDormant() { zipPlay("testZipZiptestDormant", "ziptest", "ziptest.z3", 0, false, 0xFFFF); }
+void testZipZiptestPowman() { zipPlay("testZipZiptestPowman", "ziptest", "ziptest.z3", 0, false, 0); }
+void testZipZork1Powman() { zipPlay("testZipZork1Powman", "zork1", "zork1.z3", 0, true, 0); }
+
+// BREAK at a key wait leaves the game at once, as QUIT does.
+void testZipBreak() {
+  auto g = zipStart("testZipBreak", "zork1.z3");
+  if (!g) return;
+  g->f->m->cpu.pressOnKey();
+  g->f->m->bus.ioPort().setOnKeyLine(true);
+  g->f->m->cpu.requestMI();
+  g->f->m->bus.ioPort().setOnKeyLine(false);
+  CHECK(waitForIdle(*g->f->m, 20'000'000));
+  CHECK(g->f->run("A=5") == 0);
+  CHECK(g->f->m->bus.readME0(0x7900) == 0x00 && g->f->m->bus.readME0(0x7902) == 0x50);  // A = 5
 }
 
 // Peer-to-peer (2026-09-28, BLE_PROTOCOL.md "Peer-to-peer files"): the fake
@@ -5753,6 +6274,360 @@ void testCommandHistory() {
 #endif
 }
 
+// STAGE RAM run with the command history on and MCONF SLEEPWAIT 0 under the
+// sleep model, typed and recalled (2026-10-30: ERROR 1 on the dongle), for
+// DORMANT and for POWMAN after a second. After a POWMAN wake the MCU's
+// image has lost the keyboard loop, so the refresh must put it back, or
+// history is gone (ROM1's own loop). SLEEPTRACE=1 prints the commands,
+// sleeps and wakes.
+void testHistoryStageSleep() {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  std::printf("SKIP: testHistoryStageSleep -- built without the firmware sources.\n");
+#else
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomDir =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom/";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomDir + "rom_8800.bin");
+  std::vector<uint8_t> romBin = readFile(kExpRomDir + "rom.bin");
+  if (rom.empty() || expRom.empty() || romBin.size() < 0x800) {
+    std::printf("SKIP: testHistoryStageSleep -- ROM1.BIN, rom_8800.bin and/or rom.bin not found.\n");
+    return;
+  }
+  const uint16_t kbdLoop = static_cast<uint16_t>((expRom[0x11] << 8) | expRom[0x12]);
+  const uint16_t kDriverIdle = static_cast<uint16_t>(kbdLoop + (0xE2AA - 0xE24A));
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_history_stage");
+  auto m = std::make_unique<BootedMachine>();
+  m->bus.ioPort().useManualRtcClock();
+  m->bus.loadME0(0xC000, rom.data(), rom.size());
+  m->bus.setExtRam0000Size(0x4000);
+  m->bus.setExtRamExtSize(0x2800);
+  m->bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x8800, /*requirePv=*/false,
+                             /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
+                             /*dataWindowSize=*/0x800, /*instructionAddr=*/0x87FF, romBin.data(), 0x800);
+  m->bus.expansionMock().setRootDir(sdDir);
+  pc1500::ExpansionMock& mock = m->bus.expansionMock();
+  auto idle = [&]() {
+    for (long i = 0; i < 60'000'000; i++) {
+      if (m->cpu.halted() && (m->cpu.p() == kIdleAddr || m->cpu.p() == kDriverIdle)) return true;
+      stepOne(*m);
+    }
+    return false;
+  };
+  auto key = [&](pc1500::Key k) {
+    tapKey(*m, k);
+    for (long i = 0; i < 200'000; i++) stepOne(*m);
+  };
+  auto wait = [&](long cycles) { for (long i = 0; i < cycles; i++) stepOne(*m); };
+  auto enter = [&](const std::string& text) {
+    m->bus.writeME0(kErlAbs, 0);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, text);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(idle());
+  };
+  m->cpu.reset();
+  for (long c = 0; !m->cpu.halted() && c < 20'000'000; c++) stepOne(*m);
+  for (long i = 0; i < 4'000'000; i++) stepOne(*m);
+  enter("NEW0");
+  CHECK(m->bus.readME0(0x79D4) == 0x55);
+  enter("STAGE RAM");
+  key(pc1500::Key::Ent);
+  CHECK(idle());
+  CHECK(mock.romStagedVerified());
+  for (uint16_t delay : {static_cast<uint16_t>(0xFFFF), static_cast<uint16_t>(1)}) {
+    mock.setConfigValue(pc1500::ExpansionMock::kConfigSleepWait, 0);
+    mock.setConfigValue(pc1500::ExpansionMock::kConfigPowmanDelay, delay);
+    mock.setSleepEmulation(true);
+    wait(2'000'000);
+    std::printf("ST --- POWMANDELAY %d: STAGE RAM typed\n", delay == 0xFFFF ? -1 : delay);
+    enter("STAGE RAM");
+    CHECK(m->bus.readME0(kErlAbs) == 0);
+    key(pc1500::Key::Ent);
+    CHECK(idle());
+    CHECK(m->bus.readME0(kbdLoop) == m->bus.readME0(0xE24A));  // rom.asm KBD_ENTRY: the loop's there
+    wait(2'000'000);
+    std::printf("ST --- POWMANDELAY %d: STAGE RAM recalled\n", delay == 0xFFFF ? -1 : delay);
+    m->bus.writeME0(kErlAbs, 0);
+    key(pc1500::Key::Cl);
+    key(pc1500::Key::Def);
+    key(pc1500::Key::Up);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(idle());
+    CHECK(m->bus.readME0(kErlAbs) == 0);
+    key(pc1500::Key::Ent);
+    CHECK(idle());
+    CHECK(m->bus.readME0(kbdLoop) == m->bus.readME0(0xE24A));
+    CHECK(mock.history().entries().size() >= 2 && mock.history().entries()[0] == "STAGE RAM");
+    if (delay == 1) CHECK(mock.powmanCount() >= 1);
+    if (delay == 1) {
+      // A long line recalled and run (2026-10-31, ERROR 1 on the dongle,
+      // typed it worked): the session's DONE, then ROM1 drawing the line,
+      // then the keyword's wake -- past the history floor, into the sleep's
+      // deaf entry. Typed first, then recalled.
+      std::printf("ST --- MCONF POWMANDELAY=-1 typed\n");
+      wait(4'000'000);
+      enter("MCONF POWMANDELAY=-1");
+      CHECK(m->bus.readME0(kErlAbs) == 0);
+      CHECK(mock.configValue(pc1500::ExpansionMock::kConfigPowmanDelay) == 0xFFFF);
+      mock.setConfigValue(pc1500::ExpansionMock::kConfigPowmanDelay, 1);
+      std::printf("ST --- MCONF POWMANDELAY=-1 recalled\n");
+      enter("MCONF");
+      key(pc1500::Key::Cl);
+      wait(4'000'000);
+      m->bus.writeME0(kErlAbs, 0);
+      key(pc1500::Key::Cl);
+      key(pc1500::Key::Def);
+      key(pc1500::Key::Up);
+      key(pc1500::Key::Up);
+      tapKey(*m, pc1500::Key::Ent);
+      CHECK(idle());
+      CHECK(m->bus.readME0(kErlAbs) == 0);
+      CHECK(mock.configValue(pc1500::ExpansionMock::kConfigPowmanDelay) == 0xFFFF);
+    }
+    mock.setSleepEmulation(false);
+  }
+#endif
+}
+
+// Power-on with the dongle's own settings (2026-11-01: on the dongle,
+// STAGE and MCONF gave ERROR 1, and history was gone after a power-on):
+// SLEEPWAIT 0, AUTOSTAGE 1, HISTORY 1, the sleep model on from the start,
+// for each POWMANDELAY. The boot hook stages and arms history; then plain
+// STAGE, a keyword typed and recalled, STAGE RAM, and a second power-on
+// that must arm history again -- each after the MCU has gone to sleep.
+void testPowerOnSleepConfigs() {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  std::printf("SKIP: testPowerOnSleepConfigs -- built without the firmware sources.\n");
+#else
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomDir =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom/";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomDir + "rom_8800.bin");
+  std::vector<uint8_t> romBin = readFile(kExpRomDir + "rom.bin");
+  if (rom.empty() || expRom.empty() || romBin.size() < 0x800) {
+    std::printf("SKIP: testPowerOnSleepConfigs -- ROM1.BIN, rom_8800.bin and/or rom.bin not found.\n");
+    return;
+  }
+  const uint16_t kbdLoop = static_cast<uint16_t>((expRom[0x11] << 8) | expRom[0x12]);
+  const uint16_t kDriverIdle = static_cast<uint16_t>(kbdLoop + (0xE2AA - 0xE24A));
+  for (uint16_t delay : {static_cast<uint16_t>(0xFFFF), static_cast<uint16_t>(0), static_cast<uint16_t>(1)}) {
+    const int d = delay == 0xFFFF ? -1 : delay;
+    fs::path sdDir = makeTempTestDir("expansion_keyword_test_poweron_sleep");
+    auto m = std::make_unique<BootedMachine>();
+    m->bus.ioPort().useManualRtcClock();
+    m->bus.loadME0(0xC000, rom.data(), rom.size());
+    m->bus.setExtRam0000Size(0x4000);
+    m->bus.setExtRamExtSize(0x2800);
+    m->bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x8800, /*requirePv=*/false,
+                               /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
+                               /*dataWindowSize=*/0x800, /*instructionAddr=*/0x87FF, romBin.data(), 0x800);
+    m->bus.expansionMock().setRootDir(sdDir);
+    pc1500::ExpansionMock& mock = m->bus.expansionMock();
+    mock.setConfigValue(pc1500::ExpansionMock::kConfigSleepWait, 0);
+    mock.setConfigValue(pc1500::ExpansionMock::kConfigAutostage, 1);
+    mock.setConfigValue(pc1500::ExpansionMock::kConfigHistory, 1);
+    mock.setConfigValue(pc1500::ExpansionMock::kConfigBlkbd, 0);
+    mock.setConfigValue(pc1500::ExpansionMock::kConfigPowmanDelay, delay);
+    mock.setSleepEmulation(true);
+    auto idle = [&]() {
+      for (long i = 0; i < 60'000'000; i++) {
+        if (m->cpu.halted() && (m->cpu.p() == kIdleAddr || m->cpu.p() == kDriverIdle)) return true;
+        stepOne(*m);
+      }
+      return false;
+    };
+    auto key = [&](pc1500::Key k) {
+      tapKey(*m, k);
+      for (long i = 0; i < 200'000; i++) stepOne(*m);
+    };
+    auto wait = [&](long cycles) { for (long i = 0; i < cycles; i++) stepOne(*m); };
+    auto enter = [&](const std::string& text) {
+      m->bus.writeME0(kErlAbs, 0);
+      tapKey(*m, pc1500::Key::Cl);
+      typeText(*m, text);
+      tapKey(*m, pc1500::Key::Ent);
+      CHECK(idle());
+    };
+    auto recall = [&]() {  // the last line, from history
+      m->bus.writeME0(kErlAbs, 0);
+      key(pc1500::Key::Cl);
+      key(pc1500::Key::Def);
+      key(pc1500::Key::Up);
+      tapKey(*m, pc1500::Key::Ent);
+      CHECK(idle());
+    };
+    auto powerOn = [&](bool keepStaged) {  // the MCU's cold boot with the PC-1500's
+      mock.simulateColdBoot(keepStaged);
+      m->cpu.reset();
+      for (long c = 0; !m->cpu.halted() && c < 20'000'000; c++) stepOne(*m);
+      for (long i = 0; i < 4'000'000; i++) stepOne(*m);
+      enter("NEW0");
+    };
+    auto erl = [&]() { return m->bus.readME0(kErlAbs); };
+    auto mode = [&](uint8_t bit) {  // 764FH: 40H RUN, 20H PRO -- MODE toggles them
+      for (int i = 0; i < 3 && !(m->bus.readME0(0x764F) & bit); i++) key(pc1500::Key::Mode);
+      CHECK((m->bus.readME0(0x764F) & bit) != 0);
+    };
+
+    std::printf("ST --- POWMANDELAY %d: power-on\n", d);
+    powerOn(false);
+    CHECK(mock.romStagedVerified());
+    CHECK(m->bus.readME0(0x79D4) == 0x55);
+    if (m->bus.readME0(0x79D4) != 0x55) std::printf("  POWMANDELAY %d: history not armed at power-on\n", d);
+    wait(2'000'000);
+
+    std::printf("ST --- POWMANDELAY %d: STAGE\n", d);
+    enter("STAGE");
+    CHECK(erl() == 0);
+    if (erl() != 0) std::printf("  POWMANDELAY %d: STAGE -> ERROR %u\n", d, (unsigned)erl());
+    key(pc1500::Key::Ent);
+    CHECK(idle());
+    wait(2'000'000);
+
+    std::printf("ST --- POWMANDELAY %d: MLOGMSG typed\n", d);
+    enter("MLOGMSG \"T\"");
+    CHECK(erl() == 0);
+    CHECK(mock.lastUserLogMessage() == "T");
+    wait(2'000'000);
+
+    std::printf("ST --- POWMANDELAY %d: MLOGMSG recalled\n", d);
+    recall();
+    CHECK(erl() == 0);
+    CHECK(mock.lastUserLogMessage() == "T");
+    if (erl() != 0 || mock.lastUserLogMessage() != "T")
+      std::printf("  POWMANDELAY %d: recalled MLOGMSG -> ERROR %u, \"%s\"\n", d, (unsigned)erl(),
+                  mock.lastUserLogMessage().c_str());
+    wait(2'000'000);
+
+    std::printf("ST --- POWMANDELAY %d: STAGE RAM\n", d);
+    enter("STAGE RAM");
+    CHECK(erl() == 0);
+    key(pc1500::Key::Ent);
+    CHECK(idle());
+    CHECK(mock.romStagedVerified());
+    wait(2'000'000);
+
+    std::printf("ST --- POWMANDELAY %d: power-on again\n", d);
+    powerOn(false);
+    CHECK(mock.romStagedVerified());
+    CHECK(m->bus.readME0(0x79D4) == 0x55);
+    if (m->bus.readME0(0x79D4) != 0x55) std::printf("  POWMANDELAY %d: history not armed at 2nd power-on\n", d);
+    wait(2'000'000);
+    enter("MLOGMSG \"U\"");
+    CHECK(erl() == 0);
+    wait(2'000'000);
+    recall();
+    CHECK(erl() == 0);
+    CHECK(mock.lastUserLogMessage() == "U");
+    if (delay != 0xFFFF) CHECK(mock.powmanCount() >= 1);
+
+    // The GreenPAKs and SRAM kept powered through it (seen on the dongle):
+    // the boot hook finds the copy staged and only arms history.
+    std::printf("ST --- POWMANDELAY %d: power-on, the stage kept\n", d);
+    powerOn(true);
+    CHECK(mock.romStagedVerified());
+    CHECK(m->bus.readME0(0x79D4) == 0x55);
+    if (m->bus.readME0(0x79D4) != 0x55) std::printf("  POWMANDELAY %d: history not armed, stage kept\n", d);
+    wait(2'000'000);
+
+    // Keywords back to back in a program: SLEEPWAIT 0 sends the MCU to
+    // sleep straight after each one's DONE, so the next one's first write
+    // lands in DORMANT's deaf entry and is lost (EC_WAKE's next write must
+    // wake it), or in POWMAN's preparing, which it calls off.
+    std::printf("ST --- POWMANDELAY %d: program\n", d);
+    int deafBefore = mock.deafWrites();
+    int cancelsBefore = mock.powmanCancels();
+    enter("10 FOR I=1 TO 20");
+    enter("20 A$=STR$ I:MLOGMSG A$");
+    enter("30 NEXT I");
+    key(pc1500::Key::Mode);  // PRO -> RUN mode; RUN in PRO mode is ERROR 26
+    enter("RUN");
+    CHECK(erl() == 0);
+    CHECK(mock.lastUserLogMessage() == "20");
+    if (erl() != 0 || mock.lastUserLogMessage() != "20")
+      std::printf("  POWMANDELAY %d: program -> ERROR %u, last \"%s\"\n", d, (unsigned)erl(),
+                  mock.lastUserLogMessage().c_str());
+    std::printf("  POWMANDELAY %d: program: %d writes lost going to sleep, %d POWMAN cancels\n", d,
+                mock.deafWrites() - deafBefore, mock.powmanCancels() - cancelsBefore);
+    if (d != 0) CHECK(mock.deafWrites() > deafBefore);  // the case is really exercised
+
+    // ...and with a longer way into sleep (DORMANT's deaf entry, POWMAN's
+    // preparing: 150 ms), so the wake's first few writes are all lost.
+    std::printf("ST --- POWMANDELAY %d: program, 150 ms into sleep\n", d);
+    enter("MLOGMSG \"X\"");  // so "20" below is this run's
+    CHECK(mock.lastUserLogMessage() == "X");
+    wait(2'000'000);
+    mock.setSleepEntryDeaf(195000);
+    mock.setPowmanPrepare(195000);
+    deafBefore = mock.deafWrites();
+    cancelsBefore = mock.powmanCancels();
+    m->bus.writeME0(kErlAbs, 0);
+    enter("RUN");
+    CHECK(erl() == 0);
+    CHECK(mock.lastUserLogMessage() == "20");
+    if (erl() != 0 || mock.lastUserLogMessage() != "20")
+      std::printf("  POWMANDELAY %d: program, 150 ms -> ERROR %u, last \"%s\"\n", d, (unsigned)erl(),
+                  mock.lastUserLogMessage().c_str());
+    std::printf("  POWMANDELAY %d: program, 150 ms: %d writes lost going to sleep, %d POWMAN cancels\n", d,
+                mock.deafWrites() - deafBefore, mock.powmanCancels() - cancelsBefore);
+    if (d == 0) CHECK(mock.powmanCancels() > cancelsBefore);  // a write in every POWMAN's preparing
+    mock.setSleepEntryDeaf(pc1500::ExpansionMock::kSleepEntryDeafCycles);
+
+    // SDOPEN channels through it all: a program writes ten values, another
+    // reads them back, a sleep (or a called-off POWMAN) between every two
+    // keywords -- a cancelled POWMAN had closed the channels and left them
+    // closed (2026-11-01, the independent review).
+    // POWMAN's preparing still 150 ms long, so its sleeps are called off.
+    std::printf("ST --- POWMANDELAY %d: channels across sleeps\n", d);
+    cancelsBefore = mock.powmanCancels();
+    mode(0x20);  // PRO, to type it
+    enter("NEW");
+    enter("10 SDOPEN \"P.SDF\" FOR W AS 1");
+    enter("20 FOR I=1 TO 10:SDPRINT #1,I:NEXT I");
+    enter("30 SDCLOSE 1:SDOPEN \"P.SDF\" AS 2:S=0");
+    enter("40 FOR I=1 TO 10:SDINPUT #2,A:S=S+A:NEXT I");
+    enter("50 SDCLOSE 2:A$=STR$ S:MLOGMSG A$");
+    mode(0x40);
+    enter("RUN");
+    CHECK(erl() == 0);
+    CHECK(mock.lastUserLogMessage() == "55");
+    if (erl() != 0 || mock.lastUserLogMessage() != "55")
+      std::printf("  POWMANDELAY %d: channels -> ERROR %u, last \"%s\"\n", d, (unsigned)erl(),
+                  mock.lastUserLogMessage().c_str());
+    std::printf("  POWMANDELAY %d: channels: %d POWMAN cancels\n", d, mock.powmanCancels() - cancelsBefore);
+    if (d == 0) CHECK(mock.powmanCancels() > cancelsBefore);
+
+    // The first dongle's floating bus (2026-11-01): not one value -- bit 7
+    // follows A0 at 8000H-8003H, 253 at the status cell.
+    std::printf("ST --- POWMANDELAY %d: program, the first dongle's floating bus\n", d);
+    mock.setAsleepPattern([](size_t off) -> uint8_t { return off < 4 ? ((off & 1) ? 0xE5 : 0x65) : 0xFD; });
+    m->bus.writeME0(kErlAbs, 0);
+    enter("RUN");
+    CHECK(erl() == 0);
+    CHECK(mock.lastUserLogMessage() == "55");
+    mock.setAsleepPattern(nullptr);
+    mock.setPowmanPrepare(pc1500::ExpansionMock::kPowmanPrepareCycles);
+
+    // A late BUSY stamp (its DMA reading flash while core1 wrote the log,
+    // until 2026-11-01): the ROM reads the wake's READY as the keyword's
+    // answer -- ERROR 1. The firmware's stamp is in RAM now; this keeps the
+    // mock able to show the fault.
+    std::printf("ST --- POWMANDELAY %d: a late BUSY stamp\n", d);
+    mock.setStampDelay(26000);  // 20 ms, a flash sector erase
+    enter("MLOGMSG \"LATE\"");
+    CHECK(erl() == 1);
+    mock.setStampDelay(0);
+    wait(2'000'000);
+    enter("MLOGMSG \"ON TIME\"");
+    CHECK(erl() == 0);
+    CHECK(mock.lastUserLogMessage() == "ON TIME");
+    mock.setSleepEmulation(false);
+  }
+#endif
+}
+
 // The external keyboard's driver (2026-10-04). With MCONF BLKBD=1 the boot
 // hook copies ROM1's keyboard wait loop to the MCU, which patches it into
 // the ROM image at KBD_LOOP (RP2350/kbd_seq.c kbd_loop_install(), in the
@@ -6500,6 +7375,7 @@ int main(int argc, char** argv) {
   // expansion_keyword_test [part of a test's name]: only the tests whose
   // names contain it (the whole suite takes about 11 minutes).
   const char* only = argc > 1 ? argv[1] : nullptr;
+  std::setvbuf(stdout, nullptr, _IONBF, 0);  // a crash keeps every line printed before it
 #if defined(_MSC_VER) && defined(_DEBUG)
   // A Debug CRT/STL assertion goes to stderr instead of a popup dialog, so
   // an unattended run reports it instead of waiting for a click.
@@ -6508,9 +7384,37 @@ int main(int argc, char** argv) {
   _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
   _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
 #endif
-#define RUN(test)                                                              \
-  do {                                                                         \
-    if (!only || std::string(#test).find(only) != std::string::npos) test(); \
+  // TESTTRACE=1: each test's name as it starts; an uncaught exception's
+  // message before the abort (2026-11-01: a full run aborted, no test alone did).
+  static const bool trace = std::getenv("TESTTRACE") != nullptr;
+  std::set_terminate([] {
+    if (auto e = std::current_exception()) {
+      try {
+        std::rethrow_exception(e);
+      } catch (const std::exception& x) {
+        std::printf("TERMINATE: %s\n", x.what());
+      } catch (...) {
+        std::printf("TERMINATE: a non-std exception\n");
+      }
+    } else {
+      std::printf("TERMINATE: no exception (a joinable std::thread destroyed?)\n");
+    }
+    std::abort();
+  });
+  // TESTFROM=<test> / TESTTO=<test>: only the tests from one to the other,
+  // in the suite's order (for bisecting an order-dependent failure).
+  const char* from = std::getenv("TESTFROM");
+  const char* to = std::getenv("TESTTO");
+  bool inRange = from == nullptr, pastRange = false;
+#define RUN(test)                                                                \
+  do {                                                                           \
+    if (from && std::string(#test) == from) inRange = true;                     \
+    if (inRange && !pastRange &&                                                 \
+        (!only || std::string(#test).find(only) != std::string::npos)) {        \
+      if (trace) std::printf("=== %s\n", #test);                                 \
+      test();                                                                    \
+    }                                                                            \
+    if (to && std::string(#test) == to) pastRange = true;                       \
   } while (0)
   RUN(testCe150Plotter);
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
@@ -6523,6 +7427,8 @@ int main(int argc, char** argv) {
   RUN(testKeywordsInProgramWithExpressions);
   RUN(testExternalKeyboardDriver);
   RUN(testCommandHistory);
+  RUN(testHistoryStageSleep);
+  RUN(testPowerOnSleepConfigs);
   RUN(testBlkbdPairsKeyboard);
   RUN(testExternalKeyboardOldRom);
   RUN(testBlkeyLoadSaveTranslation);
@@ -6543,6 +7449,16 @@ int main(int argc, char** argv) {
   RUN(testBleGetFromPeer);
   RUN(testBleMessaging);
   RUN(testSdeofEndsReadLoop);
+  RUN(testSdopenModes);
+  RUN(testSdreadSdwriteRawBytes);
+  RUN(testSdReadBytesFromMachineCode);
+  RUN(testZipZiptest);
+  RUN(testZipZork1);
+  RUN(testZipBreak);
+  RUN(testSleepKeywordsWake);
+  RUN(testZipZiptestDormant);
+  RUN(testZipZiptestPowman);
+  RUN(testZipZork1Powman);
   RUN(testBlePrintText);
   RUN(testBleListMatchesDetokenizer);
   RUN(testBleListBreak);
@@ -6614,6 +7530,7 @@ int main(int argc, char** argv) {
   RUN(testSdopenReusingChannelClosesPrevious);
   RUN(testSdcloseClosesOneAndAll);
   RUN(testSdprintSdinputNumericRoundTrip);
+  RUN(testSdopenChannelSurvivesPowman);
   RUN(testSdprintSdinputStringRoundTrip);
   RUN(testSdinputEofFillsZeroAndBlank);
   RUN(testSdskipAdvancesAndRaisesError40PastEnd);

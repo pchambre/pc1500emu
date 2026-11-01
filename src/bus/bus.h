@@ -640,6 +640,7 @@ class Bus : public lh5801::MemoryBus {
     // GET_BLOCK to copy from, and (re)sizes the mock SRAM chip to match --
     // see ExpansionMock::setRomImage()'s own comment.
     expansionMock_.setRomImage(m.data);
+    expansionMock_.setWindowSeed(m.dataWindow);  // what a POWMAN boot puts back
   }
   void unloadRomModule(int slot) { romModules_[slot] = RomModule{}; }
   bool romModuleLoaded(int slot) const { return !romModules_[slot].data.empty(); }

@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
@@ -14,9 +15,24 @@
 #include "keywords.h"
 #include "plotter.h"
 #include "time_zone.h"
+#include "zterm.h"
 #endif
 
 namespace pc1500 {
+
+// ZIP/1500's console: the firmware's zterm.c over a vector for the
+// transcript. The session record a POWMAN sleep keeps is zt itself plus the
+// story's path (the firmware: the transcript ring's header sector).
+struct ExpansionMock::ZtermState {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  zterm_t zt{};
+  zterm_t saved{};
+#endif
+  std::vector<uint8_t> text;
+  uint16_t seed = 0x1234;
+  std::filesystem::path storyPath;
+};
+
 
 namespace fs = std::filesystem;
 
@@ -252,6 +268,13 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       return readSdValue(window);
     case kCommandSdSkipValues:
       return skipSdValues(window);
+    case kCommandSdReadBytes:
+    case kCommandSdWriteBytes:
+      return sdChannelBytes(cmd, window);
+    case kCommandSdChannelInfo:
+      return sdChannelInfo(window);
+    case kCommandZterm:
+      return ztermCommand(window);
     case kCommandSdChannelEof: {  // nothing left past SDINPUT#'s own position
       uint8_t channel = window[0];
       if (channel < 1 || channel > kMaxSdChannels || !channels_[channel - 1].isOpen) return kStatusError;
@@ -333,7 +356,9 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       std::this_thread::sleep_for(std::chrono::seconds(seconds));
       return kStatusSuccess;
     }
-    case kCommandClearStatus:
+    case kCommandWake:  // the wake's two phases (pc_exp.h EXP_COMMAND_WAKE)
+      return kStatusAwake;
+    case kCommandReady:
       return kStatusReady;
     case kCommandDone:
       return kStatusSuccess;
@@ -358,6 +383,8 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
 #endif
     case kCommandFnBlstat:  // keywords as BASIC functions (2026-09-29): BLSTAT, SDEOF(n)
     case kCommandFnSdeof:
+    case kCommandFnSdlof:
+    case kCommandFnSdpos:
     case kCommandFnWfstat:
     case kCommandFnBlmsgs:
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
@@ -1496,6 +1523,7 @@ void ExpansionMock::closeSdChannelAt(int index) {
   ch.isOpen = false;
   ch.name.clear();
   ch.readPos = 0;
+  ch.bytePos = 0;
 }
 
 // Ported from main.c's EXP_COMMAND_SD_OPEN_CHANNEL case: window[0]=channel
@@ -1513,12 +1541,17 @@ uint8_t ExpansionMock::openSdChannel(std::vector<uint8_t>& window) {
   fs::path path = resolvePath(name);
   if (path.empty()) return kStatusError;
 
+  // The mode byte after the name (monitor.c): READ needs an existing file
+  // and refuses writes; WRITE creates one if needed, keeping what's there.
+  size_t modeAt = 3 + name.size();
+  bool writable = modeAt < window.size() && window[modeAt] == kSdOpenWrite;
+
   int index = channel - 1;
   closeSdChannelAt(index);
 
   SdChannel& ch = channels_[index];
-  ch.file.open(path, std::ios::binary | std::ios::in | std::ios::out);
-  if (!ch.file.is_open()) {
+  ch.file.open(path, writable ? std::ios::binary | std::ios::in | std::ios::out : std::ios::binary | std::ios::in);
+  if (!ch.file.is_open() && writable) {
     // Doesn't exist yet -- plain in|out can't create a file on most
     // implementations, so create it out-only first, then reopen in|out.
     ch.file.clear();
@@ -1529,8 +1562,74 @@ uint8_t ExpansionMock::openSdChannel(std::vector<uint8_t>& window) {
   }
   if (!ch.file.is_open()) return kStatusError;
   ch.isOpen = true;
+  ch.writable = writable;
   ch.name = name;
+  ch.path = path;
   ch.readPos = 0;
+  ch.bytePos = 0;
+  return kStatusSuccess;
+}
+
+// Ported from monitor.c's EXP_COMMAND_SD_READ_BYTES/WRITE_BYTES case:
+// [channel][pos, 4 BE][len, 2 BE]; pos kSdPosCurrent = the channel's byte
+// position. A read leaves the bytes at window[0..] and the count at the
+// length port (kStatusEof for none); a write takes them from
+// window[kSdBytesData..] and writes at the position, growing the file past
+// its end. Either way the position moves past them.
+uint8_t ExpansionMock::sdChannelBytes(uint8_t cmd, std::vector<uint8_t>& window) {
+  if (window.size() < static_cast<size_t>(kLengthPortOffset) + 2) return kStatusError;
+  uint8_t channel = window[0];
+  uint32_t pos = static_cast<uint32_t>(window[1]) << 24 | static_cast<uint32_t>(window[2]) << 16 |
+                 static_cast<uint32_t>(window[3]) << 8 | window[4];
+  uint16_t len = static_cast<uint16_t>(window[5] << 8 | window[6]);
+  if (channel < 1 || channel > kMaxSdChannels || !channels_[channel - 1].isOpen || len > kMaxTransferLen ||
+      (cmd != kCommandSdReadBytes && !channels_[channel - 1].writable))
+    return kStatusError;
+  SdChannel& ch = channels_[channel - 1];
+  if (pos == kSdPosCurrent) pos = ch.bytePos;
+  ch.file.clear();
+  ch.file.seekg(0, std::ios::end);
+  uint32_t size = static_cast<uint32_t>(ch.file.tellg());
+  uint32_t done = 0;
+  if (cmd == kCommandSdReadBytes) {
+    if (pos < size) {
+      done = std::min<uint32_t>(len, size - pos);
+      ch.file.seekg(pos);
+      ch.file.read(reinterpret_cast<char*>(window.data()), done);
+      if (!ch.file.good()) return kStatusError;
+    }
+    window[kLengthPortOffset] = static_cast<uint8_t>(done >> 8);
+    window[kLengthPortOffset + 1] = static_cast<uint8_t>(done);
+  } else {
+    if (pos > size) {  // FatFs's f_lseek grows the file; so does this
+      ch.file.seekp(size);
+      std::vector<char> zeros(pos - size, 0);
+      ch.file.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+    }
+    ch.file.seekp(pos);
+    ch.file.write(reinterpret_cast<const char*>(window.data() + kSdBytesData), len);
+    if (!ch.file.good()) return kStatusError;
+    ch.file.flush();
+    done = len;
+  }
+  ch.bytePos = pos + done;
+  return cmd == kCommandSdReadBytes && done == 0 && len != 0 ? kStatusEof : kStatusSuccess;
+}
+
+// Ported from monitor.c's EXP_COMMAND_SD_CHANNEL_INFO: [channel] ->
+// [byte position, 4 BE][file size, 4 BE].
+uint8_t ExpansionMock::sdChannelInfo(std::vector<uint8_t>& window) {
+  if (window.size() < 8) return kStatusError;
+  uint8_t channel = window[0];
+  if (channel < 1 || channel > kMaxSdChannels || !channels_[channel - 1].isOpen) return kStatusError;
+  SdChannel& ch = channels_[channel - 1];
+  ch.file.clear();
+  ch.file.seekg(0, std::ios::end);
+  uint32_t size = static_cast<uint32_t>(ch.file.tellg());
+  for (int i = 0; i < 4; i++) {
+    window[i] = static_cast<uint8_t>(ch.bytePos >> (24 - 8 * i));
+    window[4 + i] = static_cast<uint8_t>(size >> (24 - 8 * i));
+  }
   return kStatusSuccess;
 }
 
@@ -1597,7 +1696,7 @@ uint8_t ExpansionMock::writeSdValue(std::vector<uint8_t>& window) {
   uint8_t channel = window[0];
   if (channel < 1 || channel > kMaxSdChannels) return kStatusError;
   SdChannel& ch = channels_[channel - 1];
-  if (!ch.isOpen) return kStatusError;
+  if (!ch.isOpen || !ch.writable) return kStatusError;
   if (window.size() < 2) return kStatusError;
   uint8_t tag = window[1];
   size_t chunkLen;
@@ -1932,6 +2031,96 @@ uint8_t ExpansionMock::kbdKeyCell() { return 0; }
 uint8_t ExpansionMock::kbdBreakCell() { return 0; }
 #endif
 
+uint8_t ExpansionMock::ztermCommand(std::vector<uint8_t>& window) {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  if (!zterm_) zterm_ = std::make_unique<ZtermState>();
+  ZtermState& z = *zterm_;
+  static const zt_store_t kStore = {
+      nullptr,
+      [](void* c) { static_cast<ZtermState*>(c)->text.clear(); },
+      [](void* c, const uint8_t* d, uint16_t n) {
+        auto& t = static_cast<ZtermState*>(c)->text;
+        t.insert(t.end(), d, d + n);
+      },
+      [](void*) -> uint32_t { return 0; },
+      [](void* c) -> uint32_t { return static_cast<uint32_t>(static_cast<ZtermState*>(c)->text.size()); },
+      [](void* c, uint32_t pos) -> uint8_t {
+        auto& t = static_cast<ZtermState*>(c)->text;
+        return pos < t.size() ? t[pos] : 0;
+      },
+      [](void* c) -> uint16_t { return static_cast<ZtermState*>(c)->seed; },
+  };
+  zt_store_t store = kStore;
+  store.ctx = &z;
+  if (window[0] == kZtermOpen) {  // the story's path, for a POWMAN wake
+    uint8_t channel = window[1];
+    z.storyPath.clear();
+    if (channel >= 1 && channel <= kMaxSdChannels && channels_[channel - 1].isOpen)
+      z.storyPath = channels_[channel - 1].path;
+  }
+  static const bool log = std::getenv("ZTERMLOG") != nullptr;
+  if (log) std::fprintf(stderr, "ZTERM %u %02X %02X %02X\n", window[0], window[1], window[2], window[3]);
+  uint8_t status = zterm_command(&z.zt, &store, window.data());
+  if (log && window.size() > 40)
+    std::fprintf(stderr, "  -> %02X state %u \"%.26s\" len %u\n", status, window[0],
+                 reinterpret_cast<const char*>(window.data() + 1), window[27]);
+  return status;
+#else
+  (void)window;
+  return kStatusNotImplemented;
+#endif
+}
+
+std::string ExpansionMock::ztermTranscript() const {
+  if (!zterm_) return {};
+  return std::string(zterm_->text.begin(), zterm_->text.end());
+}
+
+void ExpansionMock::setZtermSeed(uint16_t seed) {
+  if (!zterm_) zterm_ = std::make_unique<ZtermState>();
+  zterm_->seed = seed;
+}
+
+void ExpansionMock::simulatePowmanWake() {
+  // The ROM image back from flash: the keyboard loop KBD_INSTALL patched in
+  // is gone (STAGE RAM after this must put it back -- 2026-10-30).
+  kbdLoopInstalled_.store(false, std::memory_order_release);
+  romImage_ = romImageBuilt_;
+  reopenAfterPowmanPrepare();
+}
+
+// PreparePowman() closed every SDOPEN channel and saved ZIP's console; the
+// first command after a POWMAN wake -- or a cancelled POWMAN -- reopens
+// them, names and cursors kept (monitor.c ResumeChannels(), ResumeZterm()).
+void ExpansionMock::reopenAfterPowmanPrepare() {
+  for (SdChannel& ch : channels_) {
+    if (!ch.isOpen) continue;
+    ch.file.close();
+    ch.file.open(ch.path, ch.writable ? std::ios::binary | std::ios::in | std::ios::out
+                                      : std::ios::binary | std::ios::in);
+    ch.isOpen = ch.file.is_open();
+  }
+  if (!zterm_) return;
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  ZtermState& z = *zterm_;
+  z.saved = z.zt;               // the session record, written before the sleep
+  zterm_init(&z.zt);            // the RAM state, gone
+  z.zt = z.saved;               // ...and read back at the wake
+  if (z.zt.open && !z.storyPath.empty() && z.zt.story_channel >= 1 && z.zt.story_channel <= kMaxSdChannels &&
+      !channels_[z.zt.story_channel - 1].isOpen) {
+    SdChannel& ch = channels_[z.zt.story_channel - 1];
+    ch.file.open(z.storyPath, std::ios::binary | std::ios::in);
+    ch.isOpen = ch.file.is_open();
+    ch.writable = false;
+    ch.path = z.storyPath;
+    ch.readPos = 0;
+    ch.bytePos = 0;
+  }
+#endif
+}
+
+ExpansionMock::ExpansionMock() = default;
+
 ExpansionMock::~ExpansionMock() {
   if (worker_.joinable()) worker_.join();
 }
@@ -1969,30 +2158,263 @@ uint8_t ExpansionMock::runKeywordCommand(uint8_t cmd, void* ctx) {
   return self->dispatchCommand(cmd, *self->kwWindow_);
 }
 
+// SLEEPTRACE=1 (2026-10-30 diagnosis): every command, unserved write, sleep
+// and wake, with the emulated time in microseconds.
+static bool sleepTrace() {
+  static const bool on = std::getenv("SLEEPTRACE") != nullptr;
+  return on;
+}
+
 void ExpansionMock::processCommand(uint8_t cmd, std::vector<uint8_t>& window,
                                     size_t instructionOffset) {
-  if (worker_.joinable()) worker_.join();  // serialize -- see this function's own comment
-  window[instructionOffset] = kStatusBusy;
+  if (sleepTrace())
+    std::printf("ST %10.0fus cmd %02X\n", static_cast<double>(emulatedCycles_) * 1e6 / kCpuHz, cmd);
+  // The sleep model (setSleepEmulation()): DONE asks for sleep, any other
+  // command calls it off; any command ends a wake's wait for one.
+  sleepWindow_ = &window;
+  sleepInstr_ = instructionOffset;
+  sleepRequested_ = cmd == kCommandDone;
+  sleepRequestedCycles_ = emulatedCycles_;
+  if (cmd == kCommandHistAdd || cmd == kCommandHistBegin) historyAdded_ = true;
+  if (cmd == kCommandDone) {
+    sleepAfterHistory_ = historyAdded_;
+    historyAdded_ = false;
+  }
+  awaitingFirst_ = false;
+  if (sleepState_ == SleepState::DormantWaking) sleepState_ = SleepState::Awake;  // core1: the check, then this
+  // The BUSY stamp (the dispatch DMA), at once unless setStampDelay(); the
+  // newest command replaces any not yet started, and a running one's
+  // status won't be published (monitor.c WriteStatus()).
+  {
+    std::lock_guard<std::mutex> lock(doneMutex_);
+    if (workerActive_) newerWrite_ = true;
+    if (stampDelayCycles_ == 0) {
+      window[instructionOffset] = kStatusBusy;
+      pendingStatus_.store(kStatusBusy, std::memory_order_relaxed);
+    } else {
+      stampDueCycles_ = emulatedCycles_ + stampDelayCycles_;
+    }
+  }
+  cmdWindow_ = &window;
+  cmdInstr_ = instructionOffset;
+  pendingCmd_ = cmd;
+  pumpCommands();
+}
+
+void ExpansionMock::startCommand(uint8_t cmd) {
+  std::vector<uint8_t>& window = *cmdWindow_;
+  if (worker_.joinable()) worker_.join();
+  activeCmd_ = cmd;
+  workerActive_ = true;
+  workerDone_.store(false, std::memory_order_relaxed);
   commandStartCycles_ = emulatedCycles_;
   commandStartTime_ = std::chrono::steady_clock::now();
-  pendingStatus_.store(kStatusBusy, std::memory_order_relaxed);
-  worker_ = std::thread(&ExpansionMock::runCommandAsync, this, cmd, &window, instructionOffset);
+  {
+    std::lock_guard<std::mutex> lock(doneMutex_);
+    newerWrite_ = false;
+    window[cmdInstr_] = kStatusBusy;  // DoCommand()'s own stamp
+    pendingStatus_.store(kStatusBusy, std::memory_order_relaxed);
+  }
+  worker_ = std::thread(&ExpansionMock::runCommandAsync, this, cmd, &window, cmdInstr_);
+}
+
+// The emulation thread: a late BUSY stamp landing, the running command
+// finished, then the newest one written started -- not before its stamp is
+// in (core0 waits to see it, monitor.c).
+void ExpansionMock::pumpCommands() {
+  if (stampDueCycles_ != 0 && emulatedCycles_ >= stampDueCycles_) {
+    stampDueCycles_ = 0;
+    std::lock_guard<std::mutex> lock(doneMutex_);
+    if (cmdWindow_) (*cmdWindow_)[cmdInstr_] = kStatusBusy;
+    pendingStatus_.store(kStatusBusy, std::memory_order_relaxed);
+  }
+  if (workerActive_) {
+    if (!workerDone_.load(std::memory_order_acquire)) return;
+    if (worker_.joinable()) worker_.join();  // waitUntilIdleForTest() may have already
+    workerActive_ = false;
+    nextStartCycles_ = emulatedCycles_ + forwardCycles_;
+  }
+  if (pendingCmd_ < 0 || stampDueCycles_ != 0 || emulatedCycles_ < answerFromCycles_ ||
+      emulatedCycles_ < nextStartCycles_)
+    return;
+  uint8_t cmd = static_cast<uint8_t>(pendingCmd_);
+  pendingCmd_ = -1;
+  startCommand(cmd);
+}
+
+void ExpansionMock::waitUntilIdleForTest() {
+  for (;;) {
+    if (workerActive_ && worker_.joinable()) worker_.join();
+    uint64_t next = nextStartCycles_, from = answerFromCycles_;
+    nextStartCycles_ = answerFromCycles_ = 0;
+    if (stampDueCycles_ != 0) stampDueCycles_ = 1;  // due now
+    pumpCommands();
+    nextStartCycles_ = (std::max)(nextStartCycles_, next);
+    answerFromCycles_ = from;
+    if (!workerActive_ && pendingCmd_ < 0) return;
+  }
+}
+
+void ExpansionMock::simulateColdBoot(bool keepStaged) {
+  if (worker_.joinable()) worker_.join();
+  workerActive_ = false;
+  pendingCmd_ = -1;
+  stampDueCycles_ = 0;
+  kbdLoopInstalled_.store(false, std::memory_order_release);
+  romImage_ = romImageBuilt_;
+  for (int i = 0; i < kMaxSdChannels; i++)
+    if (channels_[i].isOpen) closeSdChannelAt(i);
+  if (!keepStaged) {
+    remapActive_ = false;
+    romStagedVerified_ = false;
+    romCopyActive_ = false;
+  }
+  sleepRequested_ = false;
+  awaitingFirst_ = false;
+  historyAdded_ = sleepAfterHistory_ = false;
+  coldBoot_ = true;
+  sleepState_ = SleepState::PowmanBooting;
+  sleepEventCycles_ = emulatedCycles_ + kColdBootServeCycles;
+  answerFromCycles_ = emulatedCycles_ + kColdBootLoopCycles;
 }
 
 void ExpansionMock::runCommandAsync(uint8_t cmd, std::vector<uint8_t>* window,
                                      size_t instructionOffset) {
   uint8_t status = dispatchCommand(cmd, *window);
-  (*window)[instructionOffset] = status;
   {
+    // Overtaken by a newer write: the cell keeps its BUSY (monitor.c
+    // WriteStatus()).
     std::lock_guard<std::mutex> lock(doneMutex_);
-    pendingStatus_.store(status, std::memory_order_release);
+    if (!newerWrite_) {
+      (*window)[instructionOffset] = status;
+      pendingStatus_.store(status, std::memory_order_release);
+    }
   }
+  workerDone_.store(true, std::memory_order_release);
   doneCv_.notify_all();
+}
+
+// A write while the window isn't served (setSleepEmulation()): lost; and
+// asleep, the wake -- unless missWakes() says this one is missed.
+void ExpansionMock::windowWriteUnserved(std::vector<uint8_t>& window, size_t instructionOffset) {
+  sleepWindow_ = &window;
+  sleepInstr_ = instructionOffset;
+  if (sleepTrace())
+    std::printf("ST %10.0fus unserved write, state %d\n", static_cast<double>(emulatedCycles_) * 1e6 / kCpuHz,
+                static_cast<int>(sleepState_));
+  if (sleepState_ == SleepState::PowmanPreparing) {  // latched: CancelPowman() once prepared
+    powmanLatched_ = true;
+    return;
+  }
+  if (sleepState_ != SleepState::Dormant && sleepState_ != SleepState::Powman) return;  // booting
+  if (sleepState_ == SleepState::Dormant &&
+      emulatedCycles_ - sleepEnteredCycles_ < sleepEntryDeafCycles_) {  // still going to sleep
+    deafWrites_++;
+    if (sleepTrace()) std::printf("ST   (deaf: the sleep's entry)\n");
+    return;
+  }
+  if (missWakes_ > 0) {
+    missWakes_--;
+    return;
+  }
+  wakeCount_++;
+  bool powman = sleepState_ == SleepState::Powman;
+  sleepState_ = powman ? SleepState::PowmanBooting : SleepState::DormantWaking;
+  sleepEventCycles_ = emulatedCycles_ + (powman ? kPowmanPowerUpCycles + kPowmanBootCycles : kDormantWakeCycles);
+}
+
+void ExpansionMock::enterSleep(bool powman) {
+  if (sleepTrace())
+    std::printf("ST %10.0fus sleep %s\n", static_cast<double>(emulatedCycles_) * 1e6 / kCpuHz,
+                powman ? "POWMAN" : "DORMANT");
+  sleepCount_++;
+  sleepEnteredCycles_ = emulatedCycles_;
+  sleepRequested_ = false;
+  awaitingFirst_ = false;
+  if (powman) {
+    sleepState_ = SleepState::PowmanPreparing;
+    sleepEventCycles_ = emulatedCycles_ + powmanPrepareCycles_;
+    powmanLatched_ = false;
+    return;
+  }
+  sleepState_ = SleepState::Dormant;
+  uint16_t delay = config_[kConfigPowmanDelay];
+  sleepEventCycles_ = delay == 0xFFFF ? UINT64_MAX : emulatedCycles_ + static_cast<uint64_t>(delay) * 1300000u;
+}
+
+// The emulation thread, every advanceCycles() -- monitor.c's main loop's
+// sleep decision and its wakes.
+void ExpansionMock::stepSleep() {
+  switch (sleepState_) {
+    case SleepState::Awake: {
+      if (!sleepOn_ || !romStagedVerified_ || commandInFlight()) return;
+      uint16_t wait = config_[kConfigSleepWait];
+      uint64_t waitCycles = static_cast<uint64_t>(wait) * 1300u;
+      if (sleepAfterHistory_ && waitCycles < kHistorySleepWaitCycles) waitCycles = kHistorySleepWaitCycles;
+      bool due = sleepRequested_ && wait != 0xFFFF && emulatedCycles_ - sleepRequestedCycles_ >= waitCycles;
+      bool stray = awaitingFirst_ && emulatedCycles_ - wokeCycles_ >= kStrayWakeCycles;
+      if (due || stray) enterSleep(config_[kConfigPowmanDelay] == 0);
+      return;
+    }
+    case SleepState::Dormant:
+      if (emulatedCycles_ >= sleepEventCycles_) {  // POWMANDELAY's n seconds: on to POWMAN
+        sleepState_ = SleepState::PowmanPreparing;
+        sleepEventCycles_ = emulatedCycles_ + powmanPrepareCycles_;
+        powmanLatched_ = false;
+      }
+      return;
+    case SleepState::PowmanPreparing:
+      if (emulatedCycles_ < sleepEventCycles_) return;
+      if (powmanLatched_) {  // CancelPowman(): the bus back, then the wake check's READY
+        powmanCancels_++;
+        if (sleepTrace())
+          std::printf("ST %10.0fus POWMAN cancel\n", static_cast<double>(emulatedCycles_) * 1e6 / kCpuHz);
+        reopenAfterPowmanPrepare();
+        sleepState_ = SleepState::DormantWaking;
+        sleepEventCycles_ = emulatedCycles_ + kDormantWakeCycles;
+        return;
+      }
+      powmanCount_++;
+      sleepState_ = SleepState::Powman;
+      return;
+    case SleepState::Powman:
+      return;
+    case SleepState::DormantWaking:
+    case SleepState::PowmanBooting: {
+      if (emulatedCycles_ < sleepEventCycles_) return;
+      bool boot = sleepState_ == SleepState::PowmanBooting;
+      std::vector<uint8_t>* window = sleepWindow_ ? sleepWindow_ : cmdWindow_;
+      if (window) {
+        if (boot) {  // monitor_init_buffer(): the window as built
+          std::fill(window->begin(), window->end(), 0);
+          std::copy(windowSeed_.begin(), windowSeed_.begin() + (std::min)(windowSeed_.size(), window->size()),
+                    window->begin());
+        }
+      }
+      // The boot's AWAKE is monitor_init_buffer()'s, before anything is
+      // served; DORMANT's is the wake check's WriteStatus(), which a write
+      // already waiting overtakes.
+      if (boot || pendingCmd_ < 0) {
+        std::lock_guard<std::mutex> lock(doneMutex_);
+        if (window) (*window)[sleepWindow_ ? sleepInstr_ : cmdInstr_] = kStatusAwake;
+        pendingStatus_.store(kStatusAwake, std::memory_order_release);
+      }
+      if (boot && !coldBoot_) {
+        answerFromCycles_ = emulatedCycles_ + (kPowmanLoopCycles - kPowmanBootCycles);
+        simulatePowmanWake();  // the channels and the console, as the firmware's boot restores them
+      }
+      sleepState_ = SleepState::Awake;
+      awaitingFirst_ = !coldBoot_;  // only a POWMAN wake waits for its first command (monitor.c)
+      coldBoot_ = false;
+      wokeCycles_ = emulatedCycles_;
+      return;
+    }
+  }
 }
 
 uint8_t ExpansionMock::pollStatusPaced() {
   uint8_t status = pendingStatus_.load(std::memory_order_acquire);
-  if (status != kStatusBusy) return status;
+  if (status != kStatusBusy || !workerActive_) return status;  // queued: nothing to wait on yet
   auto emulated = std::chrono::duration<double>(
       static_cast<double>(emulatedCycles_ - commandStartCycles_) / kCpuHz);
   auto until = commandStartTime_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(emulated);
