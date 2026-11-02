@@ -45,6 +45,8 @@ if(EXISTS "${PC1500_EXPANSION_FIRMWARE_DIR}/keywords.c")
     "${PC1500_EXPANSION_FIRMWARE_DIR}/cmd_history.c"
     # ZIP/1500's console (2026-10-29, EXP_COMMAND_ZTERM)
     "${PC1500_EXPANSION_FIRMWARE_DIR}/zterm.c"
+    # the FL store (2026-11-02): FLSET/FLGET/FLRM/FLLS/FLDF, EXP_COMMAND_FL_*
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/fl_store.c"
     # the clock's time zones (2026-10-08): MCONF TZ, WFCON's SNTP time
     "${PC1500_EXPANSION_FIRMWARE_DIR}/time_zone.c"
     "${PC1500_EXPANSION_FIRMWARE_DIR}/tz_table.c"

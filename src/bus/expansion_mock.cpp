@@ -7,10 +7,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
 #include "basic_xlate.h"
+#include "fl_store.h"
 #include "kbd_seq.h"
 #include "keywords.h"
 #include "plotter.h"
@@ -32,6 +34,15 @@ struct ExpansionMock::ZtermState {
   uint16_t seed = 0x1234;
   std::filesystem::path storyPath;
   uint16_t* config = nullptr;  // the mock's MCONF settings: the console's are there
+  // A prompt's F1 (2026-11-02): the current directory, as zterm_session.c
+  // reads it.
+  std::filesystem::path cwd;
+  struct Entry {
+    std::string name;
+    bool dir;
+    uint64_t size;
+  };
+  std::vector<Entry> dir;
 };
 
 
@@ -434,6 +445,37 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
       }
       return kStatusSuccess;
     }
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+    case kCommandFlGet:
+    case kCommandFlSet:
+    case kCommandFlRm:
+    case kCommandFlList:
+    case kCommandFlInfo: {
+      // the FL store -- the firmware's fl_store.c over flFlash_
+      static const fl_flash_t kFlash = {
+          nullptr,
+          [](void* c, uint32_t off, uint8_t* d, uint32_t n) {
+            auto& f = *static_cast<std::vector<uint8_t>*>(c);
+            if (off + n > f.size()) return false;
+            std::copy(f.begin() + off, f.begin() + off + n, d);
+            return true;
+          },
+          [](void* c, uint32_t off) {
+            auto& f = *static_cast<std::vector<uint8_t>*>(c);
+            std::fill(f.begin() + off, f.begin() + off + FL_SECTOR, 0xFF);
+            return true;
+          },
+          [](void* c, uint32_t off, const uint8_t* d, uint32_t n) {
+            auto& f = *static_cast<std::vector<uint8_t>*>(c);
+            for (uint32_t i = 0; i < n; i++) f[off + i] &= d[i];  // flash: bits only clear
+            return true;
+          },
+      };
+      fl_flash_t flash = kFlash;
+      flash.ctx = &flFlash_;
+      return fl_command(&flash, cmd, window.data());
+    }
+#endif
     case kCommandConfigHostnameGet: {
       std::string name = hostName();
       window[0] = static_cast<uint8_t>(name.size());
@@ -2057,10 +2099,34 @@ uint8_t ExpansionMock::ztermCommand(std::vector<uint8_t>& window) {
       [](void* c, uint8_t id, uint16_t value) {
         if (id == ZT_SETTING_WRAP) static_cast<ZtermState*>(c)->config[kConfigZwrap] = value;
       },
+      [](void* c) -> uint8_t {  // as zterm_session.c: the directory, in listing order
+        auto* z = static_cast<ZtermState*>(c);
+        z->dir.clear();
+        std::error_code ec;
+        for (const auto& e : fs::directory_iterator(z->cwd, ec)) {
+          if (z->dir.size() >= 255) break;
+          bool isDir = e.is_directory();
+          if (!isDir && !e.is_regular_file()) continue;
+          std::string name = e.path().filename().string();
+          if (name.size() > 16) continue;
+          z->dir.push_back({name, isDir, isDir ? 0 : static_cast<uint64_t>(e.file_size(ec))});
+        }
+        return static_cast<uint8_t>(z->dir.size());
+      },
+      [](void* c, uint8_t i, uint8_t* line, uint8_t* nameLen) {
+        auto* z = static_cast<ZtermState*>(c);
+        const auto& e = z->dir[i];
+        std::memset(line, ' ', ZT_WIDTH);
+        std::memcpy(line, e.name.data(), e.name.size());
+        std::string size = e.dir ? "<DIR>" : std::to_string(e.size);
+        if (size.size() <= ZT_WIDTH - 16) std::memcpy(line + ZT_WIDTH - size.size(), size.data(), size.size());
+        *nameLen = static_cast<uint8_t>(e.name.size());
+      },
   };
   zt_store_t store = kStore;
   store.ctx = &z;
   z.config = config_;
+  z.cwd = currentDir_;
   if (window[0] == kZtermOpen) {  // the story's path, for a POWMAN wake
     uint8_t channel = window[1];
     z.storyPath.clear();
@@ -2069,7 +2135,10 @@ uint8_t ExpansionMock::ztermCommand(std::vector<uint8_t>& window) {
   }
   static const bool log = std::getenv("ZTERMLOG") != nullptr;
   if (log) std::fprintf(stderr, "ZTERM %u %02X %02X %02X\n", window[0], window[1], window[2], window[3]);
+  bool open = window[0] == kZtermOpen;
   uint8_t status = zterm_command(&z.zt, &store, window.data());
+  if (open && status == kStatusSuccess)  // FILE's first name, as zterm_session.c
+    zterm_default_save_name(&z.zt, z.storyPath.string().c_str());
   if (log && window.size() > 40)
     std::fprintf(stderr, "  -> %02X state %u \"%.26s\" len %u\n", status, window[0],
                  reinterpret_cast<const char*>(window.data() + 1), window[27]);
@@ -2129,7 +2198,11 @@ void ExpansionMock::reopenAfterPowmanPrepare() {
 #endif
 }
 
-ExpansionMock::ExpansionMock() = default;
+ExpansionMock::ExpansionMock() {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  fl_forget();  // fl_store.c's copy is a global: this mock's flash is new
+#endif
+}
 
 ExpansionMock::~ExpansionMock() {
   if (worker_.joinable()) worker_.join();
@@ -2280,6 +2353,11 @@ void ExpansionMock::simulateColdBoot(bool keepStaged) {
   romImage_ = romImageBuilt_;
   for (int i = 0; i < kMaxSdChannels; i++)
     if (channels_[i].isOpen) closeSdChannelAt(i);
+  if (zterm_) zterm_->zt.open = false;  // ZIP's console is in RAM; only a POWMAN wake resumes it
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  fl_forget();  // the FL store is read from flash again
+#endif
+  currentDir_ = rootDir_;  // FatFs mounts afresh at the root
   if (!keepStaged) {
     remapActive_ = false;
     romStagedVerified_ = false;

@@ -448,6 +448,11 @@ class ExpansionMock {
   // by a fake peer (below) instead of a radio.
   static constexpr uint8_t kCommandConfigHostnameGet = 0x35;  // MCONF HOSTNAME
   static constexpr uint8_t kCommandConfigHostnameSet = 0x36;
+  static constexpr uint8_t kCommandFlGet = 0x7E;  // the FL store (2026-11-02, fl_store.h)
+  static constexpr uint8_t kCommandFlSet = 0x7F;
+  static constexpr uint8_t kCommandFlRm = 0x80;
+  static constexpr uint8_t kCommandFlList = 0x82;
+  static constexpr uint8_t kCommandFlInfo = 0x83;
   static constexpr uint8_t kCommandBleScan = 0x40;
   static constexpr uint8_t kCommandBleConnect = 0x41;
   static constexpr uint8_t kCommandBleConnectName = 0x42;
@@ -1080,6 +1085,7 @@ class ExpansionMock {
   mutable std::mutex bleBackendMutex_;
   std::shared_ptr<BleBackend> bleBackend_;
   std::string hostName_ = "PC-1500 EMU";  // the firmware's default is "PC-1500"
+  std::vector<uint8_t> flFlash_ = std::vector<uint8_t>(8192, 0xFF);  // the FL store's two sectors (kept across simulateColdBoot())
   // slot 0: function keys (1 sector), slot 1: state (9 sectors) -- sizes as
   // in the firmware's flash_layout.h; erased flash reads 0xFF
   std::vector<uint8_t> stores_[2] = {std::vector<uint8_t>(4096, 0xFF), std::vector<uint8_t>(9 * 4096, 0xFF)};
