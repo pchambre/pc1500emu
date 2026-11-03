@@ -4074,8 +4074,8 @@ void testMconfShowsAndSetsSettings() {
   CHECK(shown(0x8002 + 7 * 30) == "HISTORY=1");  // 2026-10-07, on by default
   CHECK(shown(0x8002 + 8 * 30) == "BRIDGEINT=0");
   CHECK(shown(0x8002 + 9 * 30) == "TIMESYNC=1");  // 2026-10-08, on by default
-  CHECK(shown(0x8002 + 10 * 30) == "ZWRAP=1");  // 2026-11-01, ZIP's word wrap, on by default
-  CHECK(shown(0x8002 + 11 * 30) == "HOSTNAME=KITCHEN");
+  CHECK(shown(0x8002 + 10 * 30) == "BLDISP=0");  // every build since 2026-11-02 (ZIP's mirror), off by default
+  CHECK(shown(0x8002 + 11 * 30) == "HOSTNAME=KITCHEN");  // (ZWRAP: the FL store's since 2026-11-03)
   CHECK(shown(0x8002 + 12 * 30) == "TZ=UTC");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
@@ -5240,12 +5240,14 @@ static void sleepOn(BleFixture& f, uint16_t powmanDelay);
 // SDLOAD M "ZIP", ZORK1.Z3 at its GAME FILE prompt. It's waiting for its
 // first command. With
 // sleep >= 0: STAGE RAM first and the dongle's sleep model on, POWMANDELAY
-// = sleep (0xFFFF: DORMANT only).
-static std::unique_ptr<ZipGame> zipStart(const char* testName, const std::string& story, int sleep = -1) {
+// = sleep (0xFFFF: DORMANT only). setup: at BASIC first (e.g. BLCON).
+static std::unique_ptr<ZipGame> zipStart(const char* testName, const std::string& story, int sleep = -1,
+                                         const std::function<void(BleFixture&)>& setup = nullptr) {
   auto g = std::make_unique<ZipGame>();
   g->f = bleFixture(testName, 0x4000, 0x2800, sleep >= 0);
   if (!g->f) return nullptr;
   if (sleep >= 0) sleepOn(*g->f, static_cast<uint16_t>(sleep));
+  if (setup) setup(*g->f);
   fs::path zip = fs::path(kZipDir) / "ZIP";
   fs::path src = fs::path(kZipDir) / "tests" / story;
   if (!fs::exists(zip) || !fs::exists(src)) {
@@ -5357,7 +5359,7 @@ static uint16_t zipLabel(const std::string& text) {  // its address, from zip.rs
 // ZIP/1500's console, milestone 2 (2026-11-01, zterm.c): F1 shows the
 // status lines -- the location, then the score and moves -- and back; any
 // other key there only goes back. F2 is the settings menu: word wrap, kept
-// as MCONF ZWRAP. With wrap off a line is up to 80 characters and < and >
+// in the FL store as ZWRAP. With wrap off a line is up to 80 characters and < and >
 // move along it while reading; turning it back on rewraps the scrollback.
 void testZipConsoleKeys() {
   auto g = zipStart("testZipConsoleKeys", "zork1.z3");
@@ -5386,10 +5388,10 @@ void testZipConsoleKeys() {
   press(pc1500::Key::F1);
   CHECK(press(pc1500::Key::X) == text);
 
-  // F2: the menu; ENTER turns word wrap off (MCONF ZWRAP 0); F2 leaves.
+  // F2: the menu; ENTER turns word wrap off (ZWRAP 0); F2 leaves.
   CHECK(starts(press(pc1500::Key::F2), "Word wrap: on"));
   CHECK(starts(press(pc1500::Key::Ent), "Word wrap: off"));
-  CHECK(mock.configValue(pc1500::ExpansionMock::kConfigZwrap) == 0);
+  CHECK(!mock.flFlag("ZWRAP", true));
   press(pc1500::Key::F2);
 
   // Wrap off: the opening's long line is one line (to 80); > and < move along it.
@@ -5407,7 +5409,7 @@ void testZipConsoleKeys() {
   // Wrap on again: the same line, now 26 wide.
   press(pc1500::Key::F2);
   CHECK(starts(press(pc1500::Key::Right), "Word wrap: on"));
-  CHECK(mock.configValue(pc1500::ExpansionMock::kConfigZwrap) == 1);
+  CHECK(mock.flFlag("ZWRAP", false));
   CHECK(starts(press(pc1500::Key::Cl), "You are standing in an  "));
 
   // And the game goes on.
@@ -5600,6 +5602,266 @@ void testFlStore() {
   CHECK(c() == 0x0000);
 }
 
+// Milestone 4 (2026-11-02): with a link and MCONF BLDISP=1 the game goes to
+// the app's Screen pane as DISPLAY records (zterm.c's mirror). Played here
+// as the app plays them: the screen they make is the transcript, lines at
+// most 80 wide, the prompt and what's typed as EDIT, the status lines as
+// GAME; small frames make the same screen; a new link starts with the last
+// 3K of the screen's records; BREAK closes the game and hides the status.
+void testZipMirror() {
+  auto g = zipStart("testZipMirror", "zork1.z3", -1, [](BleFixture& f) {
+    CHECK(f.run("MCONF BLDISP=1") == 0);
+    f.connect();
+  });
+  if (!g) return;
+  auto* mock = g->f->mock;
+  struct Screen {
+    std::vector<std::string> lines;
+    std::string edit;
+    int cursor = -2;  // -2: no EDIT
+    std::string location, score;
+    bool game = false;
+    int clears = 0, records = 0;
+    bool longLine = false;
+  };
+  auto play = [](const std::vector<std::vector<uint8_t>>& payloads, Screen& s) {
+    for (const auto& p : payloads)
+      for (size_t at = 0; at + 2 <= p.size();) {
+        uint8_t kind = p[at], len = p[at + 1];
+        CHECK(at + 2 + len <= p.size());
+        std::string text(p.begin() + static_cast<long>(at) + 2, p.begin() + static_cast<long>(at) + 2 + len);
+        s.records++;
+        if (kind == 4) {
+          s.lines.clear();
+          s.cursor = -2;
+          s.clears++;
+        } else if (kind == 2) {
+          s.lines.push_back(text);
+          s.longLine |= text.size() > 80;
+          s.cursor = -2;
+        } else if (kind == 3) {
+          s.cursor = static_cast<int8_t>(text[0]);
+          s.edit = text.substr(1);
+        } else if (kind == 6) {
+          s.game = len > 0;
+          if (s.game) {
+            uint8_t n = static_cast<uint8_t>(text[0]);
+            s.location = text.substr(1, n);
+            s.score = text.substr(1 + n);
+          }
+        }
+        at += 2 + len;
+      }
+  };
+  // The screen's text against the transcript, line breaks and wrapping's
+  // spaces aside
+  auto squash = [](std::string t) {
+    t.erase(std::remove_if(t.begin(), t.end(), [](char c) { return c == ' ' || c == '\r' || c == '\n'; }), t.end());
+    return t;
+  };
+  auto shown = [&](const Screen& s) {
+    std::string t;
+    for (const auto& l : s.lines) t += l;
+    if (s.cursor != -2) t += s.edit;
+    return squash(t);
+  };
+
+  Screen s;
+  play(mock->bleDisplay(), s);
+  CHECK(s.clears >= 1);  // GAME FILE's console, then the game's
+  CHECK(shown(s) == squash(mock->ztermTranscript()));
+  CHECK(s.cursor == static_cast<int>(s.edit.size()) && s.edit == ">");  // the prompt, nothing typed
+  CHECK(s.game && s.location == "West of House" && s.score.rfind("Score: 0", 0) == 0);
+
+  CHECK(g->command("OPEN MAILBOX"));
+  g->keyAction(pc1500::Key::Ent, false, pc1500::basic::kIdleFrames);  // the turn's ENTER let go first
+  g->type("REA");
+  CHECK(g->settle());
+  s = Screen{};
+  play(mock->bleDisplay(), s);
+  CHECK(s.edit == ">REA" && s.cursor == 4);
+  CHECK(!s.longLine);
+  CHECK(shown(s) == squash(mock->ztermTranscript() + "REA"));
+  CHECK(g->command("D LEAFLET"));
+  for (int i = 0; i < 60 && mock->ztermTranscript().size() < 3500; i++) CHECK(g->command("LOOK"));  // past 3K
+  s = Screen{};
+  play(mock->bleDisplay(), s);
+  CHECK(shown(s) == squash(mock->ztermTranscript()));
+  CHECK(s.score.find("Moves: ") != std::string::npos);
+
+  // Small frames: the same screen, more of them
+  size_t frames = mock->bleDisplay().size();
+  mock->clearBleDisplay();
+  mock->setBleDisplayMax(100);
+  mock->simulateBleRelink();
+  CHECK(g->command("LOOK"));
+  for (const auto& p : mock->bleDisplay()) CHECK(p.size() <= 100);
+  CHECK(mock->bleDisplay().size() > 3);
+  (void)frames;
+
+  // A new link: the last 3K, from a line's start
+  Screen c;
+  play(mock->bleDisplay(), c);
+  CHECK(c.clears == 1);
+  std::string t = mock->ztermTranscript();
+  std::string caught;
+  for (const auto& l : c.lines) caught += l;
+  CHECK(squash(caught).size() <= 3072);
+  CHECK(squash(t).size() > squash(caught).size());
+  CHECK(squash(t).size() >= squash(caught + c.edit).size() &&
+        squash(t).compare(squash(t).size() - squash(caught + c.edit).size(), std::string::npos,
+                          squash(caught + c.edit)) == 0);
+  CHECK(t.size() > 3072);
+  // (2026-11-03: the catch-up is screen.c's, the last 3K of the records it
+  // keeps -- whole lines as the mirror wrapped them, not the transcript's.)
+  CHECK(!c.lines.empty() && t.find(c.lines[0]) != std::string::npos);
+
+  // BLDISP=0: nothing more
+  mock->clearBleDisplay();
+  mock->setConfigValue(pc1500::ExpansionMock::kConfigBldisp, 0);
+  CHECK(g->command("LOOK"));
+  CHECK(mock->bleDisplay().empty());
+  mock->setConfigValue(pc1500::ExpansionMock::kConfigBldisp, 1);
+
+  // BREAK: the game closed -- its last text, and the status lines gone
+  CHECK(g->command("LOOK"));
+  mock->clearBleDisplay();
+  g->keyAction(pc1500::Key::Ent, false, pc1500::basic::kIdleFrames);
+  g->f->m->cpu.pressOnKey();
+  g->f->m->bus.ioPort().setOnKeyLine(true);
+  g->f->m->cpu.requestMI();
+  g->f->m->bus.ioPort().setOnKeyLine(false);
+  g->keyAction(pc1500::Key::Ent, false, 60);  // (KEYSCAN_WAIT halts where BASIC idles: run on)
+  Screen b;
+  b.game = true;
+  play(mock->bleDisplay(), b);
+  CHECK(b.records > 0 && !b.game);
+}
+
+// The Screen pane (2026-11-03): BASIC's own screen, from its text buffers
+// on the bus (screen.c, fed by Bus::writeME0 as GreenPAK2 IO12 feeds the
+// MCU) -- a line as entered, PRINT's output, a listing the module ROM
+// draws itself, CLS typed; nothing with BLDISP=0; a new link gets the
+// history.
+void testScreenBasic() {
+  auto f = bleFixture("testScreenBasic");
+  if (!f) return;
+  CHECK(f->run("MCONF BLDISP=1") == 0);
+  f->connect();
+  auto settle = [&] {  // past the 20 ms a burst of writes takes to count as settled
+    for (int i = 0; i < 40000; i++) stepOne(*f->m);
+  };
+  auto trim = [](std::string t) {
+    t.erase(0, t.find_first_not_of(' '));
+    return t;
+  };
+  auto records = [&] {
+    std::vector<std::pair<int, std::string>> r;
+    for (const auto& p : f->mock->bleDisplay())
+      for (size_t at = 0; at + 2 <= p.size(); at += 2u + p[at + 1])
+        r.push_back({p[at], trim(std::string(p.begin() + static_cast<long>(at) + 2,
+                                             p.begin() + static_cast<long>(at) + 2 + p[at + 1]))});
+    return r;
+  };
+  auto has = [&](int kind, const std::string& text) {
+    for (const auto& [k, t] : records())
+      if (k == kind && t == text) return true;
+    for (const auto& [k, t] : records()) std::printf("    record %d \"%s\"\n", k, t.c_str());
+    return false;
+  };
+  auto count = [&](int kind) {
+    int n = 0;
+    for (const auto& r : records()) n += r.first == kind;
+    return n;
+  };
+  settle();
+  f->mock->clearBleDisplay();
+  CHECK(f->run("A=7*6") == 0);
+  settle();
+  CHECK(has(1, "A=7*6"));
+  CHECK(f->run("PRINT A") == 0);
+  settle();
+  CHECK(has(2, "42"));
+
+  f->mock->clearBleDisplay();
+  CHECK(f->run("SDLS") == 0);
+  settle();
+  CHECK(count(2) >= 1);  // the listing, every row of it, and its summary
+  f->key(pc1500::Key::Cl);
+
+  f->mock->clearBleDisplay();
+  CHECK(f->run("CLS") == 0);  // back at the prompt a few ms after ENTER: before it settles
+  settle();
+  CHECK(count(4) == 1);
+
+  // BLDISP=0: nothing; on again: from nothing
+  CHECK(f->run("MCONF BLDISP=0") == 0);
+  settle();
+  f->mock->clearBleDisplay();
+  CHECK(f->run("PRINT 5") == 0);
+  settle();
+  CHECK(f->mock->bleDisplay().empty());
+  CHECK(f->run("MCONF BLDISP=1") == 0);
+  CHECK(f->run("PRINT 9") == 0);
+  settle();
+  CHECK(has(2, "9"));
+
+  // A new link: CLEAR, then what's kept
+  f->mock->clearBleDisplay();
+  f->mock->simulateBleRelink();
+  settle();
+  auto r = records();
+  CHECK(!r.empty() && r[0].first == 4);
+  CHECK(has(2, "9"));
+  bool five = false;  // PRINT 5 was with BLDISP=0
+  for (const auto& x : r) five |= x.first == 2 && x.second == "5";
+  CHECK(!five);
+}
+
+// The Screen pane through a SAVE and a RESTORE (2026-11-03: the user saw
+// the mirror stop after a RESTORE on hardware): the pane still follows the
+// transcript afterwards.
+void testZipMirrorRestore() {
+  auto g = zipStart("testZipMirrorRestore", "zork1.z3", -1, [](BleFixture& f) {
+    CHECK(f.run("MCONF BLDISP=1") == 0);
+    f.connect();
+  });
+  if (!g) return;
+  auto* mock = g->f->mock;
+  auto squash = [](std::string t) {
+    t.erase(std::remove_if(t.begin(), t.end(), [](char c) { return c == ' ' || c == '\r' || c == '\n'; }), t.end());
+    return t;
+  };
+  auto text = [&]() {  // the OUTPUT and EDIT records so far, as the pane shows them
+    std::string lines, edit;
+    for (const auto& p : mock->bleDisplay())
+      for (size_t at = 0; at + 2 <= p.size(); at += 2u + p[at + 1]) {
+        std::string t(p.begin() + static_cast<long>(at) + 2, p.begin() + static_cast<long>(at) + 2 + p[at + 1]);
+        if (p[at] == 4) lines.clear(), edit.clear();
+        if (p[at] == 2) lines += t, edit.clear();
+        if (p[at] == 3) edit = t.substr(1);
+      }
+    return squash(lines + edit);
+  };
+  auto transcript = [&]() { return squash(mock->ztermTranscript()); };
+  auto file = [&](const char* command) {
+    CHECK(g->command(command));
+    g->keyAction(pc1500::Key::Ent, false, pc1500::basic::kIdleFrames);
+    g->tap(pc1500::Key::Ent);
+    CHECK(g->settle());
+  };
+  CHECK(g->command("OPEN MAILBOX"));
+  file("SAVE");
+  CHECK(text() == transcript());
+  CHECK(g->command("TAKE LEAFLET"));
+  file("RESTORE");
+  CHECK(g->transcript().find("Restore from: ZORK1.SAV\nOk.\n") != std::string::npos);
+  CHECK(text() == transcript());
+  CHECK(g->command("INVENTORY"));
+  CHECK(text() == transcript());
+  if (text() != transcript()) std::printf("  pane:\n%s\n  transcript:\n%s\n", text().c_str(), transcript().c_str());
+}
+
 // A power cycle mid-game (2026-11-02): the PC-1500's RAM and the game
 // survive, the MCU starts afresh -- no story channel, no console. ZIP
 // reopens both from the path it kept, says so, and the key goes on.
@@ -5633,16 +5895,21 @@ void testZipPowerCycle() {
   if (!has("A leaflet")) std::printf("  transcript:\n%s\n", g->transcript().c_str());
 }
 
-// MCONF ZWRAP, the console's word wrap from BASIC (BASIC tokenizes its own
-// keywords inside an argument, so a new name is worth a run).
-void testMconfZwrap() {
-  auto f = bleFixture("testMconfZwrap");
+// ZWRAP, the console's word wrap from BASIC (2026-11-03): an FL store
+// value, not an MCONF setting -- on with none, any number but 0 is on.
+void testFlZwrap() {
+  auto f = bleFixture("testFlZwrap");
   if (!f) return;
-  CHECK(f->run("MCONF ZWRAP=0") == 0);
-  CHECK(f->mock->configValue(pc1500::ExpansionMock::kConfigZwrap) == 0);
-  CHECK(f->run("MCONF ZWRAP=1") == 0);
-  CHECK(f->mock->configValue(pc1500::ExpansionMock::kConfigZwrap) == 1);
-  CHECK(f->run("MCONF ZWRAP=2") == 1);
+  CHECK(f->mock->flFlag("ZWRAP", true));  // none: the default
+  CHECK(f->run("FLSET \"ZWRAP\",0") == 0);
+  CHECK(!f->mock->flFlag("ZWRAP", true));
+  CHECK(f->run("FLSET \"ZWRAP\",1") == 0);
+  CHECK(f->mock->flFlag("ZWRAP", false));
+  CHECK(f->run("FLSET \"ZWRAP\",LEN(\"AB\")") == 0);  // a binary number, as LEN leaves it
+  CHECK(f->mock->flFlag("ZWRAP", false));
+  CHECK(f->run("FLSET \"ZWRAP\",\"NO\"") == 0);  // a string: the default
+  CHECK(f->mock->flFlag("ZWRAP", true) && !f->mock->flFlag("ZWRAP", false));
+  CHECK(f->run("MCONF ZWRAP=0") != 0);  // not an MCONF setting
 }
 
 // The codes KEYSCAN_WAIT hands ZIP for the keys the console may use
@@ -7905,9 +8172,12 @@ int main(int argc, char** argv) {
   RUN(testZipConsoleKeys);
   RUN(testZipSaveRestore);
   RUN(testZipGamePrompt);
+  RUN(testZipMirror);
+  RUN(testZipMirrorRestore);
+  RUN(testScreenBasic);
   RUN(testFlStore);
   RUN(testZipPowerCycle);
-  RUN(testMconfZwrap);
+  RUN(testFlZwrap);
   RUN(testZipTypingSpeed);
   RUN(testZipKeyCodes);
   RUN(testBlePrintText);

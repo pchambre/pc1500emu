@@ -86,6 +86,9 @@ class LinkCore : public BleBackend {
   uint8_t close() override;
   void setName(const std::string& name) override;
   bool hostTime(int64_t* utcMs, int32_t* offsetS) override;
+  uint32_t session() override;
+  int display(const std::vector<uint8_t>& payload) override;
+  size_t displayMax() override { return plainMax() - 4; }
 
   // The UI's controls and views.
   bool setAdvertising(bool on);

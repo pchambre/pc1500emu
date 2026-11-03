@@ -37,6 +37,17 @@ class BleBackend {
     (void)utcMs, (void)offsetS;
     return false;
   }
+
+  // ZIP's mirror (2026-11-02, RP2350/zterm_session.h, as ble_link.h's):
+  // 0 with no link up, else a number different for every link; a DISPLAY
+  // payload to the peer -- 1 sent, 0 no link (or the peer has no screen),
+  // -1 it failed -- and the largest one.
+  virtual uint32_t session() { return 0; }
+  virtual int display(const std::vector<uint8_t>& payload) {
+    (void)payload;
+    return 0;
+  }
+  virtual size_t displayMax() { return 0; }
 };
 
 }  // namespace pc1500

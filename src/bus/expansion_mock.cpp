@@ -16,11 +16,16 @@
 #include "kbd_seq.h"
 #include "keywords.h"
 #include "plotter.h"
+#include "screen.h"
 #include "time_zone.h"
 #include "zterm.h"
 #endif
 
 namespace pc1500 {
+
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+static fl_flash_t flStore(std::vector<uint8_t>& sectors);
+#endif
 
 // ZIP/1500's console: the firmware's zterm.c over a vector for the
 // transcript. The session record a POWMAN sleep keeps is zt itself plus the
@@ -29,11 +34,14 @@ struct ExpansionMock::ZtermState {
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
   zterm_t zt{};
   zterm_t saved{};
+  // The game to the Screen pane (screen.c), as zterm_session.c
+  zt_mirror_t mirror{}, mirrorPending{};
+  uint32_t mirrorGen = 0;
 #endif
   std::vector<uint8_t> text;
   uint16_t seed = 0x1234;
   std::filesystem::path storyPath;
-  uint16_t* config = nullptr;  // the mock's MCONF settings: the console's are there
+  std::vector<uint8_t>* flFlash = nullptr;  // the FL store's: the console's settings are there
   // A prompt's F1 (2026-11-02): the current directory, as zterm_session.c
   // reads it.
   std::filesystem::path cwd;
@@ -452,27 +460,7 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandFlList:
     case kCommandFlInfo: {
       // the FL store -- the firmware's fl_store.c over flFlash_
-      static const fl_flash_t kFlash = {
-          nullptr,
-          [](void* c, uint32_t off, uint8_t* d, uint32_t n) {
-            auto& f = *static_cast<std::vector<uint8_t>*>(c);
-            if (off + n > f.size()) return false;
-            std::copy(f.begin() + off, f.begin() + off + n, d);
-            return true;
-          },
-          [](void* c, uint32_t off) {
-            auto& f = *static_cast<std::vector<uint8_t>*>(c);
-            std::fill(f.begin() + off, f.begin() + off + FL_SECTOR, 0xFF);
-            return true;
-          },
-          [](void* c, uint32_t off, const uint8_t* d, uint32_t n) {
-            auto& f = *static_cast<std::vector<uint8_t>*>(c);
-            for (uint32_t i = 0; i < n; i++) f[off + i] &= d[i];  // flash: bits only clear
-            return true;
-          },
-      };
-      fl_flash_t flash = kFlash;
-      flash.ctx = &flFlash_;
+      fl_flash_t flash = flStore(flFlash_);
       return fl_command(&flash, cmd, window.data());
     }
 #endif
@@ -814,9 +802,109 @@ uint8_t ExpansionMock::closeSdFile(std::vector<uint8_t>& window) {
   return kStatusSuccess;
 }
 
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+// The FL store's flash over a mock's flFlash_, as monitor.c's kFlFlash.
+static fl_flash_t flStore(std::vector<uint8_t>& sectors) {
+  static const fl_flash_t kFlash = {
+      nullptr,
+      [](void* c, uint32_t off, uint8_t* d, uint32_t n) {
+        auto& f = *static_cast<std::vector<uint8_t>*>(c);
+        if (off + n > f.size()) return false;
+        std::copy(f.begin() + off, f.begin() + off + n, d);
+        return true;
+      },
+      [](void* c, uint32_t off) {
+        auto& f = *static_cast<std::vector<uint8_t>*>(c);
+        std::fill(f.begin() + off, f.begin() + off + FL_SECTOR, 0xFF);
+        return true;
+      },
+      [](void* c, uint32_t off, const uint8_t* d, uint32_t n) {
+        auto& f = *static_cast<std::vector<uint8_t>*>(c);
+        for (uint32_t i = 0; i < n; i++) f[off + i] &= d[i];  // flash: bits only clear
+        return true;
+      },
+  };
+  fl_flash_t flash = kFlash;
+  flash.ctx = &sectors;
+  return flash;
+}
+#endif
+
+bool ExpansionMock::flFlag(const std::string& key, bool dflt) {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  fl_flash_t flash = flStore(flFlash_);
+  return fl_get_flag(&flash, key.c_str(), dflt);
+#else
+  (void)key;
+  return dflt;
+#endif
+}
+
 void ExpansionMock::resetKeywords() {
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
   kw_reset();
+#endif
+  screenReset();
+}
+
+// ---- The Screen pane (2026-11-03): screen.c's backend, as screen_watch.c ----
+
+void ExpansionMock::screenReset() {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  screen_backend_t b{};
+  b.ctx = this;
+  b.session = [](void* c) -> uint32_t {
+    auto* m = static_cast<ExpansionMock*>(c);
+    auto ble = m->bleBackend();
+    return ble ? ble->session() : m->bleConnected_ ? m->bleLinks_ : 0;
+  };
+  b.display = [](void* c, const uint8_t* p, uint16_t n) -> int {
+    auto* m = static_cast<ExpansionMock*>(c);
+    std::vector<uint8_t> payload(p, p + n);
+    auto ble = m->bleBackend();
+    if (ble) return ble->display(payload);
+    m->bleDisplay_.push_back(std::move(payload));
+    return 1;
+  };
+  b.display_max = [](void* c) -> uint16_t {
+    auto* m = static_cast<ExpansionMock*>(c);
+    auto ble = m->bleBackend();
+    return static_cast<uint16_t>(std::min<size_t>(ble ? ble->displayMax() : m->bleDisplayMax_, 256));
+  };
+  b.enabled = [](void* c) { return static_cast<ExpansionMock*>(c)->config_[kConfigBldisp] != 0; };
+  b.now_us = [](void* c) {
+    return static_cast<uint32_t>(static_cast<double>(static_cast<ExpansionMock*>(c)->emulatedCycles_) * 1e6 / kCpuHz);
+  };
+  b.rom_byte = [](void* c, uint16_t addr) -> int {  // romImage_ starts at 8800H
+    auto* m = static_cast<ExpansionMock*>(c);
+    if (addr < 0x8800 || static_cast<size_t>(addr - 0x8800) >= m->romImage_.size()) return -1;
+    return m->romImage_[addr - 0x8800];
+  };
+  b.lock = [](void* c) { static_cast<ExpansionMock*>(c)->screenMutex_.lock(); };
+  b.unlock = [](void* c) { static_cast<ExpansionMock*>(c)->screenMutex_.unlock(); };
+  screen_init(&b);
+#endif
+}
+
+void ExpansionMock::screenPoll() {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  std::unique_lock<std::mutex> one(screenPollMutex_, std::try_to_lock);
+  if (!one.owns_lock()) return;  // the other thread is sending: it takes this too
+  for (int i = 0; i < 64 && screen_poll(); i++) {
+  }
+#endif
+}
+
+void ExpansionMock::screenWrite(uint16_t addr, uint8_t value) {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  if (!windowServed()) return;  // asleep: the PIO stopped with the clocks
+  static const bool log = std::getenv("SCREENLOG") != nullptr;  // BASIC's buffers' writes, timed in ms
+  if (log && (addr >= 0x7B60 || (addr >= 0x787E && addr <= 0x7880)))
+    std::fprintf(stderr, "W %04X %02X @%llu\n", addr, value, static_cast<unsigned long long>(emulatedCycles_ / 1300));
+  screen_watch_write(addr, value);
+#else
+  (void)addr;
+  (void)value;
 #endif
 }
 
@@ -1045,6 +1133,7 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
   if (auto ble = bleBackend()) return ble->command(cmd, window);  // a real link
   auto connected = [&](const std::string& name) {
     bleConnected_ = true;
+    bleLinks_++;
     bleLastHost_ = name;
     bleLinkedName_ = name;
     bleInbox_.clear();  // a new link empties the inbox (BLE_PROTOCOL.md)
@@ -1191,6 +1280,7 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       // Each check is a POLL of the waiting keyword: the peer's countdowns.
       if (bleAdvertising_ && bleConnectAfter_ >= 0 && bleConnectAfter_-- == 0) {
         bleConnected_ = true;
+        bleLinks_++;
         bleLinkedName_ = bleConnectName_;
         bleAdvertising_ = false;
         bleInbox_.clear();
@@ -1303,6 +1393,9 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
     case kCommandBleDisplayClear:  // a DISPLAY CLEAR record to the peer
       if (!bleConnected_) return fail(0);
       bleScreenClears_++;
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+      screen_clear();
+#endif
       return kStatusSuccess;
     case kCommandBleMsgCount:
       bleDeliver();
@@ -2092,12 +2185,13 @@ uint8_t ExpansionMock::ztermCommand(std::vector<uint8_t>& window) {
         return pos < t.size() ? t[pos] : 0;
       },
       [](void* c) -> uint16_t { return static_cast<ZtermState*>(c)->seed; },
-      [](void* c, uint8_t id) -> uint16_t {  // as zterm_session.c: MCONF ZWRAP
-        auto* z = static_cast<ZtermState*>(c);
-        return id == ZT_SETTING_WRAP ? z->config[kConfigZwrap] : 0;
+      [](void* c, uint8_t id) -> uint16_t {  // as zterm_session.c: the FL store's ZWRAP
+        fl_flash_t flash = flStore(*static_cast<ZtermState*>(c)->flFlash);
+        return id == ZT_SETTING_WRAP ? fl_get_flag(&flash, ZT_WRAP_KEY, true) : 0;
       },
       [](void* c, uint8_t id, uint16_t value) {
-        if (id == ZT_SETTING_WRAP) static_cast<ZtermState*>(c)->config[kConfigZwrap] = value;
+        fl_flash_t flash = flStore(*static_cast<ZtermState*>(c)->flFlash);
+        if (id == ZT_SETTING_WRAP) fl_set_flag(&flash, ZT_WRAP_KEY, value != 0);
       },
       [](void* c) -> uint8_t {  // as zterm_session.c: the directory, in listing order
         auto* z = static_cast<ZtermState*>(c);
@@ -2125,7 +2219,7 @@ uint8_t ExpansionMock::ztermCommand(std::vector<uint8_t>& window) {
   };
   zt_store_t store = kStore;
   store.ctx = &z;
-  z.config = config_;
+  z.flFlash = &flFlash_;
   z.cwd = currentDir_;
   if (window[0] == kZtermOpen) {  // the story's path, for a POWMAN wake
     uint8_t channel = window[1];
@@ -2142,6 +2236,20 @@ uint8_t ExpansionMock::ztermCommand(std::vector<uint8_t>& window) {
   if (log && window.size() > 40)
     std::fprintf(stderr, "  -> %02X state %u \"%.26s\" len %u\n", status, window[0],
                  reinterpret_cast<const char*>(window.data() + 1), window[27]);
+  // The game to the screen, as zterm_session.c's to_screen().
+  uint32_t gen = screen_generation();
+  if (gen != z.mirrorGen) {
+    zterm_mirror_restart(&z.mirror);
+    z.mirrorGen = gen;
+  }
+  screen_watch_mute(z.zt.open);
+  std::vector<uint8_t> payload(256);
+  while (uint16_t n = zterm_mirror_next(&z.mirror, &z.mirrorPending, &z.zt, &store, payload.data(),
+                                        static_cast<uint16_t>(payload.size()))) {
+    screen_records(payload.data(), n);
+    zterm_mirror_sent(&z.mirror, &z.mirrorPending);
+  }
+  screenPoll();
   return status;
 #else
   (void)window;
@@ -2185,6 +2293,7 @@ void ExpansionMock::reopenAfterPowmanPrepare() {
   z.saved = z.zt;               // the session record, written before the sleep
   zterm_init(&z.zt);            // the RAM state, gone
   z.zt = z.saved;               // ...and read back at the wake
+  screen_watch_mute(z.zt.open); // zterm_session_resume()
   if (z.zt.open && !z.storyPath.empty() && z.zt.story_channel >= 1 && z.zt.story_channel <= kMaxSdChannels &&
       !channels_[z.zt.story_channel - 1].isOpen) {
     SdChannel& ch = channels_[z.zt.story_channel - 1];
@@ -2202,6 +2311,7 @@ ExpansionMock::ExpansionMock() {
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
   fl_forget();  // fl_store.c's copy is a global: this mock's flash is new
 #endif
+  screenReset();  // screen.c's too
 }
 
 ExpansionMock::~ExpansionMock() {

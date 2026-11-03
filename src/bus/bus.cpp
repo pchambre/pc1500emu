@@ -494,6 +494,14 @@ uint8_t Bus::readME0(uint16_t addr) {
 
 void Bus::writeME0(uint16_t addr, uint8_t value) {
   lastAccessedSpace_ = MemorySpace::ME0;
+  // GreenPAK2 IO12 (2026-11-03): an expansion module sees every write to
+  // 7000H-7FFFH -- BASIC's text buffers, for the Screen pane (screen.h).
+  if (addr >= 0x7000 && addr <= 0x7FFF)
+    for (const RomModule& m : romModules_)
+      if (m.hasDataWindow) {
+        expansionMock_.screenWrite(addr, value);
+        break;
+      }
   if (addr >= 0x8000 && addr <= 0xBFFF) {
     // Unlike a plain loadrommodule-style module (whose whole claimed range
     // is real ROM and can never be written -- isUnmapped's own blanket

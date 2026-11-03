@@ -158,6 +158,10 @@ class ExpansionMock {
       ssh_.poll(*sshWindow_, kbdNowMs());
       history_.poll(*sshWindow_, kbdNowMs());  // the command history's browsing, the same way
     }
+    if (emulatedCycles_ - screenPolledCycles_ >= kSshPollCycles) {  // as core1, between commands
+      screenPolledCycles_ = emulatedCycles_;
+      screenPoll();
+    }
   }
   static constexpr double kCpuHz = 1300000.0;
 
@@ -419,9 +423,9 @@ class ExpansionMock {
   // value. The mock keeps them in memory (real firmware: flash).
   static constexpr uint8_t kCommandConfigGet = 0x30;
   static constexpr uint8_t kCommandConfigSet = 0x31;
-  static constexpr int kConfigCount = 15;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY, BRIDGEINT, TIMESYNC, BLDISP, ZWRAP -- mcu_config.h
+  static constexpr int kConfigCount = 14;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY, BRIDGEINT, TIMESYNC, BLDISP -- mcu_config.h
   static constexpr int kConfigTimeSync = 12;
-  static constexpr int kConfigZwrap = 14;  // ZIP/1500's word wrap (zterm.h ZT_SETTING_WRAP)
+  static constexpr int kConfigBldisp = 13;  // the screen to a linked peer (screen.c)
   static constexpr int kConfigAutostage = 6;
   static constexpr int kConfigSleepWait = 1;
   static constexpr int kConfigPowmanDelay = 8;
@@ -657,8 +661,23 @@ class ExpansionMock {
   int32_t blePlotY() const { return blePaper_.penY(); }
   uint8_t blePlotPen() const { return blePaper_.pen(); }
   void setBlePeerPlots(bool plots) { blePeerPlots_ = plots; }
+  // Test-only: an FL store setting as on/off (fl_store.h fl_get_flag()),
+  // `dflt` if there's none -- ZIP's ZWRAP.
+  bool flFlag(const std::string& key, bool dflt);
   // Test-only: how many times BLCLS cleared the peer's screen pane.
   int bleScreenClears() const { return bleScreenClears_; }
+  // The Screen pane (2026-11-03): the firmware's screen.c, fed by BASIC's
+  // buffers (Bus::writeME0 hands over every ME0 write to 7000H-7FFFH, as
+  // GreenPAK2 IO12 does), the keywords' SHOW/BROWSE, and ZIP's console;
+  // polled about once per emulated millisecond, as core1 polls it.
+  void screenWrite(uint16_t addr, uint8_t value);
+  // Test-only: the DISPLAY payloads the fake peer took, in order, and the
+  // largest it takes.
+  const std::vector<std::vector<uint8_t>>& bleDisplay() const { return bleDisplay_; }
+  void clearBleDisplay() { bleDisplay_.clear(); }
+  void setBleDisplayMax(size_t max) { bleDisplayMax_ = max; }
+  // ...and the link dropped and made again, as BLCON would.
+  void simulateBleRelink() { bleLinks_++; }
   // Test-only: how many times ECINIT erased everything.
   int factoryResets() const { return factoryResets_; }
   // Test-only, the clock (2026-10-08): with a clock, the fake peer is the
@@ -1013,7 +1032,7 @@ class ExpansionMock {
   int sleepCount_ = 0, powmanCount_ = 0, wakeCount_ = 0;
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
-  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1, 1, 1, 0, 1};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on, BRIDGEINT on, TIMESYNC on, BLDISP off, ZWRAP on)
+  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1, 1, 1, 0};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on, BRIDGEINT on, TIMESYNC on, BLDISP off)
   std::atomic<bool> kbdLoopInstalled_{false};
   std::vector<uint8_t> windowSeed_;  // setWindowSeed()
   std::vector<uint8_t> romImageBuilt_;  // romImage_ before KBD_INSTALL: the firmware's flash copy
@@ -1069,6 +1088,14 @@ class ExpansionMock {
   int blePlotFrames_ = 0;
   bool blePeerPlots_ = true;
   int bleScreenClears_ = 0;
+  std::vector<std::vector<uint8_t>> bleDisplay_;
+  void screenReset();  // screen_init(): a fresh MCU's RAM
+  void screenPoll();
+  std::recursive_mutex screenMutex_;  // screen.c's state: the worker's keywords, the emulation's bus
+  std::mutex screenPollMutex_;        // one sender at a time
+  uint64_t screenPolledCycles_ = 0;
+  size_t bleDisplayMax_ = 240;
+  uint32_t bleLinks_ = 0;  // counts the fake peer's links: its session(), for ZIP's mirror
   std::string bleLastHost_;  // BLCON with no name connects to it (2026-10-18)
   int factoryResets_ = 0;
   bool blePeerClock_ = false;

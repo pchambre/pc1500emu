@@ -369,6 +369,17 @@ bool LinkCore::isLinked() const {
   return linked_;
 }
 
+uint32_t LinkCore::session() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return linked_ ? linkGen_ : 0;
+}
+
+int LinkCore::display(const std::vector<uint8_t>& payload) {
+  if (!isLinked()) return 0;
+  int r = request(kDisplay, payload);
+  return r == 0 ? 1 : r == kErrUnsupported ? 0 : -1;
+}
+
 void LinkCore::log(const std::string& line) {
   std::lock_guard<std::mutex> lock(mutex_);
   log_.push_back(line);
