@@ -2468,6 +2468,7 @@ void ExpansionMock::simulateColdBoot(bool keepStaged) {
   fl_forget();  // the FL store is read from flash again
 #endif
   currentDir_ = rootDir_;  // FatFs mounts afresh at the root
+  resetKeywords();         // keywords.c's state and screen.c's, in RAM
   if (!keepStaged) {
     remapActive_ = false;
     romStagedVerified_ = false;
@@ -2485,6 +2486,10 @@ void ExpansionMock::simulateColdBoot(bool keepStaged) {
 void ExpansionMock::runCommandAsync(uint8_t cmd, std::vector<uint8_t>* window,
                                      size_t instructionOffset) {
   uint8_t status = dispatchCommand(cmd, *window);
+  static const bool log = std::getenv("CMDLOG") != nullptr;  // every command and its answer, in ms
+  if (log)
+    std::fprintf(stderr, "CMD %02X [%02X %02X %02X %02X] -> %02X @%llu\n", cmd, (*window)[0], (*window)[1],
+                 (*window)[2], (*window)[3], status, static_cast<unsigned long long>(emulatedCycles_ / 1300));
   {
     // Overtaken by a newer write: the cell keeps its BUSY (monitor.c
     // WriteStatus()).

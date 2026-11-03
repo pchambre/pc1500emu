@@ -5590,10 +5590,7 @@ void testFlStore() {
   // The MCU starts afresh: still there, read from its flash again.
   f->mock->simulateColdBoot(true);
   for (int i = 0; i < 1'500'000; i++) stepOne(*f->m);  // its boot (~550 ms)
-  // (The first statement after this MCU-only reboot, the PC-1500 left on,
-  // is ERROR 1 -- seen 2026-11-02, not looked into; the next is fine.)
-  f->run("C=0");
-  CHECK(f->run("C=0") == 0);
+  CHECK(f->run("C=0") == 0);  // FLDF's result was up: its key ends it (testRestartInKeyWait)
   CHECK(f->run("FLGET \"N\",C") == 0);
   CHECK(c() == 0x0224);
   CHECK(f->run("FLRM \"N\"") == 0);
@@ -5860,6 +5857,29 @@ void testZipMirrorRestore() {
   CHECK(g->command("INVENTORY"));
   CHECK(text() == transcript());
   if (text() != transcript()) std::printf("  pane:\n%s\n  transcript:\n%s\n", text().c_str(), transcript().c_str());
+}
+
+// The MCU starting afresh while a keyword waits for a key (2026-11-03: the
+// user's ERROR 1 after switching the PC-1500 off and on at a result) -- the
+// key wait resumes, the MCU's keyword and window are gone. The key ends the
+// statement quietly (keywords.c: CONTINUE with none running is DONE), from
+// the place rom.asm's KW_KEY kept on the stack.
+void testRestartInKeyWait() {
+  auto f = bleFixture("testRestartInKeyWait");
+  if (!f) return;
+  auto restart = [&] {
+    f->mock->simulateColdBoot(true);
+    for (int i = 0; i < 1'500'000; i++) stepOne(*f->m);  // its boot (~550 ms)
+  };
+  CHECK(f->run("FLDF") == 0);  // a SHOW, waiting
+  restart();
+  CHECK(f->run("A=1") == 0);   // its CL ends FLDF; then the statement
+  CHECK(f->run("A=2") == 0);
+  CHECK(f->run("SDLS") == 0);  // a listing, waiting
+  restart();
+  f->key(pc1500::Key::Cl);     // leaves it
+  CHECK(f->run("A=4") == 0);
+  CHECK(f->m->bus.readME0(kErlAbs) == 0);
 }
 
 // A power cycle mid-game (2026-11-02): the PC-1500's RAM and the game
@@ -8176,6 +8196,7 @@ int main(int argc, char** argv) {
   RUN(testZipMirrorRestore);
   RUN(testScreenBasic);
   RUN(testFlStore);
+  RUN(testRestartInKeyWait);
   RUN(testZipPowerCycle);
   RUN(testFlZwrap);
   RUN(testZipTypingSpeed);
