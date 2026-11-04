@@ -6,9 +6,11 @@
 // part sim65 or ucsim plays for other targets. No ROM, LCD or keyboard;
 // pc1500runner is the tool for programs that need the PC-1500 itself.
 //
-// usage: pc1500sim [-c CYCLES] <bin> [load hex]
+// usage: pc1500sim [-c CYCLES] [-p PROFILE] <bin> [load hex]
 //   bin     a raw image, loaded at the load address (default 0100)
 //   -c      give up after CYCLES cycles (default 2000000000), exit status 2
+//   -p      write a profile to PROFILE: one "ADDR count cycles" line (hex
+//           address, decimal) for each instruction address that ran
 //
 // The program starts at the load address with S at FEFFH and a return
 // address of FFF8H on the stack. It talks to the simulator through ME1,
@@ -57,14 +59,16 @@ struct FlatBus : lh5801::MemoryBus {
 int main(int argc, char** argv) {
   long long maxCycles = 2'000'000'000;
   const char* path = nullptr;
+  const char* profilePath = nullptr;
   unsigned load = 0x0100;
   for (int i = 1; i < argc; i++) {
     if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc) maxCycles = std::atoll(argv[++i]);
+    else if (std::strcmp(argv[i], "-p") == 0 && i + 1 < argc) profilePath = argv[++i];
     else if (!path) path = argv[i];
     else load = std::strtoul(argv[i], nullptr, 16);
   }
   if (!path) {
-    std::fprintf(stderr, "usage: pc1500sim [-c CYCLES] <bin> [load hex]\n");
+    std::fprintf(stderr, "usage: pc1500sim [-c CYCLES] [-p PROFILE] <bin> [load hex]\n");
     return 2;
   }
   std::ifstream f(path, std::ios::binary);
@@ -86,6 +90,7 @@ int main(int argc, char** argv) {
 
   long long cycles = 0;
   int status = 0;
+  std::vector<long long> hits(profilePath ? 0x10000 : 0), clks(profilePath ? 0x10000 : 0);
   while (true) {
     if (bus.stopped) {
       status = bus.status;
@@ -102,8 +107,21 @@ int main(int argc, char** argv) {
       status = 2;
       break;
     }
+    uint16_t at = cpu.p();
     int c = cpu.step();
-    cycles += c > 0 ? c : 1;
+    if (c <= 0) c = 1;
+    cycles += c;
+    if (profilePath) {
+      hits[at]++;
+      clks[at] += c;
+    }
+  }
+  if (profilePath) {
+    if (FILE* out = std::fopen(profilePath, "w")) {
+      for (unsigned a = 0; a < 0x10000; a++)
+        if (hits[a]) std::fprintf(out, "%04X %lld %lld\n", a, hits[a], clks[a]);
+      std::fclose(out);
+    }
   }
   std::printf("\n%zu words read from %s\n", bin.size(), path);
   std::printf("Total time since last reset= %.6f sec (%lld clks)\n", cycles / 1300000.0, cycles);
