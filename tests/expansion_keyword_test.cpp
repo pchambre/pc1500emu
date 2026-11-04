@@ -4318,9 +4318,12 @@ struct BleFixture {
 static std::unique_ptr<BleFixture> bleFixture(const char* testName, size_t extRam0000Bytes = 0x4000,
                                               size_t extRamExtBytes = 0x2800, bool stageable = false) {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
-  const std::string kExpRomPath =
-      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/"
-      "Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom_8800.bin";
+  // EXPROM_DIR: another build of the ROM (rom_8800.bin, rom.bin) -- an
+  // older one in a scratch copy, say, to see a test fail without a fix.
+  const char* romDir = std::getenv("EXPROM_DIR");
+  const std::string kRomDir =
+      romDir ? romDir : "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom";
+  const std::string kExpRomPath = kRomDir + "/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
   if (rom.empty() || expRom.empty()) {
@@ -4331,8 +4334,7 @@ static std::unique_ptr<BleFixture> bleFixture(const char* testName, size_t extRa
   f->m = bootAndSettle(rom, extRam0000Bytes, extRamExtBytes);
   f->sdDir = makeTempTestDir(testName);
   if (stageable) {
-    std::vector<uint8_t> romBin = readFile(
-        "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom/rom.bin");
+    std::vector<uint8_t> romBin = readFile(kRomDir + "/rom.bin");
     if (romBin.size() < 0x800) {
       std::printf("SKIP: %s -- rom.bin not found.\n", testName);
       return nullptr;
@@ -5880,6 +5882,24 @@ void testRestartInKeyWait() {
   f->key(pc1500::Key::Cl);     // leaves it
   CHECK(f->run("A=4") == 0);
   CHECK(f->m->bus.readME0(kErlAbs) == 0);
+}
+
+// The same with the dongle's sleep (2026-11-03, on hardware: Enter was
+// fine, Down drew garbage and then CL was ERROR 1). The MCU started afresh
+// goes back to sleep 100 ms after the first key's wake, so the window
+// floats; the first key in the restarted listing, whichever it is, ends it.
+void testRestartInBrowseAsleep() {
+  auto f = bleFixture("testRestartInBrowseAsleep", 0x4000, 0x2800, true);
+  if (!f) return;
+  sleepOn(*f, 0xFFFF);
+  f->mock->setAsleepValue(0xFD);  // the second dongle's float
+  CHECK(f->run("SDLS") == 0);     // a listing, waiting
+  f->mock->simulateColdBoot(true);
+  for (int i = 0; i < 1'500'000; i++) stepOne(*f->m);  // its boot (~550 ms)
+  f->key(pc1500::Key::Down);  // ends it: not a step into a listing that's gone
+  for (int i = 0; i < 400'000; i++) stepOne(*f->m);  // past the stray-wake sleep
+  CHECK(f->mock->asleepNow());
+  CHECK(f->run("A=4") == 0);
 }
 
 // A power cycle mid-game (2026-11-02): the PC-1500's RAM and the game
@@ -8197,6 +8217,7 @@ int main(int argc, char** argv) {
   RUN(testScreenBasic);
   RUN(testFlStore);
   RUN(testRestartInKeyWait);
+  RUN(testRestartInBrowseAsleep);
   RUN(testZipPowerCycle);
   RUN(testFlZwrap);
   RUN(testZipTypingSpeed);
