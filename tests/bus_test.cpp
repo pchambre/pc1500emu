@@ -1028,6 +1028,129 @@ void testExpansionModuleFreeSpaceAndVolumeSizeSucceed() {
 
 }  // namespace
 
+// CE-1638 (2026-11-09): eight independent 16K RAM banks, bank n selected
+// by any write to 5800H+n (6800H+n on a PC-1500A); each bank's own F1-F6
+// reserve area is seeded, as BASIC needs it zeroed.
+void testCe1638EightBanksIndependent() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  bus.setBankedModule(pc1500::Bus::BankedModule::Ce1638);
+  CHECK(bus.bankedModuleBank() == 0);
+  for (int bank = 0; bank < 8; ++bank) {
+    bus.writeME0(static_cast<uint16_t>(0x5800 + bank), 0x00);
+    CHECK(bus.bankedModuleBank() == bank);
+    CHECK(bus.readME0(0x0008) == 0x00);  // reserve area seeded
+    CHECK(bus.readME0(0x00C4) == 0x00);
+    CHECK(bus.readME0(0x00C5) == 0xFF);
+    bus.writeME0(0x1234, static_cast<uint8_t>(0x10 + bank));
+  }
+  for (int bank = 7; bank >= 0; --bank) {
+    bus.writeME0(static_cast<uint16_t>(0x5800 + bank), 0x55);
+    CHECK(bus.readME0(0x1234) == 0x10 + bank);
+  }
+  bus.writeME0(0x580B, 0x00);  // A2-A0 = 3
+  CHECK(bus.bankedModuleBank() == 3);
+  // Another module empties it; the CE-163 sees only two banks.
+  bus.setCe163Enabled(true);
+  CHECK(bus.bankedModule() == pc1500::Bus::BankedModule::Ce163);
+  CHECK(bus.readME0(0x1234) == 0xFF);
+  bus.writeME0(0x5803, 0x00);
+  CHECK(bus.ce163Bank() == 1);
+  // Exclusive with the other 0000H options.
+  bus.setBankedModule(pc1500::Bus::BankedModule::Ce1638);
+  bus.setExtRam0000Size(0x4000);
+  CHECK(bus.bankedModule() == pc1500::Bus::BankedModule::None);
+  bus.setBankedModule(pc1500::Bus::BankedModule::Ce163F);
+  CHECK(bus.extRam0000Size() == 0);
+  bus.setInternalCard(true);
+  CHECK(bus.bankedModule() == pc1500::Bus::BankedModule::None);
+  // PC-1500A: 6800H+n.
+  pc1500::Keyboard kb2;
+  pc1500::Bus busA(kb2);
+  busA.setMachineVariant(pc1500::Bus::MachineVariant::PC1500A);
+  busA.setBankedModule(pc1500::Bus::BankedModule::Ce1638);
+  busA.writeME0(0x5805, 0x00);
+  CHECK(busA.bankedModuleBank() == 0);
+  busA.writeME0(0x6805, 0x00);
+  CHECK(busA.bankedModuleBank() == 5);
+}
+
+// CE-163F: banks 0-7 RAM, 8-15 the SST39SF010A flash (bank b = chip
+// address (b - 8) << 14 | addr). Flash takes only the chip's command
+// sequences, and only with PGM EN bridged.
+void testCe163fFlashBanks() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  bus.setBankedModule(pc1500::Bus::BankedModule::Ce163F);
+  bus.writeME0(0x5809, 0x00);
+  CHECK(bus.bankedModuleBank() == 9);
+  CHECK(bus.readME0(0x0100) == 0xFF);  // erased
+  bus.writeME0(0x0100, 0x12);          // a plain write: not a command
+  CHECK(bus.readME0(0x0100) == 0xFF);
+  // Chip 5555H = bank 9 (chip 4000H) + 1555H; chip 2AAAH = bank 8 + 2AAAH.
+  auto unlock = [&](uint8_t command) {
+    bus.writeME0(0x5809, 0);
+    bus.writeME0(0x1555, 0xAA);
+    bus.writeME0(0x5808, 0);
+    bus.writeME0(0x2AAA, 0x55);
+    bus.writeME0(0x5809, 0);
+    bus.writeME0(0x1555, command);
+  };
+  // Byte program, at bank 10 (chip 8000H) + 0123H.
+  unlock(0xA0);
+  bus.writeME0(0x580A, 0);
+  bus.writeME0(0x0123, 0x5A);
+  CHECK(bus.readME0(0x0123) == 0x5A);
+  CHECK(bus.ce163fFlash().memory()[0x8123] == 0x5A);
+  unlock(0xA0);  // programming only clears bits
+  bus.writeME0(0x580A, 0);
+  bus.writeME0(0x0123, 0xF0);
+  CHECK(bus.readME0(0x0123) == 0x50);
+  // Software ID.
+  unlock(0x90);
+  bus.writeME0(0x5808, 0);
+  CHECK(bus.readME0(0x0000) == 0xBF);
+  CHECK(bus.readME0(0x0001) == 0xB5);
+  bus.writeME0(0x0000, 0xF0);  // exit
+  CHECK(bus.readME0(0x0000) == 0xFF);
+  // Sector erase (4K) of chip 8000H-8FFFH; chip 9000H survives.
+  bus.ce163fFlash().memory()[0x9000] = 0x00;
+  unlock(0x80);
+  bus.writeME0(0x5809, 0);
+  bus.writeME0(0x1555, 0xAA);
+  bus.writeME0(0x5808, 0);
+  bus.writeME0(0x2AAA, 0x55);
+  bus.writeME0(0x580A, 0);
+  bus.writeME0(0x0FFF, 0x30);
+  CHECK(bus.readME0(0x0123) == 0xFF);
+  CHECK(bus.readME0(0x1000) == 0x00);
+  // Chip erase.
+  unlock(0x80);
+  bus.writeME0(0x5809, 0);
+  bus.writeME0(0x1555, 0xAA);
+  bus.writeME0(0x5808, 0);
+  bus.writeME0(0x2AAA, 0x55);
+  bus.writeME0(0x5809, 0);
+  bus.writeME0(0x1555, 0x10);
+  bus.writeME0(0x580A, 0);
+  CHECK(bus.readME0(0x1000) == 0xFF);
+  // PGM EN open: no command reaches the chip.
+  bus.setCe163fProgramEnable(false);
+  unlock(0xA0);
+  bus.writeME0(0x580A, 0);
+  bus.writeME0(0x0123, 0x00);
+  CHECK(bus.readME0(0x0123) == 0xFF);
+  // RAM banks are still RAM; an image loads from bank 8.
+  bus.writeME0(0x5807, 0);
+  bus.writeME0(0x0123, 0x77);
+  CHECK(bus.readME0(0x0123) == 0x77);
+  const uint8_t image[] = {0x01, 0x02, 0x03};
+  CHECK(bus.loadCe163fFlashImage(image, sizeof image));
+  bus.writeME0(0x5808, 0);
+  CHECK(bus.readME0(0x0002) == 0x03);
+  CHECK(bus.readME0(0x0003) == 0xFF);
+}
+
 int main() {
   testUnmappedRegionsReadHighAndIgnoreWrites();
   testMirroredRegionsAliasRealRam();
@@ -1051,6 +1174,8 @@ int main() {
   testInternalCardBanksAreIndependent();
   testInternalCardIsExclusiveInThe0000Window();
   testCe163IsMutuallyExclusiveWithOtherExtensionRam();
+  testCe1638EightBanksIndependent();
+  testCe163fFlashBanks();
   testExtRam0000SizeZeroClearsCe163AndCe155();
   testCe155IsMutuallyExclusiveWithOtherExtensionRam();
   testExtensionWindowFollowsMachineVariant();

@@ -207,6 +207,18 @@ native OS menu) sits above the display:
   active, this submenu shows a disabled note instead of a selectable
   item, since CE-155's own toggle lives in the expansion-window submenu —
   this window only hosts its remaining isolated 2K at `3800H`-`3FFFH`.
+  **CE-1638 (8 x 16K RAM, banked)** and **CE-163F (8 x 16K RAM + 8 x 16K
+  flash)**: aftermarket modules (manual: *PC-1500/A Memory Expansion Module
+  User Manual* V1.4). A write to `5800H`+n (`6800H`+n on a PC-1500A)
+  selects bank n: 0-7 on the CE-1638, 0-15 on the CE-163F, whose banks
+  8-15 are an SST39SF010A flash (8 holds the vendor's utilities). The
+  flash takes the chip's own program/erase/ID command sequences while
+  **CE-163F PGM EN** is ticked (the module's solder bridge), and
+  **Load CE-163F flash image...** puts an image (the vendor's
+  `FULLUTIL.IMG`, say) in it from bank 8 on. The module's RAM and flash
+  are kept in the state file; choosing a different module empties the RAM.
+  The vendor's switchers (`CALL&D5,X` on the CE-1638, `CALL&E3,X` on the
+  CE-163F) live in each bank, put there by the vendor's formatter.
   **Internal card (5 x 16K, banked)**: the RP2354B internal expansion
   card instead of the dongle. Its 128K SRAM backs this window as BANK 0
   (the base) and BANK 1-4, chosen by the card GreenPAK's V16-V14 bits,
@@ -335,6 +347,12 @@ Commands:
 - `setce163 <0|1>` — FIFO equivalent of Settings > Extension RAM (0000H) >
   CE-163 (see that section above). Mutually exclusive with `setextram` and
   `setce155` — enabling one clears the others.
+- `setce1638 <0|1>` / `setce163f <0|1>` — FIFO equivalents of Settings >
+  Extension RAM (0000H) > CE-1638 / CE-163F. Exclusive in the same way as
+  `setce163`. Need `reset` after.
+- `setce163fpgm <0|1>` — the CE-163F's PGM EN bridge (default 1).
+- `loadce163fflash <path>` — a CE-163F flash image (up to 128K), from
+  chip address 0 (bank 8).
 - `setce155 <0|1>` — FIFO equivalent of Settings > Extension RAM (0000H) >
   CE-155 (see that section above). Mutually exclusive with `setextram` and
   `setce163`, same as `setce163` above.

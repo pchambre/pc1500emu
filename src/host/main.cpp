@@ -1637,7 +1637,8 @@ int main(int argc, char** argv) {
                                              : pc1500::Bus::MachineVariant::PC1500);
   bus.setExtRamExtSize(appConfig.extRamExtBytes);
   bus.setExtRam0000Size(appConfig.extRam0000Bytes);
-  bus.setCe163Enabled(appConfig.ce163Enabled);
+  bus.setBankedModule(pc1500::Bus::bankedModuleFromName(appConfig.bankedModule));
+  bus.setCe163fProgramEnable(appConfig.ce163fProgramEnable);
   // Last, so it deterministically wins if a hand-edited conf file somehow
   // has a contradictory combination -- setCe155Enabled(true) itself
   // clears the two sizes and CE-163 right back off (see its own comment).
@@ -2042,6 +2043,34 @@ int main(int argc, char** argv) {
       long enabled = 0;
       iss >> std::dec >> enabled;
       bus.setCe163Enabled(enabled != 0);
+    } else if (cmd == "setce1638" || cmd == "setce163f") {
+      // FIFO equivalents of Settings > Extension RAM (0000H) > CE-1638 /
+      // CE-163F (2026-11-09): <enabled> is 0 or 1. Exclusive in the same
+      // way as setce163 (Bus::setBankedModule). Needs `reset` after.
+      long enabled = 0;
+      iss >> std::dec >> enabled;
+      auto module = cmd == "setce1638" ? pc1500::Bus::BankedModule::Ce1638
+                                       : pc1500::Bus::BankedModule::Ce163F;
+      if (enabled != 0)
+        bus.setBankedModule(module);
+      else if (bus.bankedModule() == module)
+        bus.setBankedModule(pc1500::Bus::BankedModule::None);
+    } else if (cmd == "setce163fpgm") {
+      // The CE-163F's PGM EN bridge: 1 = its flash takes writes.
+      long enabled = 0;
+      iss >> std::dec >> enabled;
+      bus.setCe163fProgramEnable(enabled != 0);
+    } else if (cmd == "loadce163fflash") {
+      // loadce163fflash <path>: a CE-163F flash image (e.g. the vendor's
+      // FULLUTIL.IMG, up to 128K) from chip address 0 -- bank 8 onwards.
+      std::string path;
+      std::getline(iss >> std::ws, path);
+      std::ifstream in(path, std::ios::binary);
+      std::vector<uint8_t> image((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      if (!in.good() && !in.eof())
+        std::fprintf(stderr, "pc1500emu: loadce163fflash: can't read %s\n", path.c_str());
+      else if (!bus.loadCe163fFlashImage(image.data(), image.size()))
+        std::fprintf(stderr, "pc1500emu: loadce163fflash: %s is bigger than 128K\n", path.c_str());
     } else if (cmd == "setce155") {
       // FIFO equivalent of the Settings > Extension RAM (0000H) > CE-155
       // menu item. <enabled> is 0 or 1. Mutually exclusive with both
@@ -3321,7 +3350,7 @@ int main(int argc, char** argv) {
           size_t cur = bus.extRamExtSize();
           uint16_t base = bus.extRamExtBase();
           size_t maxSize = bus.extRamExtWindowMaxSize();
-          bool ce163 = bus.ce163Enabled();
+          bool ce163 = bus.bankedModule() != pc1500::Bus::BankedModule::None;  // any banked module
           bool ce155 = bus.ce155Enabled();
           // Persisted to the conf file (AppConfig::extRamExtBytes) so it
           // survives a restart -- it only takes effect on the *next*
@@ -3339,7 +3368,7 @@ int main(int argc, char** argv) {
             // it must clear CE-163/CE-155 as well, not just nonzero sizes
             // -- a real PC-1500(A) has one expansion port, so "None"
             // here means nothing at all is plugged into it.
-            appConfig.ce163Enabled = false;
+            appConfig.bankedModule.clear();
             appConfig.ce155Enabled = false;
             persistActiveConf();
           };
@@ -3389,7 +3418,7 @@ int main(int argc, char** argv) {
               appConfig.ce155Enabled = true;
               appConfig.extRam0000Bytes = 0;
               appConfig.extRamExtBytes = 0;
-              appConfig.ce163Enabled = false;
+              appConfig.bankedModule.clear();
               appConfig.internalCard = false;
               persistActiveConf();
             }
@@ -3399,7 +3428,7 @@ int main(int argc, char** argv) {
         if (ImGui::BeginMenu("Extension RAM (0000H)")) {
           if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) ImGui::CloseCurrentPopup();
           size_t cur = bus.extRam0000Size();
-          bool ce163 = bus.ce163Enabled();
+          bool ce163 = bus.bankedModule() != pc1500::Bus::BankedModule::None;  // any banked module
           bool ce155 = bus.ce155Enabled();
           bool card = bus.internalCard();
           auto setExtRam0000 = [&](size_t bytes) {
@@ -3415,7 +3444,7 @@ int main(int argc, char** argv) {
             // runs after setExtRam0000Size in main()'s own pre-reset
             // ordering) would silently re-enable whichever one was left
             // set in the conf file.
-            appConfig.ce163Enabled = false;
+            appConfig.bankedModule.clear();
             appConfig.ce155Enabled = false;
             appConfig.internalCard = false;
             persistActiveConf();
@@ -3433,14 +3462,42 @@ int main(int argc, char** argv) {
           // bank-select range physically overlaps that window and a real
           // PC-1500(A) has only one expansion port. See
           // Bus::setCe163Enabled's own comment.
-          if (ImGui::MenuItem("CE-163 (32K, banked)", nullptr, ce163)) {
-            bus.setCe163Enabled(true);
-            appConfig.ce163Enabled = true;
-            appConfig.extRam0000Bytes = 0;
-            appConfig.extRamExtBytes = 0;
-            appConfig.ce155Enabled = false;
-            appConfig.internalCard = false;
-            persistActiveConf();
+          // CE-1638 / CE-163F (2026-11-09): aftermarket 128K banked RAM
+          // (8 banks), the CE-163F with 128K of flash as banks 8-15 too --
+          // see Bus::setBankedModule.
+          auto bankedItem = [&](const char* text, pc1500::Bus::BankedModule module) {
+            if (ImGui::MenuItem(text, nullptr, bus.bankedModule() == module)) {
+              bus.setBankedModule(module);
+              appConfig.bankedModule = pc1500::Bus::bankedModuleName(module);
+              appConfig.extRam0000Bytes = 0;
+              appConfig.extRamExtBytes = 0;
+              appConfig.ce155Enabled = false;
+              appConfig.internalCard = false;
+              persistActiveConf();
+            }
+          };
+          bankedItem("CE-163 (32K, banked)", pc1500::Bus::BankedModule::Ce163);
+          bankedItem("CE-1638 (8 x 16K RAM, banked)", pc1500::Bus::BankedModule::Ce1638);
+          bankedItem("CE-163F (8 x 16K RAM + 8 x 16K flash)", pc1500::Bus::BankedModule::Ce163F);
+          if (bus.bankedModule() == pc1500::Bus::BankedModule::Ce163F) {
+            bool pgm = bus.ce163fProgramEnable();
+            if (ImGui::MenuItem("CE-163F PGM EN (flash writable)", nullptr, pgm)) {
+              bus.setCe163fProgramEnable(!pgm);
+              appConfig.ce163fProgramEnable = !pgm;
+              persistActiveConf();
+            }
+            if (ImGui::MenuItem("Load CE-163F flash image...")) {
+              requestPick(false, "Load CE-163F flash image", {"*.img", "*.IMG", "*.bin", "*.BIN"},
+                          "Flash images (up to 128K)", std::string(),
+                          [&bus](std::optional<std::string> path) {
+                            if (!path) return;
+                            std::ifstream in(*path, std::ios::binary);
+                            std::vector<uint8_t> image((std::istreambuf_iterator<char>(in)),
+                                                       std::istreambuf_iterator<char>());
+                            if (!bus.loadCe163fFlashImage(image.data(), image.size()))
+                              std::fprintf(stderr, "pc1500emu: %s is bigger than 128K\n", path->c_str());
+                          });
+            }
           }
           // The internal card (2026-11-09): the RP2354B card's 128K SRAM,
           // five 16K banks in this window (BANK 0-4). It's inside the
@@ -3450,7 +3507,7 @@ int main(int argc, char** argv) {
             bus.setInternalCard(true);
             appConfig.internalCard = true;
             appConfig.extRam0000Bytes = 0;
-            appConfig.ce163Enabled = false;
+            appConfig.bankedModule.clear();
             appConfig.ce155Enabled = false;
             persistActiveConf();
           }
@@ -3603,8 +3660,9 @@ int main(int argc, char** argv) {
           } else {
             ImGui::Text("Ext RAM %04XH: off", bus.extRamExtBase());
           }
-          if (bus.ce163Enabled()) {
-            ImGui::Text("Ext RAM 0000H: CE-163 (bank %u)", static_cast<unsigned>(bus.ce163Bank()));
+          if (bus.bankedModule() != pc1500::Bus::BankedModule::None) {
+            ImGui::Text("Ext RAM 0000H: %s (bank %u)", pc1500::Bus::bankedModuleName(bus.bankedModule()),
+                        static_cast<unsigned>(bus.bankedModuleBank()));
           } else if (bus.internalCard()) {
             int bank = bus.internalCardBank();
             if (bank >= 0)
@@ -3738,8 +3796,9 @@ int main(int argc, char** argv) {
       if (pendingStateMismatchConfig.internalCard) {
         ImGui::Text("Saved config -- %s, 0000H: internal card (5 x 16K), expansion: %zu bytes",
                      variantStr, pendingStateMismatchConfig.extRamExtSize);
-      } else if (pendingStateMismatchConfig.ce163Enabled) {
-        ImGui::Text("Saved config -- %s, 0000H: CE-163 (32K banked)", variantStr);
+      } else if (pendingStateMismatchConfig.bankedModule != pc1500::Bus::BankedModule::None) {
+        ImGui::Text("Saved config -- %s, 0000H: %s (banked)", variantStr,
+                     pc1500::Bus::bankedModuleName(pendingStateMismatchConfig.bankedModule));
       } else if (pendingStateMismatchConfig.ce155Enabled) {
         ImGui::Text("Saved config -- %s, 0000H: CE-155 (8K)", variantStr);
       } else {
@@ -3759,14 +3818,14 @@ int main(int argc, char** argv) {
         bus.setMachineVariant(pendingStateMismatchConfig.machineVariant);
         bus.setExtRamExtSize(pendingStateMismatchConfig.extRamExtSize);
         bus.setExtRam0000Size(pendingStateMismatchConfig.extRam0000Size);
-        bus.setCe163Enabled(pendingStateMismatchConfig.ce163Enabled);
+        bus.setBankedModule(pendingStateMismatchConfig.bankedModule);
         bus.setCe155Enabled(pendingStateMismatchConfig.ce155Enabled);
         bus.setInternalCard(pendingStateMismatchConfig.internalCard);
         appConfig.isPC1500A =
             pendingStateMismatchConfig.machineVariant == pc1500::Bus::MachineVariant::PC1500A;
         appConfig.extRamExtBytes = pendingStateMismatchConfig.extRamExtSize;
         appConfig.extRam0000Bytes = pendingStateMismatchConfig.extRam0000Size;
-        appConfig.ce163Enabled = pendingStateMismatchConfig.ce163Enabled;
+        appConfig.bankedModule = pc1500::Bus::bankedModuleName(pendingStateMismatchConfig.bankedModule);
         appConfig.ce155Enabled = pendingStateMismatchConfig.ce155Enabled;
         appConfig.internalCard = pendingStateMismatchConfig.internalCard;
         persistActiveConf();

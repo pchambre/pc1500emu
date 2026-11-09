@@ -19,7 +19,9 @@
 // same way real PC-1500 RAM (short of a battery-backed module) doesn't
 // survive a hardware reconfiguration either; version 7 added the internal
 // card -- its flag, GP1's V16-V14, its 128K SRAM and its banks' saved BASIC
-// pointers) -- restoring a session is
+// pointers; version 8 replaced the CE-163 flag with the banked module kind
+// (CE-163/CE-1638/CE-163F), widened its RAM to 128K and added the CE-163F
+// flash) -- restoring a session is
 // meant to resume exactly where OFF left the machine, the same way real
 // hardware's OFF/ON cycle just halts and wakes the CPU in place rather
 // than resetting it, so the caller must NOT call cpu.reset() after a
@@ -35,7 +37,7 @@
 namespace pc1500host {
 
 inline constexpr char kStateFileMagic[4] = {'P', 'C', '1', 'S'};
-inline constexpr uint16_t kStateFileVersion = 7;
+inline constexpr uint16_t kStateFileVersion = 8;
 
 // Writes an 8-byte header (4-byte magic, u16 version, 2 reserved bytes),
 // then cpu.saveState(), then bus.saveState(). Returns false with *error

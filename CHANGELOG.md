@@ -4,6 +4,33 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [1.6.0] - 2026-11-09
+
+### Added
+- CE-1638 and CE-163F banked modules: Settings > Extension RAM (0000H),
+  or `setce1638 1` / `setce163f 1`. A write to `5800H`+n (`6800H`+n on a
+  PC-1500A) selects bank n -- eight 16K RAM banks, and on the CE-163F
+  eight more of SST39SF010A flash (`src/bus/sst39sf010a.h`: byte program,
+  4K sector and chip erase, software ID), writable while PGM EN is on
+  (`setce163fpgm`). `loadce163fflash <path>` or the Settings item loads a
+  flash image (the vendor's `FULLUTIL.IMG`, say) from bank 8.
+- Tests: `testCe1638EightBanksIndependent`, `testCe163fFlashBanks`
+  (bus_test), `testCe163fRoundTrip` (state_roundtrip_test), and
+  `testCe1638VendorFormatAndSwitch`: the manual's Annex A `BANKSW.BAS`
+  formats all eight banks, then `CALL&D5,X` switches with each bank's
+  program kept.
+
+### Changed
+- The CE-163 is now one kind of banked module (`Bus::setBankedModule`);
+  `setCe163Enabled` stays as a shorthand. The conf file's `ce163Enabled`
+  is replaced by `bankedModule` ("CE-163", "CE-1638", "CE-163F") and
+  `ce163fProgramEnable`. State file version 8; older state files don't
+  load.
+
+### Fixed
+- The CE-163's banks now get their F1-F6 reserve area zeroed; it was
+  seeded in the RAM the CE-163 hides, which could give ERROR 13.
+
 ## [1.5.0] - 2026-11-09
 
 ### Added

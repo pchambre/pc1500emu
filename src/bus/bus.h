@@ -10,9 +10,11 @@
 #include <cstdint>
 #include <ctime>
 #include <iosfwd>
+#include <string>
 #include <vector>
 
 #include "expansion_mock.h"
+#include "sst39sf010a.h"
 #include "keyboard.h"
 #include "lh5801.h"
 
@@ -492,7 +494,7 @@ class Bus : public lh5801::MemoryBus {
   explicit Bus(Keyboard& keyboard) : keyboard_(keyboard) {
     me0_.fill(0xFF);
     reseedReserveArea();  // 4008H-40C4H for the bare-default config constructed with here
-    ce163Ram_.fill(0xFF);  // matches real RAM's confirmed 0xFF power-up default, not C++'s own 0
+    bankedRam_.fill(0xFF);  // matches real RAM's confirmed 0xFF power-up default, not C++'s own 0
   }
 
   uint8_t readME0(uint16_t addr) override;
@@ -719,7 +721,7 @@ class Bus : public lh5801::MemoryBus {
   void setExtRamExtSize(size_t bytes) {
     extRamExtSize_ = bytes;
     if (bytes != 0) {
-      ce163Enabled_ = false;
+      bankedModule_ = BankedModule::None;
       ce155Enabled_ = false;
     }
   }
@@ -755,31 +757,42 @@ class Bus : public lh5801::MemoryBus {
     // place. Before this fix, bytes == 0 skipped the clear entirely, so
     // selecting "None" while CE-163 was enabled did nothing -- the window
     // stayed banked, since isUnmapped()'s 0000H-window check gates on
-    // !ce163Enabled_ regardless of extRam0000Size_.
-    ce163Enabled_ = false;
+    // a banked module regardless of extRam0000Size_.
+    bankedModule_ = BankedModule::None;
     ce155Enabled_ = false;
     expansionMock_.setBoard(ExpansionMock::Board::Dongle);
     reseedReserveArea();  // may move reserveAreaBase() -- see its own comment
   }
   size_t extRam0000Size() const { return extRam0000Size_; }
 
-  // CE-163: a real 1982-era module, 32K of RAM banked into the 0000H-3FFFH
-  // window two 16K banks at a time (only one bank visible at once). Bank
-  // selection is a pure address-line trigger on real hardware: any WRITE
-  // to a 2K range selects bank 0 (even address) or bank 1 (odd address)
-  // -- the byte value written is irrelevant, and nothing is actually
-  // stored there (see Bus::writeME0). That trigger range is itself
-  // machine-variant-dependent, same underlying reason as the expansion
-  // window above: 5800H-5FFFH on a PC-1500 (pin 18 = S3), or
-  // 6800H-6FFFH on a PC-1500A (same physical pin, now wired to S5).
+  // Banked modules in the 0000H-3FFFH window, 16K visible at a time (one
+  // bank), selected by a pure address-line trigger: any WRITE to a 2K
+  // range latches the bank from the address's low bits -- the byte value
+  // is irrelevant and nothing is stored there (see Bus::writeME0). The
+  // range is variant-dependent, as for the expansion window above:
+  // 5800H-5FFFH on a PC-1500 (pin 18 = S3), 6800H-6FFFH on a PC-1500A
+  // (the same pin, wired to S5).
+  //  - CE-163 (Sharp, 1982): 32K, 2 banks, bank = A0.
+  //  - CE-1638 (aftermarket, 2026-11-09): 128K, 8 banks, 5800H+n (A2-A0).
+  //  - CE-163F (aftermarket): 8 banks of 128K RAM (0-7) and 8 of an
+  //    SST39SF010A flash (8-15; 8 holds the vendor's utilities), 5800H+n
+  //    (A3-A0). Flash bank b is chip address (b - 8) << 14 | addr. With its
+  //    PGM EN bridge open the flash ignores writes.
+  // The manual (Flash_and_RAM_Drive_Manual_V1.4) names 5800H-5807H and
+  // 5800H-580FH; that the rest of the 2K range aliases, as on the CE-163,
+  // is a guess about the decode. The RAM is battery-backed and kept in
+  // the state file; changing to a different module empties it.
   //
-  // Mutually exclusive with both extension-RAM windows above and CE-155
-  // below (enabling this clears all three; any of them going active
-  // disables this) -- real hardware has one expansion port, so at most
-  // one of these four can be physically installed at a time.
-  void setCe163Enabled(bool enabled) {
-    ce163Enabled_ = enabled;
-    if (enabled) {
+  // Mutually exclusive with both extension-RAM windows above, CE-155
+  // and the internal card -- real hardware has one module slot.
+  enum class BankedModule : uint8_t { None, Ce163, Ce1638, Ce163F };
+  void setBankedModule(BankedModule module) {
+    if (module != bankedModule_) {
+      bankedRam_.fill(0xFF);
+      bankedBank_ = 0;
+    }
+    bankedModule_ = module;
+    if (module != BankedModule::None) {
       extRam0000Size_ = 0;
       extRamExtSize_ = 0;
       ce155Enabled_ = false;
@@ -787,8 +800,57 @@ class Bus : public lh5801::MemoryBus {
     }
     reseedReserveArea();  // may move reserveAreaBase() -- see its own comment
   }
-  bool ce163Enabled() const { return ce163Enabled_; }
-  uint8_t ce163Bank() const { return ce163Bank_; }
+  BankedModule bankedModule() const { return bankedModule_; }
+  uint8_t bankedModuleBank() const { return bankedBank_; }
+  static int bankedModuleBankCount(BankedModule module) {
+    switch (module) {
+      case BankedModule::Ce163: return 2;
+      case BankedModule::Ce1638: return 8;
+      case BankedModule::Ce163F: return 16;
+      default: return 0;
+    }
+  }
+  // "CE-163", "CE-1638", "CE-163F", or "" for none -- the Settings/conf name.
+  static const char* bankedModuleName(BankedModule module) {
+    switch (module) {
+      case BankedModule::Ce163: return "CE-163";
+      case BankedModule::Ce1638: return "CE-1638";
+      case BankedModule::Ce163F: return "CE-163F";
+      default: return "";
+    }
+  }
+  static BankedModule bankedModuleFromName(const std::string& name) {
+    for (BankedModule m : {BankedModule::Ce163, BankedModule::Ce1638, BankedModule::Ce163F})
+      if (name == bankedModuleName(m)) return m;
+    return BankedModule::None;
+  }
+  // The CE-163 alone (older callers and tests).
+  void setCe163Enabled(bool enabled) {
+    if (enabled)
+      setBankedModule(BankedModule::Ce163);
+    else if (bankedModule_ == BankedModule::Ce163)
+      setBankedModule(BankedModule::None);
+  }
+  bool ce163Enabled() const { return bankedModule_ == BankedModule::Ce163; }
+  uint8_t ce163Bank() const { return bankedBank_; }
+  // The CE-163F's PGM EN bridge (default closed: the vendor's copy-to-
+  // flash needs it), and its flash chip.
+  void setCe163fProgramEnable(bool enabled) { ce163fProgramEnable_ = enabled; }
+  bool ce163fProgramEnable() const { return ce163fProgramEnable_; }
+  Sst39sf010a& ce163fFlash() { return ce163fFlash_; }
+  const Sst39sf010a& ce163fFlash() const { return ce163fFlash_; }
+  // A flash image (e.g. the vendor's FULLUTIL.IMG), from chip address 0;
+  // the rest of the chip is left erased. False if it's bigger than 128K.
+  bool loadCe163fFlashImage(const uint8_t* data, size_t size) {
+    if (size > Sst39sf010a::kSize) return false;
+    auto& mem = ce163fFlash_.memory();
+    mem.fill(0xFF);
+    std::copy(data, data + size, mem.begin());
+    ce163fFlash_.resetCommandState();
+    return true;
+  }
+  // The banked module's RAM, every bank back to back (tests, the UI).
+  const std::array<uint8_t, 0x20000>& bankedRam() const { return bankedRam_; }
 
   // CE-155: a real 1982-era 8K module, split across both windows above --
   // 2K at exactly 3800H-3FFFH (the *top* of the 0000H-3FFFH window, not
@@ -807,7 +869,7 @@ class Bus : public lh5801::MemoryBus {
     if (enabled) {
       extRam0000Size_ = 0;
       extRamExtSize_ = 0;
-      ce163Enabled_ = false;
+      bankedModule_ = BankedModule::None;
       expansionMock_.setBoard(ExpansionMock::Board::Dongle);
     }
     reseedReserveArea();  // may move reserveAreaBase() -- see its own comment
@@ -826,7 +888,7 @@ class Bus : public lh5801::MemoryBus {
     expansionMock_.setBoard(enabled ? ExpansionMock::Board::Card : ExpansionMock::Board::Dongle);
     if (enabled) {
       extRam0000Size_ = 0;
-      ce163Enabled_ = false;
+      bankedModule_ = BankedModule::None;
       ce155Enabled_ = false;
     }
     reseedReserveArea();  // may move reserveAreaBase() -- see its own comment
@@ -910,7 +972,7 @@ class Bus : public lh5801::MemoryBus {
   struct SavedConfig {
     size_t extRamExtSize = 0;
     size_t extRam0000Size = 0;
-    bool ce163Enabled = false;
+    BankedModule bankedModule = BankedModule::None;
     MachineVariant machineVariant = MachineVariant::PC1500;
     bool ce155Enabled = false;
     bool internalCard = false;
@@ -949,10 +1011,10 @@ class Bus : public lh5801::MemoryBus {
 
 
   static bool isRom(uint16_t addr) { return addr >= 0xC000; }
-  // When ce163Enabled_, the 0000H window is always "mapped" here regardless
+  // With a banked module, the 0000H window is always "mapped" here regardless
   // of extRam0000Size_ (which is forced to 0 by the mutual exclusion in
   // setCe163Enabled) -- the CE-163 has its own separate backing store
-  // (ce163Ram_), read/written directly in readME0/writeME0, not gated by
+  // (bankedRam_), read/written directly in readME0/writeME0, not gated by
   // this size check at all.
   //
   // ce155Enabled_ short-circuits both windows to CE-155's own fixed,
@@ -970,7 +1032,7 @@ class Bus : public lh5801::MemoryBus {
       if (inExtWindow) return (addr - extBase) >= 0x1800;  // 6K
       return addr >= 0x8000 && addr <= 0xBFFF;              // CE-150/153/158 (not connected)
     }
-    return (in0000Window && addr >= extRam0000Size_ && !ce163Enabled_ &&
+    return (in0000Window && addr >= extRam0000Size_ && bankedModule_ == BankedModule::None &&
             !expansionMock_.isCard()) ||  // beyond configured
                                                                             // 0000H module RAM
            (inExtWindow && (addr - extBase) >= extRamExtSize_) ||  // beyond configured expansion RAM
@@ -1015,7 +1077,8 @@ class Bus : public lh5801::MemoryBus {
   // F1-F6 "reserve area" (base+8 .. base+0xC4, see reseedReserveArea's
   // own comment) actually lives.
   uint16_t reserveAreaBase() const {
-    if (ce163Enabled_ || extRam0000Size_ >= kExtRam0000WindowSize || expansionMock_.isCard())
+    if (bankedModule_ != BankedModule::None || extRam0000Size_ >= kExtRam0000WindowSize ||
+        expansionMock_.isCard())
       return 0x0000;
     if (ce155Enabled_) return 0x3800;
     return 0x4000;
@@ -1055,6 +1118,16 @@ class Bus : public lh5801::MemoryBus {
       }
       return;
     }
+    // A banked module: each RAM bank's, in the module's own RAM.
+    if (bankedModule_ != BankedModule::None) {
+      int ramBanks = (std::min)(bankedModuleBankCount(bankedModule_), 8);
+      for (int bank = 0; bank < ramBanks; ++bank) {
+        auto first = bankedRam_.begin() + bank * 0x4000;
+        if (std::all_of(first + 0x8, first + 0xC5, [](uint8_t b) { return b == 0xFF; }))
+          std::fill(first + 0x8, first + 0xC5, 0x00);
+      }
+      return;
+    }
     uint16_t base = reserveAreaBase();
     bool stillGenericFill = std::all_of(me0_.begin() + base + 0x8, me0_.begin() + base + 0xC5,
                                          [](uint8_t b) { return b == 0xFF; });
@@ -1070,10 +1143,12 @@ class Bus : public lh5801::MemoryBus {
   MachineVariant machineVariant_ = MachineVariant::PC1500;
   size_t extRamExtSize_ = 0;
   size_t extRam0000Size_ = 0;
-  bool ce163Enabled_ = false;
+  BankedModule bankedModule_ = BankedModule::None;
   bool ce155Enabled_ = false;
-  uint8_t ce163Bank_ = 0;
-  std::array<uint8_t, 0x8000> ce163Ram_{};  // 32K, two independent 16K banks back-to-back
+  uint8_t bankedBank_ = 0;
+  std::array<uint8_t, 0x20000> bankedRam_{};  // up to 8 independent 16K banks back to back
+  Sst39sf010a ce163fFlash_;
+  bool ce163fProgramEnable_ = true;
   std::array<RomModule, kNumRomModules> romModules_;
   ExpansionMock expansionMock_;
   bool pv_ = false;  // matches CPU::reset()'s own pv_/pu_ default

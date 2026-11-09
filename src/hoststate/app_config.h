@@ -43,11 +43,14 @@ struct AppConfig {
   // setExtRam0000Size.
   size_t extRamExtBytes = 0;
   size_t extRam0000Bytes = 0;
-  // CE-163 module (32K, banked into the same window as extRam0000Bytes) --
+  // A banked module in the same window as extRam0000Bytes: "CE-163",
+  // "CE-1638", "CE-163F" (Bus::bankedModuleName), or empty for none --
   // mutually exclusive with the two fields above and ce155Enabled below,
-  // see Bus::setCe163Enabled's own comment. Same before-cpu.reset()
+  // see Bus::setBankedModule's own comment. Same before-cpu.reset()
   // ordering requirement as the two extRam fields.
-  bool ce163Enabled = false;
+  std::string bankedModule;
+  // The CE-163F's PGM EN bridge: its flash takes writes.
+  bool ce163fProgramEnable = true;
   // CE-155 module (8K: 2K isolated at 3800H + 6K filling the expansion
   // window) -- mutually exclusive with all three fields above, see
   // Bus::setCe155Enabled's own comment. Same ordering requirement.

@@ -8287,6 +8287,100 @@ void testInternalCardBasicBootsOnBank0() {
   CHECK(sram[4 * 0x4000 + 0x00C5] == 0xFF);  // BANK 1 untouched
 }
 
+// CE-1638 (2026-11-09), as its manual (Flash_and_RAM_Drive_Manual_V1.4,
+// Annex A) sets one up: NEW0, BANKSW.BAS RUN puts the formatter at 4100H,
+// CALL&4100 formats all eight banks (PEEK&D4 = 7 after), then the vendor
+// switcher CALL&D5,X moves between banks with each bank's program kept.
+// No expansion module: CE-163x users have none.
+// X= and the CALL are typed as two lines, as the manual shows them: on one
+// line ("X=2:CALL &D5,X") the switcher's return gives ERROR 1 -- not
+// checked on a real CE-1638.
+void testCe1638VendorFormatAndSwitch() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  if (rom.empty()) {
+    std::printf("SKIP: testCe1638VendorFormatAndSwitch -- ROM1.BIN not found.\n");
+    return;
+  }
+  auto m = std::make_unique<BootedMachine>();
+  m->bus.ioPort().useManualRtcClock();
+  m->bus.loadME0(0xC000, rom.data(), rom.size());
+  m->bus.setBankedModule(pc1500::Bus::BankedModule::Ce1638);
+  m->cpu.reset();
+  for (long i = 0; i < 20'000'000 && !m->cpu.halted(); i++) stepOne(*m);
+  for (long i = 0; i < 4'000'000; i++) stepOne(*m);
+  pc1500::Bus& bus = m->bus;
+  auto command = [&](const std::string& line) {
+    bus.writeME0(kErlAbs, 0);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, line);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*m, 20'000'000));
+    if (bus.readME0(kErlAbs) != 0) std::printf("  %s: ERROR %d\n", line.c_str(), bus.readME0(kErlAbs));
+    return bus.readME0(kErlAbs);
+  };
+  auto ptr = [&](uint16_t at) { return static_cast<uint16_t>(bus.readME0(at) << 8 | bus.readME0(at + 1)); };
+  CHECK(waitForIdle(*m));
+  CHECK(command("NEW0") == 0);  // the cold boot's NEW0 check
+  CHECK(ptr(0x7865) == 0x00C5);
+
+  std::string error;
+  CHECK(pc1500::basic::typeBasicProgramText(
+      bus, m->cpu,
+      "10 POKE &4100,&B5,&00,&BE,&41,&0F,&DD,&B7,&08,&99,&08\n"
+      "20 POKE &410A,&BE,&00,&D6,&9A,&04,&2A,&FD,&C8,&68,&58\n"
+      "30 POKE &4114,&2E,&68,&68,&2E,&B5,&00,&1A,&18,&6A,&C4\n"
+      "40 POKE &411E,&51,&88,&03,&4A,&30,&48,&41,&6A,&3F,&F5\n"
+      "50 POKE &4128,&88,&03,&FD,&8A,&AE,&00,&D4,&9A,&FF,&BE\n"
+      "60 POKE &4132,&E2,&4A,&B7,&0F,&89,&30,&BE,&00,&D3,&BA\n"
+      "70 POKE &413C,&E3,&3F,&4A,&00,&04,&5A,&FE,&58,&00,&4A\n"
+      "80 POKE &4146,&65,&48,&78,&FD,&88,&FD,&98,&B7,&08,&8B\n"
+      "90 POKE &4150,&0A,&BE,&00,&F8,&2A,&68,&58,&2E,&68,&68\n"
+      "100 POKE &415A,&2E,&FD,&0A,&FD,&1A,&E9,&78,&63,&00,&6A\n"
+      "110 POKE &4164,&05,&F5,&88,&03,&9A,&01,&04,&01,&04,&01\n"
+      "120 POKE &416E,&04,&FF\n",
+      kCyclesPerFrame, kCyclesPerTimerTick, &error));
+  if (!error.empty()) std::printf("  typeBasicProgramText: %s\n", error.c_str());
+  tapKey(*m, pc1500::Key::Mode);  // PRO -> RUN
+  CHECK(command("RUN") == 0);
+  CHECK(bus.readME0(0x4100) == 0xB5);
+  CHECK(bus.readME0(0x416F) == 0xFF);
+  CHECK(command("CALL &4100") == 0);
+  CHECK(bus.readME0(0x00D4) == 7);  // PEEK&D4: the last bank formatted
+  CHECK(bus.bankedModuleBank() == 7);
+  // Every bank carries the switcher at 00C5H.
+  for (int bank = 0; bank < 8; ++bank)
+    CHECK(bus.bankedRam()[static_cast<size_t>(bank) * 0x4000 + 0x00D5] ==
+          bus.bankedRam()[7 * 0x4000 + 0x00D5]);
+
+  // Bank 7: NEW&104, a program. Bank 2: another. Back: each still there.
+  // NEW and program lines in PRO mode, CALL and RUN in RUN mode.
+  tapKey(*m, pc1500::Key::Mode);  // RUN -> PRO
+  CHECK(command("NEW 260") == 0);
+  uint16_t start = ptr(0x7865);
+  CHECK(start >= 0x0104 && start <= 0x0106);
+  CHECK(command("10 A=7") == 0);
+  CHECK(bus.readME0(start + 1) == 10);
+  tapKey(*m, pc1500::Key::Mode);  // PRO -> RUN
+  CHECK((command("X=2") | command("CALL &D5,X")) == 0);
+  CHECK(bus.bankedModuleBank() == 2);
+  CHECK(bus.readME0(0x00D4) == 2);
+  tapKey(*m, pc1500::Key::Mode);
+  CHECK(command("NEW 260") == 0);
+  CHECK(command("20 A=2") == 0);
+  tapKey(*m, pc1500::Key::Mode);
+  CHECK(bus.readME0(ptr(0x7865) + 1) == 20);
+  CHECK((command("X=7") | command("CALL &D5,X")) == 0);
+  CHECK(bus.bankedModuleBank() == 7);
+  CHECK(ptr(0x7865) == start);
+  CHECK(bus.readME0(start + 1) == 10);
+  CHECK(command("RUN") == 0);
+  CHECK(bus.readME0(0x7900) == 0x00);  // A = 7: exponent 0
+  CHECK(bus.readME0(0x7902) == 0x70);
+  CHECK((command("X=2") | command("CALL &D5,X")) == 0);
+  CHECK(bus.readME0(ptr(0x7865) + 1) == 20);
+}
+
 int main(int argc, char** argv) {
   // expansion_keyword_test [part of a test's name]: only the tests whose
   // names contain it (the whole suite takes about 11 minutes).
@@ -8468,6 +8562,7 @@ int main(int argc, char** argv) {
   RUN(testInternalCardBasicBootsOnBank0);
   RUN(testBankKeywords);
   RUN(testBankOnDongle);
+  RUN(testCe1638VendorFormatAndSwitch);
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

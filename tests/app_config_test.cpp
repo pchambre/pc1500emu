@@ -47,8 +47,8 @@ void testRoundTrip() {
   config.isPC1500A = true;
   config.extRamExtBytes = 0x2000;
   config.extRam0000Bytes = 0x4000;
-  config.ce163Enabled = true;
-  config.ce155Enabled = false;  // deliberately left off -- mutually exclusive with ce163Enabled above
+  config.bankedModule = "CE-163";
+  config.ce155Enabled = false;  // deliberately left off -- mutually exclusive with bankedModule above
   config.bleHostBluetooth = true;
   config.bleFilesDir = "C:/ble/files";
   config.showBluetoothWindow = true;
@@ -73,7 +73,7 @@ void testRoundTrip() {
   CHECK(loaded.isPC1500A == true);
   CHECK(loaded.extRamExtBytes == 0x2000);
   CHECK(loaded.extRam0000Bytes == 0x4000);
-  CHECK(loaded.ce163Enabled == true);
+  CHECK(loaded.bankedModule == "CE-163");
   CHECK(loaded.ce155Enabled == false);
   CHECK(loaded.bleHostBluetooth == true);
   CHECK(loaded.bleFilesDir.has_value());
@@ -101,7 +101,7 @@ void testEmptyConfigRoundTrip() {
   CHECK(loaded.isPC1500A == false);
   CHECK(loaded.extRamExtBytes == 0);
   CHECK(loaded.extRam0000Bytes == 0);
-  CHECK(loaded.ce163Enabled == false);
+  CHECK(loaded.bankedModule.empty());
   CHECK(loaded.ce155Enabled == false);
   CHECK(loaded.bleHostBluetooth == false);
   CHECK(!loaded.bleFilesDir.has_value());
@@ -143,7 +143,7 @@ void testOldConfigMissingNewFieldUsesDefault() {
   CHECK(loaded.isPC1500A == false);              // absent -- AppConfig{}'s default
   CHECK(loaded.extRamExtBytes == 0);             // absent -- AppConfig{}'s default
   CHECK(loaded.extRam0000Bytes == 0);            // absent -- AppConfig{}'s default
-  CHECK(loaded.ce163Enabled == false);           // absent -- AppConfig{}'s default
+  CHECK(loaded.bankedModule.empty());             // absent -- AppConfig{}'s default
   CHECK(loaded.ce155Enabled == false);           // absent -- AppConfig{}'s default
   CHECK(loaded.bleHostBluetooth == false);       // absent -- AppConfig{}'s default
   CHECK(!loaded.bleFilesDir.has_value());        // absent

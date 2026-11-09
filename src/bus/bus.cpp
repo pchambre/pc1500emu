@@ -481,12 +481,13 @@ uint8_t Bus::readME0(uint16_t addr) {
     }
     return 0xFF;  // empty socket, or a module present but not selected by the current PV level
   }
-  // CE-163: reads its own separate 32K backing store directly, bypassing
-  // me0_ entirely, so the bank not currently selected keeps its contents
-  // (see Bus::setCe163Enabled's own comment for why this can't just be a
-  // size gate into me0_ like the other two extension-RAM windows).
-  if (ce163Enabled_ && addr <= 0x3FFF) {
-    return ce163Ram_[static_cast<size_t>(ce163Bank_) * 0x4000 + addr];
+  // A banked module (CE-163/CE-1638/CE-163F): its own backing store,
+  // bypassing me0_ entirely, so the banks not selected keep their contents
+  // (see Bus::setBankedModule). CE-163F banks 8-15 are its flash.
+  if (bankedModule_ != BankedModule::None && addr <= 0x3FFF) {
+    if (bankedBank_ >= 8)
+      return ce163fFlash_.read(static_cast<uint32_t>(bankedBank_ - 8) << 14 | addr);
+    return bankedRam_[static_cast<size_t>(bankedBank_) * 0x4000 + addr];
   }
   // The internal card: its SRAM, in whichever block GP1's V16-V14 select
   // (see Bus::setInternalCard).
@@ -541,23 +542,28 @@ void Bus::writeME0(uint16_t addr, uint8_t value) {
     }
     return;  // not claimed by any module -- isUnmapped's own discard below covers this range anyway
   }
-  // CE-163 bank-select trigger: pin 18 = S3 -> 5800H-5FFFH on a PC-1500,
-  // or the same physical pin wired to S5 -> 6800H-6FFFH on a PC-1500A
-  // (see Bus::setCe163Enabled's own comment). Pure address-line latch on
-  // real hardware -- the byte value is irrelevant, and nothing is
-  // actually stored at this address.
-  {
+  // A banked module's bank-select trigger: pin 18 = S3 -> 5800H-5FFFH on
+  // a PC-1500, or the same physical pin wired to S5 -> 6800H-6FFFH on a
+  // PC-1500A (see Bus::setBankedModule). Pure address-line latch on real
+  // hardware -- the byte value is irrelevant, and nothing is actually
+  // stored at this address.
+  if (bankedModule_ != BankedModule::None) {
     uint16_t triggerBase = machineVariant_ == MachineVariant::PC1500A ? 0x6800 : 0x5800;
-    if (ce163Enabled_ && addr >= triggerBase && addr <= triggerBase + 0x7FF) {
-      ce163Bank_ = static_cast<uint8_t>(addr & 1);
+    if (addr >= triggerBase && addr <= triggerBase + 0x7FF) {
+      bankedBank_ = static_cast<uint8_t>(addr & (bankedModuleBankCount(bankedModule_) - 1));
       return;
     }
-  }
-  // CE-163 data write -- see readME0's own comment for why this bypasses
-  // me0_ and goes straight to the bank-selected slice of ce163Ram_.
-  if (ce163Enabled_ && addr <= 0x3FFF) {
-    ce163Ram_[static_cast<size_t>(ce163Bank_) * 0x4000 + addr] = value;
-    return;
+    // A data write -- see readME0's own comment. A flash bank takes it as
+    // a command cycle, if PGM EN is bridged.
+    if (addr <= 0x3FFF) {
+      if (bankedBank_ >= 8) {
+        if (ce163fProgramEnable_)
+          ce163fFlash_.write(static_cast<uint32_t>(bankedBank_ - 8) << 14 | addr, value);
+      } else {
+        bankedRam_[static_cast<size_t>(bankedBank_) * 0x4000 + addr] = value;
+      }
+      return;
+    }
   }
   if (addr <= 0x3FFF && expansionMock_.isCard()) {
     expansionMock_.setCardSramByte(addr, value);
@@ -736,14 +742,15 @@ void Bus::saveState(std::ostream& os) const {
   // mismatch can be rejected without touching anything).
   writeU32(os, static_cast<uint32_t>(extRamExtSize_));
   writeU32(os, static_cast<uint32_t>(extRam0000Size_));
-  writeBool(os, ce163Enabled_);
-  writeU8(os, ce163Bank_);
+  writeU8(os, static_cast<uint8_t>(bankedModule_));  // version 8
+  writeU8(os, bankedBank_);
   writeBool(os, machineVariant_ == MachineVariant::PC1500A);
   writeBool(os, ce155Enabled_);
   writeBool(os, expansionMock_.isCard());  // version 7
   writeU8(os, expansionMock_.cardV());
   writeBytes(os, me0_.data(), kSavedRamSize);
-  writeBytes(os, ce163Ram_.data(), ce163Ram_.size());
+  writeBytes(os, bankedRam_.data(), bankedRam_.size());
+  writeBytes(os, ce163fFlash_.memory().data(), ce163fFlash_.memory().size());
   writeBytes(os, expansionMock_.cardSram().data(), expansionMock_.cardSram().size());
   for (const auto& p : expansionMock_.bankPtrs()) writeBytes(os, p.data(), p.size());
   for (const RomModule& m : romModules_) {
@@ -756,8 +763,8 @@ bool Bus::loadState(std::istream& is, std::string* error, bool* configMismatch,
   using namespace pc1500state;
   size_t savedExtRamExtSize = readU32(is);
   size_t savedExtRam0000Size = readU32(is);
-  bool savedCe163Enabled = readBool(is);
-  uint8_t savedCe163Bank = readU8(is);
+  auto savedBankedModule = static_cast<BankedModule>(readU8(is));
+  uint8_t savedBankedBank = readU8(is);
   MachineVariant savedVariant =
       readBool(is) ? MachineVariant::PC1500A : MachineVariant::PC1500;
   bool savedCe155Enabled = readBool(is);
@@ -774,7 +781,7 @@ bool Bus::loadState(std::istream& is, std::string* error, bool* configMismatch,
   // under). The caller is responsible for having already applied the
   // intended config before calling this.
   if (savedExtRamExtSize != extRamExtSize_ || savedExtRam0000Size != extRam0000Size_ ||
-      savedCe163Enabled != ce163Enabled_ || savedVariant != machineVariant_ ||
+      savedBankedModule != bankedModule_ || savedVariant != machineVariant_ ||
       savedCe155Enabled != ce155Enabled_ || savedInternalCard != expansionMock_.isCard()) {
     if (error) {
       *error =
@@ -787,16 +794,18 @@ bool Bus::loadState(std::istream& is, std::string* error, bool* configMismatch,
     if (savedConfig) {
       savedConfig->extRamExtSize = savedExtRamExtSize;
       savedConfig->extRam0000Size = savedExtRam0000Size;
-      savedConfig->ce163Enabled = savedCe163Enabled;
+      savedConfig->bankedModule = savedBankedModule;
       savedConfig->machineVariant = savedVariant;
       savedConfig->ce155Enabled = savedCe155Enabled;
       savedConfig->internalCard = savedInternalCard;
     }
     return false;
   }
-  ce163Bank_ = savedCe163Bank;
+  bankedBank_ = savedBankedBank;
   readBytes(is, me0_.data(), kSavedRamSize);
-  readBytes(is, ce163Ram_.data(), ce163Ram_.size());
+  readBytes(is, bankedRam_.data(), bankedRam_.size());
+  readBytes(is, ce163fFlash_.memory().data(), ce163fFlash_.memory().size());
+  ce163fFlash_.resetCommandState();
   readBytes(is, expansionMock_.cardSram().data(), expansionMock_.cardSram().size());
   {
     auto ptrs = expansionMock_.bankPtrs();

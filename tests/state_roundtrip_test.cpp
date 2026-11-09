@@ -222,6 +222,46 @@ void testInternalCardRoundTrip() {
   std::remove(path.c_str());
 }
 
+// Version 8 (2026-11-09): a CE-163F keeps its bank, its RAM banks and its
+// flash; a Bus with a different banked module refuses the state.
+void testCe163fRoundTrip() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  lh5801::CPU cpu(bus);
+  bus.setBankedModule(pc1500::Bus::BankedModule::Ce163F);
+  bus.writeME0(0x5806, 0);
+  bus.writeME0(0x0200, 0x66);
+  bus.ce163fFlash().memory()[0x1C200] = 0x99;  // bank 15, 0200H
+  bus.writeME0(0x580F, 0);
+
+  std::string path = tempPath("pc1500emu_state_roundtrip_test_ce163f.state");
+  std::string err;
+  CHECK(pc1500host::saveStateFile(cpu, bus, path, &err));
+
+  pc1500::Keyboard kb3;
+  pc1500::Bus bus3(kb3);
+  lh5801::CPU cpu3(bus3);
+  bus3.setBankedModule(pc1500::Bus::BankedModule::Ce1638);
+  bool mismatch = false;
+  pc1500::Bus::SavedConfig saved;
+  CHECK(!pc1500host::loadStateFile(cpu3, bus3, path, &err, &mismatch, &saved));
+  CHECK(mismatch);
+  CHECK(saved.bankedModule == pc1500::Bus::BankedModule::Ce163F);
+
+  pc1500::Keyboard kb2;
+  pc1500::Bus bus2(kb2);
+  lh5801::CPU cpu2(bus2);
+  bus2.setBankedModule(pc1500::Bus::BankedModule::Ce163F);
+  err.clear();
+  CHECK(pc1500host::loadStateFile(cpu2, bus2, path, &err));
+  CHECK(err.empty());
+  CHECK(bus2.bankedModuleBank() == 15);
+  CHECK(bus2.readME0(0x0200) == 0x99);
+  bus2.writeME0(0x5806, 0);
+  CHECK(bus2.readME0(0x0200) == 0x66);
+  std::remove(path.c_str());
+}
+
 // Version 5 additions: the machine-variant flag and CE-155's own enabled
 // flag. CE-155 is mutually exclusive with everything testRoundTrip/
 // testCe163RoundTrip already exercise (see Bus::setCe155Enabled's own
@@ -330,6 +370,7 @@ int main() {
   testRoundTrip();
   testCe163RoundTrip();
   testInternalCardRoundTrip();
+  testCe163fRoundTrip();
   testMachineVariantAndCe155RoundTrip();
   testCorruptMagicRejected();
   testTruncatedFileRejected();
