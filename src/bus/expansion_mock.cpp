@@ -582,6 +582,30 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandLogGetInfoEnabled:
       window[0] = logInfoEnabled_ ? 1 : 0;
       return kStatusSuccess;
+    // Banked RAM (2026-11-09, pc_exp.h EXP_COMMAND_BANK_*): the card's
+    // GP1 V16-V14 and the pointers its flash keeps; the dongle has none.
+    case kCommandBankInfo: {
+      int bank = cardBankForV(cardV());
+      window[0] = isCard() && bank >= 0 ? static_cast<uint8_t>(bank) : kBankUnknown;
+      window[1] = isCard() ? kCardBankCount : 0;
+      return kStatusSuccess;
+    }
+    case kCommandBankSelect:
+    case kCommandBankPtrsGet:
+    case kCommandBankPtrsSet: {
+      if (!isCard() || window[0] >= kCardBankCount) return kStatusError;
+      uint8_t bank = window[0];
+      std::lock_guard<std::mutex> lock(bankPtrsMutex_);
+      if (cmd == kCommandBankSelect) {
+        bankSelects_++;
+        setCardV(static_cast<uint8_t>(cardVForBank(bank)));
+      } else if (cmd == kCommandBankPtrsGet) {
+        std::copy(bankPtrs_[bank].begin(), bankPtrs_[bank].end(), window.begin());
+      } else {
+        std::copy(window.begin() + 1, window.begin() + 5, bankPtrs_[bank].begin());
+      }
+      return kStatusSuccess;
+    }
     default:
       if (cmd == 0x67 || cmd == 0x70) return ssh_.pingCommand(cmd, window, !wifiSsid_.empty());  // WFPING
       if (cmd == kCommandHistAdd || cmd == kCommandHistBegin) {  // the command history (2026-10-07)

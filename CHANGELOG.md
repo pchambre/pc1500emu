@@ -4,6 +4,20 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [1.5.0] - 2026-11-09
+
+### Added
+- The card's MCU side of the bank keywords (firmware ECVER 0.15):
+  `EXP_COMMAND_BANK_INFO/SELECT/PTRS_GET/PTRS_SET` in the expansion mock.
+  SELECT sets the card's V16-V14; the banks' saved BASIC pointers are kept
+  like the card's flash, and in the state file. The dongle mock has no
+  banks, as the real dongle.
+- `testBankKeywords`: `BANK`, `BANK n` with each bank's program kept
+  apart, `BANKSUB` by line and by label (with FOR and GOSUB in the
+  callee) and `BANKRTN`, lost pointers found again from the lines, an
+  empty bank, `BANK` refused inside a program, and the ROM's
+  `BANK_RAW_ENTRY` from machine code. `testBankOnDongle`: ERROR 40.
+
 ## [1.4.0] - 2026-11-09
 
 ### Added

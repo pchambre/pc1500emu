@@ -150,7 +150,7 @@ void stepOne(BootedMachine& m) {
 // ordering requirement (src/hoststate/app_config.h).
 std::unique_ptr<BootedMachine> bootAndSettle(
     const std::vector<uint8_t>& rom, size_t extRam0000Bytes = 0x4000, size_t extRamExtBytes = 0x2800,
-    pc1500::Bus::MachineVariant variant = pc1500::Bus::MachineVariant::PC1500) {
+    pc1500::Bus::MachineVariant variant = pc1500::Bus::MachineVariant::PC1500, bool internalCard = false) {
   auto m = std::make_unique<BootedMachine>();
   m->bus.ioPort().useManualRtcClock();
   m->bus.loadME0(0xC000, rom.data(), rom.size());
@@ -160,6 +160,7 @@ std::unique_ptr<BootedMachine> bootAndSettle(
   m->bus.setMachineVariant(variant);
   m->bus.setExtRam0000Size(extRam0000Bytes);
   m->bus.setExtRamExtSize(extRamExtBytes);
+  if (internalCard) m->bus.setInternalCard(true);  // the card's banks in place of 16K
   m->cpu.reset();
   long bootCycles = 0;
   constexpr long kMaxBootCycles = 20'000'000;
@@ -4316,7 +4317,8 @@ struct BleFixture {
 // stageable: the module loaded with the ROM image STAGE copies (rom.bin),
 // as the STAGE tests load it.
 static std::unique_ptr<BleFixture> bleFixture(const char* testName, size_t extRam0000Bytes = 0x4000,
-                                              size_t extRamExtBytes = 0x2800, bool stageable = false) {
+                                              size_t extRamExtBytes = 0x2800, bool stageable = false,
+                                              bool internalCard = false) {
   const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   // EXPROM_DIR: another build of the ROM (rom_8800.bin, rom.bin) -- an
   // older one in a scratch copy, say, to see a test fail without a fix.
@@ -4331,7 +4333,7 @@ static std::unique_ptr<BleFixture> bleFixture(const char* testName, size_t extRa
     return nullptr;
   }
   auto f = std::make_unique<BleFixture>();
-  f->m = bootAndSettle(rom, extRam0000Bytes, extRamExtBytes);
+  f->m = bootAndSettle(rom, extRam0000Bytes, extRamExtBytes, pc1500::Bus::MachineVariant::PC1500, internalCard);
   f->sdDir = makeTempTestDir(testName);
   if (stageable) {
     std::vector<uint8_t> romBin = readFile(kRomDir + "/rom.bin");
@@ -8121,6 +8123,130 @@ void testClockSetOnConnect() {
   CHECK(near(clock(), at(3, 15, 7, 0, 1)));
 }
 
+// Banked RAM (2026-11-09): the internal card's BANK 0-4. BANK switches with
+// BASIC's program going along, each bank keeping its own; BANKSUB calls a
+// line or label in another bank's program and BANKRTN comes back to the
+// statement after it, with the variables (above 4000H) shared and the
+// callee's own FOR/GOSUB left behind. BANK alone shows the bank. A bank's
+// lost or wrong pointers are found again from its lines; a bank with no
+// program becomes an empty one. Plain BANK n inside a program in a bank is
+// ERROR 1 (BANKSUB is the way); the dongle has no banks (ERROR 40).
+// Machine code switches with the ROM's BANK_RAW (8819H), which leaves
+// BASIC's pointers alone.
+void testBankKeywords() {
+  auto f = bleFixture("testBankKeywords", 0, 0x2800, false, true);
+  if (!f) return;
+  pc1500::Bus& bus = f->m->bus;
+  // A, at 7900H, as exponent << 8 | the first two digits
+  auto a = [&]() { return (bus.readME0(0x7900) << 8) | bus.readME0(0x7902); };
+  auto ptrs = [&]() {
+    return std::array<uint16_t, 2>{static_cast<uint16_t>(bus.readME0(0x7865) << 8 | bus.readME0(0x7866)),
+                                   static_cast<uint16_t>(bus.readME0(0x7867) << 8 | bus.readME0(0x7868))};
+  };
+  // `line` (RUN, GOTO n) in RUN mode, then back to PRO for more lines;
+  // its error number.
+  auto runProgram = [&](const char* line = "RUN") {
+    bus.writeME0(kErlAbs, 0);
+    tapKey(*f->m, pc1500::Key::Cl);
+    tapKey(*f->m, pc1500::Key::Mode);  // PRO -> RUN: RUN in PRO mode is ERROR 26
+    tapKey(*f->m, pc1500::Key::Cl);
+    typeText(*f->m, line);
+    tapKey(*f->m, pc1500::Key::Ent);
+    CHECK(waitForIdle(*f->m, 20'000'000));
+    int erl = bus.readME0(kErlAbs);
+    tapKey(*f->m, pc1500::Key::Cl);
+    tapKey(*f->m, pc1500::Key::Mode);  // back to PRO
+    CHECK(waitForIdle(*f->m));
+    return erl;
+  };
+
+  CHECK(f->run("BANK") == 0);
+  CHECK(f->shown() == "BANK 0");
+  f->key(pc1500::Key::Ent);
+
+  // BANK 0's program calls into BANK 1 by line and BANK 2 by label.
+  CHECK(f->typeProgram("10 A=1\n20 BANKSUB 1,100\n30 A=A+10\n40 BANKSUB 2,\"SUB\"\n50 A=A+1000\n60 END\n"));
+  auto bank0 = ptrs();
+  CHECK(bank0[0] == 0x00C5);
+  CHECK(f->run("BANK 1") == 0);
+  CHECK(bus.internalCardBank() == 1);
+  CHECK(ptrs()[0] == 0x00C5 && ptrs()[1] == 0x00C5);  // never used: an empty program
+  CHECK(bus.readME0(0x00C5) == 0xFF);
+  // The callee: its own FOR and GOSUB, left open as BANKRTN leaves.
+  CHECK(f->typeProgram("100 FOR I=1 TO 3\n110 GOSUB 200\n120 BANKRTN\n200 A=A*2\n210 RETURN\n"));
+  auto bank1 = ptrs();
+  CHECK(f->run("BANK 2") == 0);
+  CHECK(f->typeProgram("300 \"SUB\" A=A+100:BANKRTN\n"));
+  CHECK(f->run("BANK 0") == 0);
+  CHECK(ptrs() == bank0);
+  CHECK(runProgram() == 0);
+  CHECK(bus.internalCardBank() == 0);  // back where it started
+  CHECK(a() == 0x0311);                // ((1*2)+10+100)+1000 = 1112
+  CHECK(ptrs() == bank0);
+  CHECK(f->mock->bankSelects() >= 6);
+
+  // Each bank still lists its own program.
+  CHECK(f->run("BANK 1") == 0);
+  CHECK(ptrs() == bank1);
+  CHECK(bus.readME0(0x00C6) == 100);  // line 100 first
+
+  // BANK n inside a program in a bank: ERROR 1, the program stays put.
+  f->run("130 BANK 2");  // typed in PRO mode: a line added (typeProgram would NEW first)
+  CHECK(runProgram("GOTO 130") == 1);
+  CHECK(bus.internalCardBank() == 1);
+  bank1 = ptrs();
+
+  // BANKSUB at the prompt, or BANKRTN with nothing to return to.
+  CHECK(f->run("BANKSUB 2,300") == 1);
+  CHECK(f->run("BANKRTN") == 40);
+
+  // Lost pointers: found again from the lines.
+  CHECK(f->run("BANK 0") == 0);
+  auto saved = f->mock->bankPtrs();
+  saved[1] = {0x12, 0x34, 0x00, 0x10};  // nonsense
+  f->mock->setBankPtrs(saved);
+  CHECK(f->run("BANK 1") == 0);
+  CHECK(ptrs() == bank1);
+
+  // A bank holding no program (data, say): an empty one.
+  CHECK(f->run("BANK 0") == 0);
+  f->mock->setCardV(static_cast<uint8_t>(pc1500::ExpansionMock::cardVForBank(3)));
+  bus.writeME0(0x00C5, 0x12);
+  bus.writeME0(0x00C6, 0x34);
+  f->mock->setCardV(0);
+  CHECK(f->run("BANK 3") == 0);
+  CHECK(ptrs()[0] == 0x00C5 && ptrs()[1] == 0x00C5);
+  CHECK(bus.readME0(0x00C5) == 0xFF);
+  CHECK(f->run("BANK 0") == 0);
+  CHECK(ptrs() == bank0);
+
+  // Out of range.
+  CHECK(f->run("BANK 5") == 1);
+
+  // Machine code: BANK_RAW (8819H) with A = 2, from fixed RAM at 4100H:
+  // LDI A,2 / SJP 8819H / RTN. BASIC's pointers stay; bank 2 is in.
+  int before = f->mock->bankSelects();
+  const uint8_t code[] = {0xB5, 0x02, 0xBE, 0x88, 0x19, 0x9A};
+  for (size_t i = 0; i < sizeof code; i++) bus.writeME0(static_cast<uint16_t>(0x4100 + i), code[i]);
+  CHECK(f->run("CALL &4100") == 0);
+  CHECK(bus.internalCardBank() == 2);
+  CHECK(f->mock->bankSelects() == before + 1);
+  CHECK(ptrs() == bank0);
+  bus.writeME0(0x4101, 0x00);  // and back, A = 0
+  CHECK(f->run("CALL &4100") == 0);
+  CHECK(bus.internalCardBank() == 0);
+  CHECK(runProgram() == 0);  // the program still runs
+  CHECK(a() == 0x0311);
+}
+
+// The dongle has no banks: BANK and BANKSUB are ERROR 40.
+void testBankOnDongle() {
+  auto f = bleFixture("testBankOnDongle");
+  if (!f) return;
+  CHECK(f->run("BANK") == 40);
+  CHECK(f->run("BANK 1") == 40);
+}
+
 // The internal card (2026-11-09): BASIC boots onto the card's BANK 0 as
 // it does onto a plain 16K at 0000H -- the same RAM scan, programs from
 // 00C5H -- and a program typed there is in the card's SRAM block 0, not
@@ -8340,6 +8466,8 @@ int main(int argc, char** argv) {
   RUN(testSdChannelCommandsRaiseError1OnMalformedArgument);
   RUN(testSdinputOverlongStringRaisesError42);
   RUN(testInternalCardBasicBootsOnBank0);
+  RUN(testBankKeywords);
+  RUN(testBankOnDongle);
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

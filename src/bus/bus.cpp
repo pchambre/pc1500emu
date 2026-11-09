@@ -745,6 +745,7 @@ void Bus::saveState(std::ostream& os) const {
   writeBytes(os, me0_.data(), kSavedRamSize);
   writeBytes(os, ce163Ram_.data(), ce163Ram_.size());
   writeBytes(os, expansionMock_.cardSram().data(), expansionMock_.cardSram().size());
+  for (const auto& p : expansionMock_.bankPtrs()) writeBytes(os, p.data(), p.size());
   for (const RomModule& m : romModules_) {
     saveRomModule(os, m);
   }
@@ -797,6 +798,11 @@ bool Bus::loadState(std::istream& is, std::string* error, bool* configMismatch,
   readBytes(is, me0_.data(), kSavedRamSize);
   readBytes(is, ce163Ram_.data(), ce163Ram_.size());
   readBytes(is, expansionMock_.cardSram().data(), expansionMock_.cardSram().size());
+  {
+    auto ptrs = expansionMock_.bankPtrs();
+    for (auto& p : ptrs) readBytes(is, p.data(), p.size());
+    expansionMock_.setBankPtrs(ptrs);
+  }
   expansionMock_.setCardV(savedCardV);
   bool ok = true;
   for (RomModule& m : romModules_) {

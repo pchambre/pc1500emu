@@ -18,7 +18,8 @@
 // reserve-key area, but in general -- loaded into a different one, the
 // same way real PC-1500 RAM (short of a battery-backed module) doesn't
 // survive a hardware reconfiguration either; version 7 added the internal
-// card -- its flag, GP1's V16-V14, and its 128K SRAM) -- restoring a session is
+// card -- its flag, GP1's V16-V14, its 128K SRAM and its banks' saved BASIC
+// pointers) -- restoring a session is
 // meant to resume exactly where OFF left the machine, the same way real
 // hardware's OFF/ON cycle just halts and wakes the CPU in place rather
 // than resetting it, so the caller must NOT call cpu.reset() after a

@@ -522,6 +522,10 @@ class ExpansionMock {
   static constexpr int kBleFileArgs = 42;
   static constexpr int kStoreParams = 0x7F0;
 
+  // Banked RAM (2026-11-09) -- pc_exp.h EXP_COMMAND_BANK_*
+  static constexpr uint8_t kCommandBankInfo = 0x84, kCommandBankSelect = 0x85, kCommandBankPtrsGet = 0x86,
+                           kCommandBankPtrsSet = 0x87;
+  static constexpr uint8_t kBankUnknown = 0xFF;
   static constexpr uint8_t kCommandWake = 0xFF;   // the wake's two phases (pc_exp.h EXP_COMMAND_WAKE)
   static constexpr uint8_t kCommandReady = 0xFE;
 
@@ -813,6 +817,19 @@ class ExpansionMock {
   // The whole array, for Bus::saveState/loadState and tests.
   std::vector<uint8_t>& cardSram() { return cardSram_; }
   const std::vector<uint8_t>& cardSram() const { return cardSram_; }
+  // Each bank's BASIC pointers as the card's flash keeps them (EXP_COMMAND_
+  // BANK_PTRS_*), all FF until saved -- the BANK keywords' table. Saved in
+  // the state file with the SRAM; a copy, for that and tests.
+  std::array<std::array<uint8_t, 4>, kCardBankCount> bankPtrs() const {
+    std::lock_guard<std::mutex> lock(bankPtrsMutex_);
+    return bankPtrs_;
+  }
+  void setBankPtrs(const std::array<std::array<uint8_t, 4>, kCardBankCount>& ptrs) {
+    std::lock_guard<std::mutex> lock(bankPtrsMutex_);
+    bankPtrs_ = ptrs;
+  }
+  // How many BANK_SELECTs the MCU has done (tests: a raw switch went through the MCU).
+  int bankSelects() const { return bankSelects_.load(); }
 
   // SDOPEN/SDCLOSE/SDINPUT#/SDPRINT#/SDSKIP# -- up to kMaxSdChannels files
   // open at once, numbered 1..kMaxSdChannels (0 is the "close all"
@@ -1052,6 +1069,13 @@ class ExpansionMock {
   Board board_ = Board::Dongle;
   std::atomic<uint8_t> cardV_{0};
   std::vector<uint8_t> cardSram_ = std::vector<uint8_t>(kCardSramSize, 0xFF);
+  mutable std::mutex bankPtrsMutex_;
+  std::array<std::array<uint8_t, 4>, kCardBankCount> bankPtrs_ = [] {
+    std::array<std::array<uint8_t, 4>, kCardBankCount> a{};
+    for (auto& p : a) p.fill(0xFF);
+    return a;
+  }();
+  std::atomic<int> bankSelects_{0};
   bool remapActive_ = false;
   bool romCopyActive_ = false;
   int romCopyBlockIndex_ = 0;
