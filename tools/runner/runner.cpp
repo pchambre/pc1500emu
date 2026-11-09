@@ -8,10 +8,23 @@
 // runs its tests through it), but nothing in it is specific to them.
 //
 // usage: pc1500runner <rom> <bin> <load hex> [options] [script...]
+//   <bin> "-": nothing loaded or CALLed -- the script does it all (with
+//                  --sd, SDLOAD M, say)
 //   --ram0000 N    bytes of RAM at 0000H (e.g. 16384)
 //   --ramext N     bytes of extension RAM at 4800H (e.g. 8192, 10240)
 //   --call ADDR    CALL address (default: the load address)
 //   --new ADDR     type NEW &ADDR first, reserving the program's RAM
+//   --banked NAME  a banked module at 0000H: CE-163, CE-1638 or CE-163F
+//   --card         the internal expansion card: BANK 0-4 at 0000H (with
+//                  --expansion; --ramext 10240 as the card fills 4800H too)
+//   --expansion FILE  the expansion module's ROM (rom_8800.bin) at 8800H,
+//                  its MCU the emulator's mock, as the emulator loads it
+//   --sd DIR       the expansion module's SD card: a host directory
+//   --bank N:FILE:ADDR  load FILE into bank N at ADDR (hex) before the
+//                  CALL (repeatable), the banked module's or the card's;
+//                  bank 0 is put back after, with the bank number where
+//                  the vendor's switcher keeps it (00D4H on a CE-1638,
+//                  00E2H on a CE-163F), as its format leaves it
 //   --map FILE     an sdld .map: lets addresses below name symbols
 //   -f FILE        read more script tokens from FILE (whitespace-separated,
 //                  # to end of line is a comment)
@@ -256,11 +269,17 @@ int main(int argc, char** argv) {
     return 2;
   }
   std::vector<uint8_t> rom = readFile(argv[1]);
-  std::vector<uint8_t> bin = readFile(argv[2]);
+  const bool noBin = std::string(argv[2]) == "-";
+  std::vector<uint8_t> bin = noBin ? std::vector<uint8_t>{} : readFile(argv[2]);
   unsigned load = std::stoul(argv[3], nullptr, 16);
   unsigned call = load;
   size_t ram0000 = 0, ramext = 0;
   std::string reserve;
+  std::string banked;
+  std::string expansion;
+  std::string sdDir;
+  bool card = false;
+  std::vector<std::string> bankLoads;
   bool quiet = false;
   std::vector<std::string> script;
 
@@ -277,6 +296,11 @@ int main(int argc, char** argv) {
     else if (a == "--ramext") ramext = std::stoul(next());
     else if (a == "--call") call = std::stoul(next(), nullptr, 16);
     else if (a == "--new") reserve = next();
+    else if (a == "--banked") banked = next();
+    else if (a == "--card") card = true;
+    else if (a == "--expansion") expansion = next();
+    else if (a == "--sd") sdDir = next();
+    else if (a == "--bank") bankLoads.push_back(next());
     else if (a == "--map") loadMap(next().c_str());
     else if (a == "-q") quiet = true;
     else if (a == "-f") {
@@ -292,7 +316,7 @@ int main(int argc, char** argv) {
       script.push_back(a);
     }
   }
-  if (rom.empty() || bin.empty()) {
+  if (rom.empty() || (bin.empty() && !noBin)) {
     std::fprintf(stderr, "can't read %s\n", rom.empty() ? argv[1] : argv[2]);
     return 2;
   }
@@ -302,9 +326,27 @@ int main(int argc, char** argv) {
   m.bus.loadME0(0xC000, rom.data(), rom.size());
   if (ram0000) m.bus.setExtRam0000Size(ram0000);
   if (ramext) m.bus.setExtRamExtSize(ramext);
+  if (!banked.empty()) {
+    auto module = pc1500::Bus::bankedModuleFromName(banked);
+    if (module == pc1500::Bus::BankedModule::None) {
+      std::fprintf(stderr, "--banked: CE-163, CE-1638 or CE-163F, not %s\n", banked.c_str());
+      return 2;
+    }
+    m.bus.setBankedModule(module);
+  }
+  if (card) m.bus.setInternalCard(true);
   m.cpu.reset();
   while (!m.cpu.halted() && m.cycles < 20'000'000) m.step(1);
   m.step(4'000'000);
+  if (!expansion.empty()) {
+    std::vector<uint8_t> expRom = readFile(expansion.c_str());
+    if (expRom.empty()) {
+      std::fprintf(stderr, "can't read %s\n", expansion.c_str());
+      return 2;
+    }
+    m.bus.loadExpansionModule(0, expRom.data(), expRom.size(), 0x8800, false, false, 0x8000, 0x800, 0x87FF);
+    if (!sdDir.empty()) m.bus.expansionMock().setRootDir(sdDir);
+  }
   m.tap(Key::Cl);
   m.type("NEW0");  // the cold-boot state, cleared as on a real machine
   m.tap(Key::Ent);
@@ -318,11 +360,41 @@ int main(int argc, char** argv) {
   }
   if (!quiet)
     std::printf("[%zu glyphs; BASIC from %04X]\n", glyphs.size(), pc1500::basic::basicProgramStart(m.bus));
-  m.bus.loadME0(static_cast<uint16_t>(load), bin.data(), bin.size());
-  char callText[32];
-  std::snprintf(callText, sizeof callText, "CALL &%04X", call);
-  m.type(callText);
-  m.tap(Key::Ent);
+  if (!noBin) m.bus.loadME0(static_cast<uint16_t>(load), bin.data(), bin.size());
+  if (!bankLoads.empty()) {
+    const uint16_t port = m.bus.machineVariant() == pc1500::Bus::MachineVariant::PC1500A ? 0x6800 : 0x5800;
+    for (const std::string& spec : bankLoads) {
+      size_t c1 = spec.find(':'), c2 = spec.rfind(':');
+      if (c1 == std::string::npos || c2 == c1) {
+        std::fprintf(stderr, "--bank N:FILE:ADDR, not %s\n", spec.c_str());
+        return 2;
+      }
+      unsigned bank = std::stoul(spec.substr(0, c1));
+      std::vector<uint8_t> image = readFile(spec.substr(c1 + 1, c2 - c1 - 1).c_str());
+      unsigned at = std::stoul(spec.substr(c2 + 1), nullptr, 16);
+      if (image.empty()) {
+        std::fprintf(stderr, "can't read %s\n", spec.c_str());
+        return 2;
+      }
+      if (card)
+        m.bus.expansionMock().setCardV(static_cast<uint8_t>(pc1500::ExpansionMock::cardVForBank(bank)));
+      else
+        m.bus.writeME0(static_cast<uint16_t>(port + bank), 0);
+      for (size_t i = 0; i < image.size(); i++) m.bus.writeME0(static_cast<uint16_t>(at + i), image[i]);
+    }
+    if (card)
+      m.bus.expansionMock().setCardV(0);
+    else
+      m.bus.writeME0(port, 0);
+    if (m.bus.bankedModule() == pc1500::Bus::BankedModule::Ce1638) m.bus.writeME0(0x00D4, 0);
+    if (m.bus.bankedModule() == pc1500::Bus::BankedModule::Ce163F) m.bus.writeME0(0x00E2, 0);
+  }
+  if (!noBin) {
+    char callText[32];
+    std::snprintf(callText, sizeof callText, "CALL &%04X", call);
+    m.type(callText);
+    m.tap(Key::Ent);
+  }
 
   static const std::map<std::string, Key> names = {
       {"ENT", Key::Ent},   {"CL", Key::Cl},       {"UP", Key::Up},       {"DOWN", Key::Down},

@@ -8389,6 +8389,46 @@ void testCe1638VendorFormatAndSwitch() {
   CHECK(bus.readME0(ptr(0x7865) + 1) == 20);
 }
 
+// SDLOAD M of a banked program's file (2026-11-09, build-lh5801.sh
+// --banks=card): FFH 'B', the CALL address, a count, then per segment
+// bank (FFH: none), address, length; the bytes follow. Each bank's piece
+// goes in raw, the bank that was in is put back, then the CALL. Here
+// BANK 3 gets FF AA BB at 00C5H and fixed code at 4120H asks BANK_RAW
+// which bank is in (LDI A,FFH / SJP 8819H / STA (4110H) / RTN). On the
+// dongle, which has no banks, the file is ERROR 40.
+static void writeSegmentFile(const fs::path& path) {
+  const uint8_t code[] = {0xB5, 0xFF, 0xBE, 0x88, 0x19, 0xAE, 0x41, 0x10, 0x9A};
+  std::vector<uint8_t> f = {0xFF, 'B', 0x41, 0x20, 2,
+                            3, 0x00, 0xC5, 0x00, 3,
+                            0xFF, 0x41, 0x20, 0x00, static_cast<uint8_t>(sizeof code),
+                            0xFF, 0xAA, 0xBB};
+  f.insert(f.end(), code, code + sizeof code);
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(f.data()), static_cast<std::streamsize>(f.size()));
+}
+
+void testSdloadBankedSegments() {
+  auto f = bleFixture("testSdloadBankedSegments", 0, 0x2800, false, true);
+  if (!f) return;
+  pc1500::Bus& bus = f->m->bus;
+  writeSegmentFile(f->sdDir / "SEGS.BIN");
+  bus.writeME0(0x4110, 0x77);
+  CHECK(f->run("SDLOAD M \"SEGS.BIN\"") == 0);
+  CHECK(bus.readME0(0x4110) == 0);       // the CALL ran, with BANK 0 back in
+  CHECK(bus.internalCardBank() == 0);
+  CHECK(bus.readME0(0x4120) == 0xB5);
+  f->mock->setCardV(static_cast<uint8_t>(pc1500::ExpansionMock::cardVForBank(3)));
+  CHECK(bus.readME0(0x00C5) == 0xFF);
+  CHECK(bus.readME0(0x00C6) == 0xAA);
+  CHECK(bus.readME0(0x00C7) == 0xBB);
+  f->mock->setCardV(0);
+
+  auto d = bleFixture("testSdloadBankedSegments (dongle)");
+  if (!d) return;
+  writeSegmentFile(d->sdDir / "SEGS.BIN");
+  CHECK(d->run("SDLOAD M \"SEGS.BIN\"") == 40);
+}
+
 int main(int argc, char** argv) {
   // expansion_keyword_test [part of a test's name]: only the tests whose
   // names contain it (the whole suite takes about 11 minutes).
@@ -8571,6 +8611,7 @@ int main(int argc, char** argv) {
   RUN(testBankKeywords);
   RUN(testBankOnDongle);
   RUN(testCe1638VendorFormatAndSwitch);
+  RUN(testSdloadBankedSegments);
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

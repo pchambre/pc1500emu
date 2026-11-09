@@ -4,6 +4,20 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [1.7.0] - 2026-11-09
+
+### Added
+- pc1500runner runs banked C programs (sdcc-pc1500's `build-lh5801.sh
+  --banks=`): `--banked CE-163|CE-1638|CE-163F`, `--card` (the internal
+  card, with `--expansion rom_8800.bin` for its ROM and MCU mock), `--bank
+  N:FILE:ADDR` to load a bank's image before the CALL, `--sd DIR` for the
+  expansion module's SD card, and `-` for the program, so that the script
+  does the loading itself (`SDLOAD M`, say).
+- `testSdloadBankedSegments`: `SDLOAD M` of a banked program's file (FFH
+  'B' header, a segment per bank) loads each bank raw, puts the starting
+  bank back and CALLs; on the dongle it's ERROR 40. `testBankKeywords`:
+  `BANK_RAW` with A = FFH answers the bank that's in.
+
 ## [1.6.0] - 2026-11-09
 
 ### Added
