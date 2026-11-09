@@ -38,6 +38,9 @@ namespace pc1500host {
 
 inline constexpr char kStateFileMagic[4] = {'P', 'C', '1', 'S'};
 inline constexpr uint16_t kStateFileVersion = 8;
+// Older formats still read (2026-11-09): 6 and 7 are the same CPU state and
+// the Bus's older layouts (Bus::loadState). A save always writes the current one.
+inline constexpr uint16_t kOldestStateFileVersion = 6;
 
 // Writes an 8-byte header (4-byte magic, u16 version, 2 reserved bytes),
 // then cpu.saveState(), then bus.saveState(). Returns false with *error
@@ -45,11 +48,10 @@ inline constexpr uint16_t kStateFileVersion = 8;
 bool saveStateFile(const lh5801::CPU& cpu, const pc1500::Bus& bus, const std::string& path,
                     std::string* error);
 
-// Validates the header (magic must match; formatVersion must equal
-// kStateFileVersion exactly -- this is early-stage software with no
-// installed base to keep old state files compatible with, so a version
-// mismatch in either direction is simply rejected rather than partially
-// misread) before calling cpu.loadState()/bus.loadState(). Returns false
+// Validates the header (magic must match; the format version must be
+// kOldestStateFileVersion..kStateFileVersion -- an older one is read as
+// the layout it had, a newer or much older one rejected rather than
+// partially misread) before calling cpu.loadState()/bus.loadState(). Returns false
 // -- with *error set, and cpu/bus possibly partially modified, so callers
 // should treat any false return as fatal to this restore attempt -- if
 // the file is missing/unreadable, too short, has the wrong magic, or a

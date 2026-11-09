@@ -56,6 +56,8 @@ bool loadAppConfig(const std::string& path, AppConfig* out, std::string* error) 
   out->extRamExtBytes = j.value("extRamExtBytes", static_cast<size_t>(0));
   out->extRam0000Bytes = j.value("extRam0000Bytes", static_cast<size_t>(0));
   out->bankedModule = j.value("bankedModule", std::string());
+  // before 1.6.0 the CE-163 was a flag of its own
+  if (!j.contains("bankedModule") && j.value("ce163Enabled", false)) out->bankedModule = "CE-163";
   out->ce163fProgramEnable = j.value("ce163fProgramEnable", true);
   out->ce155Enabled = j.value("ce155Enabled", false);
   out->internalCard = j.value("internalCard", false);

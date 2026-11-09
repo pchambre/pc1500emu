@@ -759,17 +759,33 @@ void Bus::saveState(std::ostream& os) const {
 }
 
 bool Bus::loadState(std::istream& is, std::string* error, bool* configMismatch,
-                     SavedConfig* savedConfig) {
+                     SavedConfig* savedConfig, uint16_t format) {
   using namespace pc1500state;
+  // Formats 6 and 7 (2026-11-09) still load: 6 had a CE-163 flag where 8
+  // has the banked module's kind, and no internal card; 7 added the card
+  // (its flag, V16-V14, SRAM, banks' pointers) after the CE-163's 32K;
+  // 8 widened that to 128K and added the CE-163F's flash.
+  if (format < 6 || format > 8) {
+    if (error) *error = "unknown Bus state format " + std::to_string(format);
+    return false;
+  }
   size_t savedExtRamExtSize = readU32(is);
   size_t savedExtRam0000Size = readU32(is);
-  auto savedBankedModule = static_cast<BankedModule>(readU8(is));
+  BankedModule savedBankedModule;
+  if (format >= 8)
+    savedBankedModule = static_cast<BankedModule>(readU8(is));
+  else
+    savedBankedModule = readBool(is) ? BankedModule::Ce163 : BankedModule::None;
   uint8_t savedBankedBank = readU8(is);
   MachineVariant savedVariant =
       readBool(is) ? MachineVariant::PC1500A : MachineVariant::PC1500;
   bool savedCe155Enabled = readBool(is);
-  bool savedInternalCard = readBool(is);
-  uint8_t savedCardV = readU8(is);
+  bool savedInternalCard = false;
+  uint8_t savedCardV = 0;
+  if (format >= 7) {
+    savedInternalCard = readBool(is);
+    savedCardV = readU8(is);
+  }
   if (!is) {
     if (error) *error = "truncated or corrupt (couldn't even read the config header)";
     return false;
@@ -803,11 +819,16 @@ bool Bus::loadState(std::istream& is, std::string* error, bool* configMismatch,
   }
   bankedBank_ = savedBankedBank;
   readBytes(is, me0_.data(), kSavedRamSize);
-  readBytes(is, bankedRam_.data(), bankedRam_.size());
-  readBytes(is, ce163fFlash_.memory().data(), ce163fFlash_.memory().size());
+  if (format >= 8) {
+    readBytes(is, bankedRam_.data(), bankedRam_.size());
+    readBytes(is, ce163fFlash_.memory().data(), ce163fFlash_.memory().size());
+  } else {
+    bankedRam_.fill(0xFF);
+    readBytes(is, bankedRam_.data(), 0x8000);  // the CE-163's two banks
+  }
   ce163fFlash_.resetCommandState();
-  readBytes(is, expansionMock_.cardSram().data(), expansionMock_.cardSram().size());
-  {
+  if (format >= 7) {
+    readBytes(is, expansionMock_.cardSram().data(), expansionMock_.cardSram().size());
     auto ptrs = expansionMock_.bankPtrs();
     for (auto& p : ptrs) readBytes(is, p.data(), p.size());
     expansionMock_.setBankPtrs(ptrs);

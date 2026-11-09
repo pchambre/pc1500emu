@@ -43,16 +43,17 @@ bool loadStateFile(lh5801::CPU& cpu, pc1500::Bus& bus, const std::string& path, 
   }
   uint16_t version = pc1500state::readU16(f);
   pc1500state::readU16(f);  // reserved
-  if (!f || version != kStateFileVersion) {
+  if (!f || version < kOldestStateFileVersion || version > kStateFileVersion) {
     if (error) {
       *error = "'" + path + "' has state-file format version " + std::to_string(version) +
-                ", this build expects version " + std::to_string(kStateFileVersion);
+                ", this build reads versions " + std::to_string(kOldestStateFileVersion) + "-" +
+                std::to_string(kStateFileVersion);
     }
     return false;
   }
   cpu.loadState(f);
   std::string busError;
-  if (!bus.loadState(f, &busError, configMismatch, savedConfig) || !f) {
+  if (!bus.loadState(f, &busError, configMismatch, savedConfig, version) || !f) {
     if (error) *error = "'" + path + "': " + (busError.empty() ? "truncated or corrupt" : busError);
     return false;
   }

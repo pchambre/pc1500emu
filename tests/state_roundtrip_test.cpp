@@ -6,9 +6,13 @@
 #endif
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <fstream>
 #include <string>
+#include <vector>
+#include <iterator>
+#include <sstream>
 
 #include "bus.h"
 #include "keyboard.h"
@@ -262,6 +266,104 @@ void testCe163fRoundTrip() {
   std::remove(path.c_str());
 }
 
+// Older state files still load (2026-11-09): a version-6 file (before the
+// internal card) and a version-7 one (before the CE-1638/CE-163F), made
+// by rewriting a version-8 save into each older layout. Version 8's Bus
+// part: ext and 0000H sizes (U32 each), the banked module's kind, its
+// bank, variant, CE-155, card flag, V16-V14 (a byte each), 32K of RAM,
+// the banked module's 128K RAM, the CE-163F's 128K flash, the card's 128K
+// SRAM, its five banks' 4 pointer bytes, then the ROM modules. Version 7
+// had the CE-163's flag where the kind is now and only 32K of its RAM, no
+// flash; version 6 also had no card flag, V16-V14, SRAM or pointers.
+static std::vector<uint8_t> olderStateFile(const std::vector<uint8_t>& v8, size_t busStart, int version) {
+  const size_t kHeader = 14, kRam = 0x8000, kBanked = 0x20000, kCardSram = 0x20000, kPtrs = 5 * 4;
+  std::vector<uint8_t> out(v8.begin(), v8.begin() + static_cast<std::ptrdiff_t>(busStart));
+  out[4] = static_cast<uint8_t>(version);  // header: magic, then the version (little-endian)
+  out[5] = static_cast<uint8_t>(version >> 8);
+  auto at = [&](size_t off) { return v8.begin() + static_cast<std::ptrdiff_t>(busStart + off); };
+  size_t headerLen = version >= 7 ? kHeader : kHeader - 2;  // 6: no card flag, no V16-V14
+  out.insert(out.end(), at(0), at(headerLen));
+  size_t ram = kHeader;
+  out.insert(out.end(), at(ram), at(ram + kRam));
+  size_t banked = ram + kRam;
+  out.insert(out.end(), at(banked), at(banked + 0x8000));  // the CE-163's 32K
+  size_t card = banked + kBanked + pc1500::Sst39sf010a::kSize;
+  if (version >= 7) out.insert(out.end(), at(card), at(card + kCardSram + kPtrs));
+  out.insert(out.end(), at(card + kCardSram + kPtrs), v8.end());  // the ROM modules
+  return out;
+}
+
+void testOlderVersionsLoad() {
+  for (int version : {6, 7}) {
+    pc1500::Keyboard kb;
+    pc1500::Bus bus(kb);
+    lh5801::CPU cpu(bus);
+    bus.setCe163Enabled(true);
+    bus.writeME0(0x0010, 0x5A);  // CE-163 bank 0
+    bus.writeME0(0x5801, 0);
+    bus.writeME0(0x0010, 0xA5);  // bank 1, left in
+    bus.writeME0(0x4010, 0xCD);
+    uint8_t module[4] = {0x11, 0x22, 0x33, 0x44};
+    bus.loadRomModule(1, module, sizeof module, 0xA000, false, false);
+
+    std::string path = tempPath("pc1500emu_state_roundtrip_test_old.state");
+    std::string err;
+    CHECK(pc1500host::saveStateFile(cpu, bus, path, &err));
+    std::vector<uint8_t> v8;
+    {
+      std::ifstream in(path, std::ios::binary);
+      v8.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    std::ostringstream cpuState;
+    cpu.saveState(cpuState);
+    std::vector<uint8_t> old = olderStateFile(v8, 8 + cpuState.str().size(), version);
+    {
+      std::ofstream out(path, std::ios::binary | std::ios::trunc);
+      out.write(reinterpret_cast<const char*>(old.data()), static_cast<std::streamsize>(old.size()));
+    }
+
+    pc1500::Keyboard kb2;
+    pc1500::Bus bus2(kb2);
+    lh5801::CPU cpu2(bus2);
+    bus2.setCe163Enabled(true);
+    err.clear();
+    CHECK(pc1500host::loadStateFile(cpu2, bus2, path, &err));
+    if (!err.empty()) std::printf("  version %d: %s\n", version, err.c_str());
+    CHECK(bus2.ce163Bank() == 1);
+    CHECK(bus2.readME0(0x0010) == 0xA5);
+    CHECK(bus2.readME0(0x4010) == 0xCD);
+    CHECK(bus2.readME0(0xA002) == 0x33);
+    bus2.writeME0(0x5800, 0);
+    CHECK(bus2.readME0(0x0010) == 0x5A);
+    std::remove(path.c_str());
+  }
+}
+
+// PC1500EMU_STATE=<file>: that saved session loads, under the RAM
+// configuration it was saved with -- a real state file from an older build.
+void testStateFileFromEnvironment() {
+  const char* path = std::getenv("PC1500EMU_STATE");
+  if (!path) return;
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  lh5801::CPU cpu(bus);
+  std::string err;
+  bool mismatch = false;
+  pc1500::Bus::SavedConfig saved;
+  if (!pc1500host::loadStateFile(cpu, bus, path, &err, &mismatch, &saved)) {
+    CHECK(mismatch);
+    bus.setMachineVariant(saved.machineVariant);
+    bus.setExtRamExtSize(saved.extRamExtSize);
+    bus.setExtRam0000Size(saved.extRam0000Size);
+    bus.setBankedModule(saved.bankedModule);
+    bus.setCe155Enabled(saved.ce155Enabled);
+    bus.setInternalCard(saved.internalCard);
+    err.clear();
+    CHECK(pc1500host::loadStateFile(cpu, bus, path, &err));
+  }
+  std::printf("%s: %s\n", path, err.empty() ? "loaded" : err.c_str());
+}
+
 // Version 5 additions: the machine-variant flag and CE-155's own enabled
 // flag. CE-155 is mutually exclusive with everything testRoundTrip/
 // testCe163RoundTrip already exercise (see Bus::setCe155Enabled's own
@@ -371,6 +473,8 @@ int main() {
   testCe163RoundTrip();
   testInternalCardRoundTrip();
   testCe163fRoundTrip();
+  testOlderVersionsLoad();
+  testStateFileFromEnvironment();
   testMachineVariantAndCe155RoundTrip();
   testCorruptMagicRejected();
   testTruncatedFileRejected();

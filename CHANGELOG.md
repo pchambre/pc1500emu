@@ -4,6 +4,17 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [1.7.1] - 2026-11-09
+
+### Fixed
+- State files saved by older builds load again: versions 6 (every build
+  before 1.4.0) and 7 are read as the layouts they had; saving writes
+  version 8. `testOlderVersionsLoad` rewrites a save into both layouts
+  and loads them; `PC1500EMU_STATE=<file> state_roundtrip_test` loads a
+  real one under the configuration it records (a 2026-09-23 version-6
+  emulator.state does).
+- A conf file's `ce163Enabled` from before 1.6.0 still selects the CE-163.
+
 ## [1.7.0] - 2026-11-09
 
 ### Added
@@ -38,8 +49,9 @@ per this project's own convention (not just milestones).
 - The CE-163 is now one kind of banked module (`Bus::setBankedModule`);
   `setCe163Enabled` stays as a shorthand. The conf file's `ce163Enabled`
   is replaced by `bankedModule` ("CE-163", "CE-1638", "CE-163F") and
-  `ce163fProgramEnable`. State file version 8; older state files don't
-  load.
+  `ce163fProgramEnable` (an older conf file's `ce163Enabled` still
+  reads, since 1.7.1). State file version 8; versions 6 and 7 still load
+  (since 1.7.1).
 
 ### Fixed
 - The CE-163's banks now get their F1-F6 reserve area zeroed; it was
@@ -74,7 +86,7 @@ per this project's own convention (not just milestones).
 
 ### Changed
 - State files are version 7: they carry the card, its selected block and
-  its SRAM. Version 6 files are refused, as every version change is.
+  its SRAM. Version 6 files still load (since 1.7.1).
 
 ## [1.1.0] - 2026-10-07
 

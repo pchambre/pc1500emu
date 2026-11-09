@@ -148,6 +148,15 @@ void testOldConfigMissingNewFieldUsesDefault() {
   CHECK(loaded.bleHostBluetooth == false);       // absent -- AppConfig{}'s default
   CHECK(!loaded.bleFilesDir.has_value());        // absent
   std::remove(path.c_str());
+
+  // A conf file from before 1.6.0 keeps its CE-163 (its own flag then).
+  {
+    std::ofstream f(path, std::ios::binary);
+    f << R"({"ce163Enabled": true})";
+  }
+  CHECK(pc1500host::loadAppConfig(path, &loaded, &err));
+  CHECK(loaded.bankedModule == "CE-163");
+  std::remove(path.c_str());
 }
 
 void testInvalidJsonRejected() {

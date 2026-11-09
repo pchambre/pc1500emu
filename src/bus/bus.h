@@ -1000,8 +1000,10 @@ class Bus : public lh5801::MemoryBus {
   // mismatch failure path (left untouched -- not even zeroed -- on
   // success or on any other failure) -- see main.cpp's startup-time
   // mismatch prompt, the only current caller that reads them.
+  // `format`: the state file's version (state_file.h) -- 6 and 7 still
+  // load, as the layouts they had.
   bool loadState(std::istream& is, std::string* error = nullptr, bool* configMismatch = nullptr,
-                 SavedConfig* savedConfig = nullptr);
+                 SavedConfig* savedConfig = nullptr, uint16_t format = 8);
 
  private:
   // Applies a release that setKeyState deferred: updates Keyboard, and (for
