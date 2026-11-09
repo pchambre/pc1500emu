@@ -761,6 +761,59 @@ class ExpansionMock {
     if (offset < sram_.size()) sram_[offset] = value;
   }
 
+  // Which board this mock is (2026-11-09): the dongle (the default, what
+  // every earlier test models) or the internal card (PC1500-RP2354B-BLE-
+  // more-RAM). Set through Bus::setInternalCard, which keeps it exclusive
+  // with the other 0000H-window options.
+  //
+  // The card's 128K SRAM sits behind bus 0000H-3FFFH as card GP1's
+  // virtual inputs V16-V14 select (GP1-SRAM-InternalCard.gp6; the
+  // encodings are GreenPakTester/selftest.c's CARD_SRAM_*): 000 the base
+  // 16K, 1bb bank bb+1 (BANK 1-4), 011 the staging window onto the
+  // C000H copy. Any other value lands on the SRAM block it names, as the
+  // real GP1 drives SRAM AD16-AD14 straight from them. Only that window
+  // is modelled from this array: the 4800H-6FFFH windows stay Bus's own
+  // extension RAM (setExtRamExtSize), and STAGE's 8800H copy stays sram_.
+  // The MCU sets V16-V14 on the command worker thread while the CPU
+  // reads through them, hence the atomic (on the real card the LH5801 is
+  // waiting on BUSY then anyway).
+  enum class Board { Dongle, Card };
+  void setBoard(Board board) {
+    board_ = board;
+    cardV_.store(0, std::memory_order_release);
+  }
+  Board board() const { return board_; }
+  bool isCard() const { return board_ == Board::Card; }
+
+  static constexpr size_t kCardSramSize = 0x20000;  // 128K, eight 16K blocks
+  static constexpr int kCardBankCount = 5;           // BANK 0 (the base) and 1-4
+  static constexpr uint8_t kCardVStagingWindow = 3;  // 011
+  // V16-V14 for BANK n (0-4), or -1.
+  static int cardVForBank(int bank) {
+    if (bank == 0) return 0;
+    if (bank >= 1 && bank < kCardBankCount) return 4 | (bank - 1);
+    return -1;
+  }
+  // The BANK number V16-V14 select, or -1 (the staging window, or a value
+  // the firmware never sets).
+  static int cardBankForV(uint8_t v) {
+    if (v == 0) return 0;
+    if (v & 4) return (v & 3) + 1;
+    return -1;
+  }
+  void setCardV(uint8_t v) { cardV_.store(v & 7, std::memory_order_release); }
+  uint8_t cardV() const { return cardV_.load(std::memory_order_acquire); }
+  // Bus 0000H-3FFFH through the selected block.
+  uint8_t cardSramByte(uint16_t addr) const {
+    return cardSram_[static_cast<size_t>(cardV()) * 0x4000 + (addr & 0x3FFF)];
+  }
+  void setCardSramByte(uint16_t addr, uint8_t value) {
+    cardSram_[static_cast<size_t>(cardV()) * 0x4000 + (addr & 0x3FFF)] = value;
+  }
+  // The whole array, for Bus::saveState/loadState and tests.
+  std::vector<uint8_t>& cardSram() { return cardSram_; }
+  const std::vector<uint8_t>& cardSram() const { return cardSram_; }
+
   // SDOPEN/SDCLOSE/SDINPUT#/SDPRINT#/SDSKIP# -- up to kMaxSdChannels files
   // open at once, numbered 1..kMaxSdChannels (0 is the "close all"
   // sentinel). This mock never sees a BASIC variable name or value --
@@ -995,6 +1048,10 @@ class ExpansionMock {
   // own comments above.
   std::vector<uint8_t> romImage_;
   std::vector<uint8_t> sram_;
+  // The internal card -- see setBoard(). Real SRAM powers up 0xFF.
+  Board board_ = Board::Dongle;
+  std::atomic<uint8_t> cardV_{0};
+  std::vector<uint8_t> cardSram_ = std::vector<uint8_t>(kCardSramSize, 0xFF);
   bool remapActive_ = false;
   bool romCopyActive_ = false;
   int romCopyBlockIndex_ = 0;

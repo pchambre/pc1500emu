@@ -8121,6 +8121,46 @@ void testClockSetOnConnect() {
   CHECK(near(clock(), at(3, 15, 7, 0, 1)));
 }
 
+// The internal card (2026-11-09): BASIC boots onto the card's BANK 0 as
+// it does onto a plain 16K at 0000H -- the same RAM scan, programs from
+// 00C5H -- and a program typed there is in the card's SRAM block 0, not
+// in any other bank.
+void testInternalCardBasicBootsOnBank0() {
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  if (rom.empty()) {
+    std::printf("SKIP: testInternalCardBasicBootsOnBank0 -- ROM1.BIN not found.\n");
+    return;
+  }
+  auto plain = bootAndSettle(rom);
+  auto boot = [&](BootedMachine& m) {
+    m.bus.ioPort().useManualRtcClock();
+    m.bus.loadME0(0xC000, rom.data(), rom.size());
+    m.bus.setExtRamExtSize(0x2800);
+    m.bus.setInternalCard(true);
+    m.cpu.reset();
+    for (long i = 0; i < 20'000'000 && !m.cpu.halted(); i++) stepOne(m);
+    for (long i = 0; i < 4'000'000; i++) stepOne(m);
+  };
+  auto card = std::make_unique<BootedMachine>();
+  boot(*card);
+  for (uint16_t a = 0x7863; a <= 0x7868; a++) CHECK(card->bus.readME0(a) == plain->bus.readME0(a));
+  CHECK(waitForIdle(*card));
+  tapKey(*card, pc1500::Key::Cl);  // the cold boot's NEW0 check
+  typeText(*card, "NEW0");
+  tapKey(*card, pc1500::Key::Ent);
+  CHECK(waitForIdle(*card));
+  CHECK(card->bus.readME0(0x7865) == 0x00);  // program start 00C5H
+  CHECK(card->bus.readME0(0x7866) == 0xC5);
+  std::string loadError;
+  CHECK(pc1500::basic::typeBasicProgramText(card->bus, card->cpu, "10 A=1\n", kCyclesPerFrame,
+                                            kCyclesPerTimerTick, &loadError));
+  const std::vector<uint8_t>& sram = card->bus.expansionMock().cardSram();
+  CHECK(sram[0x00C5] == 0x00);  // line 10, big-endian
+  CHECK(sram[0x00C6] == 0x0A);
+  CHECK(sram[4 * 0x4000 + 0x00C5] == 0xFF);  // BANK 1 untouched
+}
+
 int main(int argc, char** argv) {
   // expansion_keyword_test [part of a test's name]: only the tests whose
   // names contain it (the whole suite takes about 11 minutes).
@@ -8299,6 +8339,7 @@ int main(int argc, char** argv) {
   RUN(testSdskipAdvancesAndRaisesError40PastEnd);
   RUN(testSdChannelCommandsRaiseError1OnMalformedArgument);
   RUN(testSdinputOverlongStringRaisesError42);
+  RUN(testInternalCardBasicBootsOnBank0);
 
   if (g_failures == 0) {
     std::printf("All tests passed.\n");

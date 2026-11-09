@@ -758,6 +758,7 @@ class Bus : public lh5801::MemoryBus {
     // !ce163Enabled_ regardless of extRam0000Size_.
     ce163Enabled_ = false;
     ce155Enabled_ = false;
+    expansionMock_.setBoard(ExpansionMock::Board::Dongle);
     reseedReserveArea();  // may move reserveAreaBase() -- see its own comment
   }
   size_t extRam0000Size() const { return extRam0000Size_; }
@@ -782,6 +783,7 @@ class Bus : public lh5801::MemoryBus {
       extRam0000Size_ = 0;
       extRamExtSize_ = 0;
       ce155Enabled_ = false;
+      expansionMock_.setBoard(ExpansionMock::Board::Dongle);
     }
     reseedReserveArea();  // may move reserveAreaBase() -- see its own comment
   }
@@ -806,10 +808,32 @@ class Bus : public lh5801::MemoryBus {
       extRam0000Size_ = 0;
       extRamExtSize_ = 0;
       ce163Enabled_ = false;
+      expansionMock_.setBoard(ExpansionMock::Board::Dongle);
     }
     reseedReserveArea();  // may move reserveAreaBase() -- see its own comment
   }
   bool ce155Enabled() const { return ce155Enabled_; }
+
+  // The internal card (2026-11-09): the expansion board is the RP2354B
+  // card rather than the dongle, and its 128K SRAM backs 0000H-3FFFH in
+  // five switchable 16K banks -- see ExpansionMock::setBoard. The card
+  // sits inside the machine, so it doesn't take the module slot: the
+  // 4800H-6FFFH window stays whatever setExtRamExtSize says (the card
+  // fills it too -- 10K, as for the dongle). Exclusive with the other
+  // 0000H-window options (16K, CE-163, CE-155), which all decode the
+  // same addresses. Switching to the card (or back) puts BANK 0 in.
+  void setInternalCard(bool enabled) {
+    expansionMock_.setBoard(enabled ? ExpansionMock::Board::Card : ExpansionMock::Board::Dongle);
+    if (enabled) {
+      extRam0000Size_ = 0;
+      ce163Enabled_ = false;
+      ce155Enabled_ = false;
+    }
+    reseedReserveArea();  // may move reserveAreaBase() -- see its own comment
+  }
+  bool internalCard() const { return expansionMock_.isCard(); }
+  // The card's selected BANK (0-4), or -1 for the staging window.
+  int internalCardBank() const { return ExpansionMock::cardBankForV(expansionMock_.cardV()); }
 
   // Wraps Keyboard::setKeyState. The actual release is deferred by
   // kMinimumHoldCycles (see applyRelease) rather than applied immediately,
@@ -889,6 +913,7 @@ class Bus : public lh5801::MemoryBus {
     bool ce163Enabled = false;
     MachineVariant machineVariant = MachineVariant::PC1500;
     bool ce155Enabled = false;
+    bool internalCard = false;
   };
 
   // Refuses to load (returns false, leaving `this` completely untouched --
@@ -945,7 +970,8 @@ class Bus : public lh5801::MemoryBus {
       if (inExtWindow) return (addr - extBase) >= 0x1800;  // 6K
       return addr >= 0x8000 && addr <= 0xBFFF;              // CE-150/153/158 (not connected)
     }
-    return (in0000Window && addr >= extRam0000Size_ && !ce163Enabled_) ||  // beyond configured
+    return (in0000Window && addr >= extRam0000Size_ && !ce163Enabled_ &&
+            !expansionMock_.isCard()) ||  // beyond configured
                                                                             // 0000H module RAM
            (inExtWindow && (addr - extBase) >= extRamExtSize_) ||  // beyond configured expansion RAM
            (addr >= 0x8000 && addr <= 0xBFFF);                // CE-150/153/158 (not connected)
@@ -989,7 +1015,8 @@ class Bus : public lh5801::MemoryBus {
   // F1-F6 "reserve area" (base+8 .. base+0xC4, see reseedReserveArea's
   // own comment) actually lives.
   uint16_t reserveAreaBase() const {
-    if (ce163Enabled_ || extRam0000Size_ >= kExtRam0000WindowSize) return 0x0000;
+    if (ce163Enabled_ || extRam0000Size_ >= kExtRam0000WindowSize || expansionMock_.isCard())
+      return 0x0000;
     if (ce155Enabled_) return 0x3800;
     return 0x4000;
   }
@@ -1017,6 +1044,17 @@ class Bus : public lh5801::MemoryBus {
   // clobber genuine saved assignments -- only ever fixes a location this
   // invariant has never actually been established for yet.
   void reseedReserveArea() {
+    // The card: every BANK's reserve area, in its own SRAM block -- BASIC
+    // sees whichever bank is in, so each is a fresh 0000H RAM of its own.
+    if (expansionMock_.isCard()) {
+      std::vector<uint8_t>& sram = expansionMock_.cardSram();
+      for (int bank = 0; bank < ExpansionMock::kCardBankCount; ++bank) {
+        auto first = sram.begin() + ExpansionMock::cardVForBank(bank) * 0x4000;
+        if (std::all_of(first + 0x8, first + 0xC5, [](uint8_t b) { return b == 0xFF; }))
+          std::fill(first + 0x8, first + 0xC5, 0x00);
+      }
+      return;
+    }
     uint16_t base = reserveAreaBase();
     bool stillGenericFill = std::all_of(me0_.begin() + base + 0x8, me0_.begin() + base + 0xC5,
                                          [](uint8_t b) { return b == 0xFF; });

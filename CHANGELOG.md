@@ -4,6 +4,23 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [1.4.0] - 2026-11-09
+
+### Added
+- The internal card: Settings > Extension RAM (0000H) > Internal card, or
+  `setcard 1`. The RP2354B card's 128K SRAM backs `0000H`-`3FFFH` in five
+  16K banks (BANK 0-4), selected by the card GreenPAK's V16-V14 as the
+  MCU sets them (`ExpansionMock::setCardV`). V16-V14 = 011, the staging
+  window onto the `C000H` copy, is there too. Each bank's reserve-key area
+  starts out zeroed, as fresh RAM is at `0000H`. Tests:
+  `testInternalCardBanksAreIndependent`,
+  `testInternalCardIsExclusiveInThe0000Window`,
+  `testInternalCardRoundTrip`, `testInternalCardBasicBootsOnBank0`.
+
+### Changed
+- State files are version 7: they carry the card, its selected block and
+  its SRAM. Version 6 files are refused, as every version change is.
+
 ## [1.1.0] - 2026-10-07
 
 The emulator itself is done; recent changes, like this one, are all about

@@ -488,6 +488,9 @@ uint8_t Bus::readME0(uint16_t addr) {
   if (ce163Enabled_ && addr <= 0x3FFF) {
     return ce163Ram_[static_cast<size_t>(ce163Bank_) * 0x4000 + addr];
   }
+  // The internal card: its SRAM, in whichever block GP1's V16-V14 select
+  // (see Bus::setInternalCard).
+  if (addr <= 0x3FFF && expansionMock_.isCard()) return expansionMock_.cardSramByte(addr);
   if (isUnmapped(addr)) return 0xFF;
   return me0_[effectiveAddr(addr, machineVariant_)];
 }
@@ -554,6 +557,10 @@ void Bus::writeME0(uint16_t addr, uint8_t value) {
   // me0_ and goes straight to the bank-selected slice of ce163Ram_.
   if (ce163Enabled_ && addr <= 0x3FFF) {
     ce163Ram_[static_cast<size_t>(ce163Bank_) * 0x4000 + addr] = value;
+    return;
+  }
+  if (addr <= 0x3FFF && expansionMock_.isCard()) {
+    expansionMock_.setCardSramByte(addr, value);
     return;
   }
   if (isUnmapped(addr) || isRom(addr)) return;
@@ -733,8 +740,11 @@ void Bus::saveState(std::ostream& os) const {
   writeU8(os, ce163Bank_);
   writeBool(os, machineVariant_ == MachineVariant::PC1500A);
   writeBool(os, ce155Enabled_);
+  writeBool(os, expansionMock_.isCard());  // version 7
+  writeU8(os, expansionMock_.cardV());
   writeBytes(os, me0_.data(), kSavedRamSize);
   writeBytes(os, ce163Ram_.data(), ce163Ram_.size());
+  writeBytes(os, expansionMock_.cardSram().data(), expansionMock_.cardSram().size());
   for (const RomModule& m : romModules_) {
     saveRomModule(os, m);
   }
@@ -750,6 +760,8 @@ bool Bus::loadState(std::istream& is, std::string* error, bool* configMismatch,
   MachineVariant savedVariant =
       readBool(is) ? MachineVariant::PC1500A : MachineVariant::PC1500;
   bool savedCe155Enabled = readBool(is);
+  bool savedInternalCard = readBool(is);
+  uint8_t savedCardV = readU8(is);
   if (!is) {
     if (error) *error = "truncated or corrupt (couldn't even read the config header)";
     return false;
@@ -762,7 +774,7 @@ bool Bus::loadState(std::istream& is, std::string* error, bool* configMismatch,
   // intended config before calling this.
   if (savedExtRamExtSize != extRamExtSize_ || savedExtRam0000Size != extRam0000Size_ ||
       savedCe163Enabled != ce163Enabled_ || savedVariant != machineVariant_ ||
-      savedCe155Enabled != ce155Enabled_) {
+      savedCe155Enabled != ce155Enabled_ || savedInternalCard != expansionMock_.isCard()) {
     if (error) {
       *error =
           "state file's saved RAM configuration doesn't match the currently configured "
@@ -777,12 +789,15 @@ bool Bus::loadState(std::istream& is, std::string* error, bool* configMismatch,
       savedConfig->ce163Enabled = savedCe163Enabled;
       savedConfig->machineVariant = savedVariant;
       savedConfig->ce155Enabled = savedCe155Enabled;
+      savedConfig->internalCard = savedInternalCard;
     }
     return false;
   }
   ce163Bank_ = savedCe163Bank;
   readBytes(is, me0_.data(), kSavedRamSize);
   readBytes(is, ce163Ram_.data(), ce163Ram_.size());
+  readBytes(is, expansionMock_.cardSram().data(), expansionMock_.cardSram().size());
+  expansionMock_.setCardV(savedCardV);
   bool ok = true;
   for (RomModule& m : romModules_) {
     ok = loadRomModuleState(is, m) && ok;

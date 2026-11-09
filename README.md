@@ -207,6 +207,12 @@ native OS menu) sits above the display:
   active, this submenu shows a disabled note instead of a selectable
   item, since CE-155's own toggle lives in the expansion-window submenu —
   this window only hosts its remaining isolated 2K at `3800H`-`3FFFH`.
+  **Internal card (5 x 16K, banked)**: the RP2354B internal expansion
+  card instead of the dongle. Its 128K SRAM backs this window as BANK 0
+  (the base) and BANK 1-4, chosen by the card GreenPAK's V16-V14 bits,
+  which the card's MCU sets. The card sits inside the machine, so the
+  expansion window keeps its own setting (10K, as the card fills it).
+  Exclusive with the other choices here.
 - **Settings > Automation Mode** — when checked, real host keyboard input
   (typing, arrow keys, F-keys, etc.) is ignored entirely; only the
   scriptable command interface below can drive the emulator. An orange
@@ -332,6 +338,9 @@ Commands:
 - `setce155 <0|1>` — FIFO equivalent of Settings > Extension RAM (0000H) >
   CE-155 (see that section above). Mutually exclusive with `setextram` and
   `setce163`, same as `setce163` above.
+- `setcard <0|1>` — FIFO equivalent of Settings > Extension RAM (0000H) >
+  Internal card. Exclusive with `setextram 0000`, `setce163` and
+  `setce155`; leaves `setextram ext` alone. Needs `reset` after.
 - `ble backend fake|host` / `ble advertise on|off` — the Settings >
   Bluetooth choices (see "Bluetooth" above).
 - `ble status` — the link's state, or why host Bluetooth isn't in use.

@@ -1642,6 +1642,9 @@ int main(int argc, char** argv) {
   // has a contradictory combination -- setCe155Enabled(true) itself
   // clears the two sizes and CE-163 right back off (see its own comment).
   bus.setCe155Enabled(appConfig.ce155Enabled);
+  // After CE-155 (whose setter would clear it): the card's own 0000H
+  // window, exclusive with the options above.
+  if (appConfig.internalCard) bus.setInternalCard(true);
 
   std::string configuredStateFilePath =
       noState ? std::string() : appConfig.stateFilePath.value_or(std::string());
@@ -2047,6 +2050,14 @@ int main(int argc, char** argv) {
       long enabled = 0;
       iss >> std::dec >> enabled;
       bus.setCe155Enabled(enabled != 0);
+    } else if (cmd == "setcard") {
+      // FIFO equivalent of Settings > Extension RAM (0000H) > Internal
+      // card (2026-11-09). <enabled> is 0 or 1. The RP2354B card's five
+      // 16K banks in the 0000H window, exclusive with setextram 0000,
+      // CE-163 and CE-155 (Bus::setInternalCard). Needs `reset` after.
+      long enabled = 0;
+      iss >> std::dec >> enabled;
+      bus.setInternalCard(enabled != 0);
     } else if (cmd == "ble") {
       // FIFO equivalent of Settings > Bluetooth (2026-09-28):
       //   ble backend fake|host   the fake peer, or this computer's Bluetooth
@@ -3379,6 +3390,7 @@ int main(int argc, char** argv) {
               appConfig.extRam0000Bytes = 0;
               appConfig.extRamExtBytes = 0;
               appConfig.ce163Enabled = false;
+              appConfig.internalCard = false;
               persistActiveConf();
             }
           }
@@ -3389,6 +3401,7 @@ int main(int argc, char** argv) {
           size_t cur = bus.extRam0000Size();
           bool ce163 = bus.ce163Enabled();
           bool ce155 = bus.ce155Enabled();
+          bool card = bus.internalCard();
           auto setExtRam0000 = [&](size_t bytes) {
             bus.setExtRam0000Size(bytes);
             appConfig.extRam0000Bytes = bytes;
@@ -3404,13 +3417,14 @@ int main(int argc, char** argv) {
             // set in the conf file.
             appConfig.ce163Enabled = false;
             appConfig.ce155Enabled = false;
+            appConfig.internalCard = false;
             persistActiveConf();
           };
           // Not a real 1982-era option at all (nothing plugged in there
           // back then), but physically possible now.
-          if (ImGui::MenuItem("None", nullptr, cur == 0 && !ce163 && !ce155)) setExtRam0000(0);
+          if (ImGui::MenuItem("None", nullptr, cur == 0 && !ce163 && !ce155 && !card)) setExtRam0000(0);
           if (ImGui::MenuItem("16K (full window)", nullptr,
-                               cur == pc1500::Bus::kExtRam0000WindowSize && !ce163 && !ce155)) {
+                               cur == pc1500::Bus::kExtRam0000WindowSize && !ce163 && !ce155 && !card)) {
             setExtRam0000(pc1500::Bus::kExtRam0000WindowSize);
           }
           // CE-163: a real 1982-era module, 32K banked two 16K halves at a
@@ -3424,6 +3438,19 @@ int main(int argc, char** argv) {
             appConfig.ce163Enabled = true;
             appConfig.extRam0000Bytes = 0;
             appConfig.extRamExtBytes = 0;
+            appConfig.ce155Enabled = false;
+            appConfig.internalCard = false;
+            persistActiveConf();
+          }
+          // The internal card (2026-11-09): the RP2354B card's 128K SRAM,
+          // five 16K banks in this window (BANK 0-4). It's inside the
+          // machine, so the expansion window keeps its own setting (10K,
+          // as the card fills it). See Bus::setInternalCard.
+          if (ImGui::MenuItem("Internal card (5 x 16K, banked)", nullptr, card)) {
+            bus.setInternalCard(true);
+            appConfig.internalCard = true;
+            appConfig.extRam0000Bytes = 0;
+            appConfig.ce163Enabled = false;
             appConfig.ce155Enabled = false;
             persistActiveConf();
           }
@@ -3578,6 +3605,12 @@ int main(int argc, char** argv) {
           }
           if (bus.ce163Enabled()) {
             ImGui::Text("Ext RAM 0000H: CE-163 (bank %u)", static_cast<unsigned>(bus.ce163Bank()));
+          } else if (bus.internalCard()) {
+            int bank = bus.internalCardBank();
+            if (bank >= 0)
+              ImGui::Text("Ext RAM 0000H: card (BANK %d)", bank);
+            else
+              ImGui::TextUnformatted("Ext RAM 0000H: card (staging window)");
           } else if (bus.extRam0000Size() > 0) {
             ImGui::Text("Ext RAM 0000H: %uK", static_cast<unsigned>(bus.extRam0000Size() / 1024));
           } else {
@@ -3702,7 +3735,10 @@ int main(int argc, char** argv) {
           pendingStateMismatchConfig.machineVariant == pc1500::Bus::MachineVariant::PC1500A
               ? "PC-1500A"
               : "PC-1500";
-      if (pendingStateMismatchConfig.ce163Enabled) {
+      if (pendingStateMismatchConfig.internalCard) {
+        ImGui::Text("Saved config -- %s, 0000H: internal card (5 x 16K), expansion: %zu bytes",
+                     variantStr, pendingStateMismatchConfig.extRamExtSize);
+      } else if (pendingStateMismatchConfig.ce163Enabled) {
         ImGui::Text("Saved config -- %s, 0000H: CE-163 (32K banked)", variantStr);
       } else if (pendingStateMismatchConfig.ce155Enabled) {
         ImGui::Text("Saved config -- %s, 0000H: CE-155 (8K)", variantStr);
@@ -3725,12 +3761,14 @@ int main(int argc, char** argv) {
         bus.setExtRam0000Size(pendingStateMismatchConfig.extRam0000Size);
         bus.setCe163Enabled(pendingStateMismatchConfig.ce163Enabled);
         bus.setCe155Enabled(pendingStateMismatchConfig.ce155Enabled);
+        bus.setInternalCard(pendingStateMismatchConfig.internalCard);
         appConfig.isPC1500A =
             pendingStateMismatchConfig.machineVariant == pc1500::Bus::MachineVariant::PC1500A;
         appConfig.extRamExtBytes = pendingStateMismatchConfig.extRamExtSize;
         appConfig.extRam0000Bytes = pendingStateMismatchConfig.extRam0000Size;
         appConfig.ce163Enabled = pendingStateMismatchConfig.ce163Enabled;
         appConfig.ce155Enabled = pendingStateMismatchConfig.ce155Enabled;
+        appConfig.internalCard = pendingStateMismatchConfig.internalCard;
         persistActiveConf();
         std::string retryErr;
         if (pc1500host::loadStateFile(cpu, bus, pendingStateMismatchPath, &retryErr)) {

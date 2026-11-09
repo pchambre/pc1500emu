@@ -455,6 +455,88 @@ void testCe163BankSwitchingKeepsBanksIndependent() {
   CHECK(bus.readME0(0x3FFF) == 0xDD);
 }
 
+// The internal card (2026-11-09): its 128K SRAM backs 0000H-3FFFH in the
+// block card GP1's V16-V14 select -- BANK 0 (000) and BANK 1-4 (1bb) each
+// keep their own contents, and 011 is the staging window (SRAM block 3,
+// the C000H copy), not one of the banks.
+void testInternalCardBanksAreIndependent() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  CHECK(bus.internalCard() == false);
+  bus.setInternalCard(true);
+  CHECK(bus.internalCard() == true);
+  CHECK(bus.internalCardBank() == 0);
+  pc1500::ExpansionMock& mock = bus.expansionMock();
+
+  // Each bank: a fresh 0xFF RAM, with its reserve-key area zeroed (the
+  // ROM needs a valid, empty 00H-terminated list there -- see
+  // Bus::reseedReserveArea).
+  for (int bank = 0; bank < pc1500::ExpansionMock::kCardBankCount; ++bank) {
+    mock.setCardV(static_cast<uint8_t>(pc1500::ExpansionMock::cardVForBank(bank)));
+    CHECK(bus.internalCardBank() == bank);
+    CHECK(bus.readME0(0x0000) == 0xFF);
+    CHECK(bus.readME0(0x0008) == 0x00);
+    CHECK(bus.readME0(0x00C4) == 0x00);
+    CHECK(bus.readME0(0x00C5) == 0xFF);
+    CHECK(bus.readME0(0x3FFF) == 0xFF);
+    bus.writeME0(0x1000, static_cast<uint8_t>(0x10 + bank));
+    bus.writeME0(0x3FFF, static_cast<uint8_t>(0x20 + bank));
+  }
+  for (int bank = 0; bank < pc1500::ExpansionMock::kCardBankCount; ++bank) {
+    mock.setCardV(static_cast<uint8_t>(pc1500::ExpansionMock::cardVForBank(bank)));
+    CHECK(bus.readME0(0x1000) == 0x10 + bank);
+    CHECK(bus.readME0(0x3FFF) == 0x20 + bank);
+  }
+
+  // The SRAM blocks: BANK 0 = block 0, BANK n = block 4+n-1.
+  const std::vector<uint8_t>& sram = mock.cardSram();
+  CHECK(sram[0x1000] == 0x10);
+  CHECK(sram[4 * 0x4000 + 0x1000] == 0x11);
+  CHECK(sram[7 * 0x4000 + 0x1000] == 0x14);
+
+  // The staging window: block 3, no BANK number.
+  mock.setCardV(pc1500::ExpansionMock::kCardVStagingWindow);
+  CHECK(bus.internalCardBank() == -1);
+  bus.writeME0(0x0123, 0x5A);
+  CHECK(sram[3 * 0x4000 + 0x0123] == 0x5A);
+
+  // 4000H and up aren't the card's 0000H window: the 2K built-in RAM is
+  // still the machine's own.
+  mock.setCardV(0);
+  bus.writeME0(0x4100, 0x77);
+  CHECK(bus.readME0(0x4100) == 0x77);
+  CHECK(sram[0x0100] != 0x77);
+
+  CHECK(pc1500::ExpansionMock::cardVForBank(5) == -1);
+  CHECK(pc1500::ExpansionMock::cardBankForV(1) == -1);
+}
+
+// The card shares the 0000H window with the 16K option, CE-163 and CE-155
+// -- turning any of them on turns it off and back. It doesn't take the
+// module slot, so the expansion window keeps its size.
+void testInternalCardIsExclusiveInThe0000Window() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  bus.setExtRamExtSize(10 * 1024);
+  bus.setInternalCard(true);
+  CHECK(bus.extRamExtSize() == 10 * 1024);
+  bus.setCe163Enabled(true);
+  CHECK(bus.internalCard() == false);
+  bus.setInternalCard(true);
+  CHECK(bus.ce163Enabled() == false);
+  bus.setCe155Enabled(true);
+  CHECK(bus.internalCard() == false);
+  bus.setInternalCard(true);
+  CHECK(bus.ce155Enabled() == false);
+  bus.setExtRam0000Size(pc1500::Bus::kExtRam0000WindowSize);
+  CHECK(bus.internalCard() == false);
+  bus.setInternalCard(true);
+  CHECK(bus.extRam0000Size() == 0);
+  bus.setExtRam0000Size(0);  // "None"
+  CHECK(bus.internalCard() == false);
+  CHECK(bus.readME0(0x0000) == 0xFF);  // unmapped again
+}
+
 // Real hardware has one expansion port -- CE-163 can't coexist with either
 // existing extension-RAM window. Enabling one clears the other; enforced
 // from both directions so Bus state can't end up contradictory regardless
@@ -966,6 +1048,8 @@ int main() {
   testExtensionRam4800WindowSizesGateMappedRange();
   testExtensionRam0000WindowSizeGatesMappedRange();
   testCe163BankSwitchingKeepsBanksIndependent();
+  testInternalCardBanksAreIndependent();
+  testInternalCardIsExclusiveInThe0000Window();
   testCe163IsMutuallyExclusiveWithOtherExtensionRam();
   testExtRam0000SizeZeroClearsCe163AndCe155();
   testCe155IsMutuallyExclusiveWithOtherExtensionRam();

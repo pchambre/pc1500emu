@@ -52,6 +52,10 @@ struct AppConfig {
   // window) -- mutually exclusive with all three fields above, see
   // Bus::setCe155Enabled's own comment. Same ordering requirement.
   bool ce155Enabled = false;
+  // The internal card (2026-11-09): the RP2354B card's banked SRAM in the
+  // 0000H window -- exclusive with the 0000H options above, see
+  // Bus::setInternalCard. Applied last, so it wins over them.
+  bool internalCard = false;
   // The expansion board's BLE link (2026-09-28): true = the host computer's
   // own Bluetooth (src/host/ble_host.h), false = the built-in fake peer.
   // bleFilesDir: where a connected PC-1500's BLSAVEs land when this

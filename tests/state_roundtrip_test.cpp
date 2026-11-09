@@ -182,6 +182,46 @@ void testCe163RoundTrip() {
   std::remove(path.c_str());
 }
 
+// Version 7: the internal card -- its flag, the selected block (V16-V14)
+// and the whole 128K SRAM, every bank, not just the one selected.
+void testInternalCardRoundTrip() {
+  pc1500::Keyboard kb;
+  pc1500::Bus bus(kb);
+  lh5801::CPU cpu(bus);
+  bus.setInternalCard(true);
+  pc1500::ExpansionMock& mock = bus.expansionMock();
+  bus.writeME0(0x0010, 0xAA);  // BANK 0
+  mock.setCardV(static_cast<uint8_t>(pc1500::ExpansionMock::cardVForBank(4)));
+  bus.writeME0(0x0010, 0xCC);  // BANK 4, left selected for the save
+
+  std::string path = tempPath("pc1500emu_state_roundtrip_test_card.state");
+  std::string err;
+  CHECK(pc1500host::saveStateFile(cpu, bus, path, &err));
+
+  // A Bus without the card refuses it, and says so.
+  pc1500::Keyboard kb3;
+  pc1500::Bus bus3(kb3);
+  lh5801::CPU cpu3(bus3);
+  bool mismatch = false;
+  pc1500::Bus::SavedConfig saved;
+  CHECK(!pc1500host::loadStateFile(cpu3, bus3, path, &err, &mismatch, &saved));
+  CHECK(mismatch);
+  CHECK(saved.internalCard);
+
+  pc1500::Keyboard kb2;
+  pc1500::Bus bus2(kb2);
+  lh5801::CPU cpu2(bus2);
+  bus2.setInternalCard(true);
+  err.clear();
+  CHECK(pc1500host::loadStateFile(cpu2, bus2, path, &err));
+  CHECK(err.empty());
+  CHECK(bus2.internalCardBank() == 4);
+  CHECK(bus2.readME0(0x0010) == 0xCC);
+  bus2.expansionMock().setCardV(0);
+  CHECK(bus2.readME0(0x0010) == 0xAA);
+  std::remove(path.c_str());
+}
+
 // Version 5 additions: the machine-variant flag and CE-155's own enabled
 // flag. CE-155 is mutually exclusive with everything testRoundTrip/
 // testCe163RoundTrip already exercise (see Bus::setCe155Enabled's own
@@ -289,6 +329,7 @@ void testTruncatedFileRejected() {
 int main() {
   testRoundTrip();
   testCe163RoundTrip();
+  testInternalCardRoundTrip();
   testMachineVariantAndCe155RoundTrip();
   testCorruptMagicRejected();
   testTruncatedFileRejected();
