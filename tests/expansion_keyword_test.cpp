@@ -8232,6 +8232,14 @@ void testBankKeywords() {
   CHECK(bus.internalCardBank() == 2);
   CHECK(f->mock->bankSelects() == before + 1);
   CHECK(ptrs() == bank0);
+  // A = FFH asks which bank is in: LDI A,FFH / SJP 8819H / STA (4110H) / RTN.
+  const uint8_t ask[] = {0xB5, 0xFF, 0xBE, 0x88, 0x19, 0xAE, 0x41, 0x10, 0x9A};
+  for (size_t i = 0; i < sizeof ask; i++) bus.writeME0(static_cast<uint16_t>(0x4120 + i), ask[i]);
+  bus.writeME0(0x4110, 0x00);
+  CHECK(f->run("CALL &4120") == 0);
+  CHECK(bus.readME0(0x4110) == 2);
+  CHECK(bus.internalCardBank() == 2);
+  CHECK(f->mock->bankSelects() == before + 1);  // nothing switched
   bus.writeME0(0x4101, 0x00);  // and back, A = 0
   CHECK(f->run("CALL &4100") == 0);
   CHECK(bus.internalCardBank() == 0);
