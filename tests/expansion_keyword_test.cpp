@@ -46,9 +46,11 @@
 #include "basic_text.h"
 #include "bus.h"
 #include "keyboard.h"
+#include "lcd.h"
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
 #include "basic_xlate.h"  // the firmware's own (testBasicXlateChunks)
 #include "kbd_seq.h"      // ...and its key sequencer (testKbdLayouts)
+#include "help.h"         // ...and HELP's viewer (testHelp)
 #endif
 #include "lh5801.h"
 #include "text_loader.h"
@@ -7014,6 +7016,22 @@ void testCommandHistory() {
     CHECK(idle());
   }
 
+  // HISTCLR (2026-11-10): everything forgotten, itself too (kept at ENTER,
+  // before it ran); DEF+Up then has nothing, so it's ROM1's Up. An argument
+  // is ERROR 1.
+  CHECK(!history().empty());
+  enter("HISTCLR");
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+  CHECK(history().empty());
+  key(pc1500::Key::Def);
+  key(pc1500::Key::Up);
+  CHECK(!mock.history().terminal());
+  CHECK(idle());
+  enter("HISTCLR 1");
+  CHECK(m->bus.readME0(kErlAbs) == 1);
+  enter("C=3");
+  CHECK(history().size() == 2 && history()[0] == "C=3" && history()[1] == "HISTCLR 1");
+
   // HISTORY=0: DEF+Up is ROM1's Up again
   mock.setConfigValue(pc1500::ExpansionMock::kConfigHistory, 0);
   size_t kept = history().size();
@@ -7023,6 +7041,153 @@ void testCommandHistory() {
   key(pc1500::Key::Up);
   CHECK(!mock.history().terminal());
   CHECK(idle());
+#endif
+}
+
+// HELP (2026-11-10, RP2350/help.h): a line per keyword in TERM's window --
+// an exact name alone, else every name holding the query; Left/Right
+// scroll, Up/Down step, CL or BREAK leave. Nothing matching shows a line.
+void testHelp() {
+#ifndef PC1500_HAVE_EXPANSION_KEYWORDS
+  std::printf("SKIP: testHelp -- built without the firmware sources.\n");
+#else
+  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  const std::string kExpRomDir =
+      "C:/Users/paulc/Documents/PSoC Creator/PC1500-PSOC5/Design01_NonDMA_8K_PV_Swap.cydsn/rom/";
+  std::vector<uint8_t> rom = readFile(kRomPath);
+  std::vector<uint8_t> expRom = readFile(kExpRomDir + "rom_8800.bin");
+  std::vector<uint8_t> romBin = readFile(kExpRomDir + "rom.bin");
+  if (rom.empty() || expRom.empty() || romBin.size() < 0x800) {
+    std::printf("SKIP: testHelp -- ROM1.BIN, rom_8800.bin and/or rom.bin not found.\n");
+    return;
+  }
+  const uint16_t kbdLoop = static_cast<uint16_t>((expRom[0x11] << 8) | expRom[0x12]);
+  const uint16_t kDriverIdle = static_cast<uint16_t>(kbdLoop + (0xE2AA - 0xE24A));
+  fs::path sdDir = makeTempTestDir("expansion_keyword_test_help");
+  auto m = std::make_unique<BootedMachine>();
+  m->bus.ioPort().useManualRtcClock();
+  m->bus.loadME0(0xC000, rom.data(), rom.size());
+  m->bus.setExtRam0000Size(0x4000);
+  m->bus.setExtRamExtSize(0x2800);
+  m->bus.loadExpansionModule(0, expRom.data(), expRom.size(), /*base=*/0x8800, /*requirePv=*/false,
+                             /*usePuBank=*/false, /*dataWindowBase=*/0x8000,
+                             /*dataWindowSize=*/0x800, /*instructionAddr=*/0x87FF, romBin.data(), 0x800);
+  m->bus.expansionMock().setRootDir(sdDir);
+  auto idle = [&]() {
+    for (long i = 0; i < 6'000'000; i++) {
+      if (m->cpu.halted() && (m->cpu.p() == kIdleAddr || m->cpu.p() == kDriverIdle)) return true;
+      stepOne(*m);
+    }
+    return false;
+  };
+  auto key = [&](pc1500::Key k) {
+    tapKey(*m, k);
+    for (long i = 0; i < 200'000; i++) stepOne(*m);
+  };
+  auto enter = [&](const std::string& text) {
+    m->bus.writeME0(kErlAbs, 0);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, text);
+    tapKey(*m, pc1500::Key::Ent);
+    CHECK(idle());
+  };
+  auto help = [&](const std::string& text) {  // HELP ..., up to its viewer
+    m->bus.writeME0(kErlAbs, 0);
+    tapKey(*m, pc1500::Key::Cl);
+    typeText(*m, text);
+    tapKey(*m, pc1500::Key::Ent);
+    for (long i = 0; i < 3'000'000 && !help_terminal(); i++) stepOne(*m);
+    for (long i = 0; i < 200'000; i++) stepOne(*m);  // its first line drawn
+    return help_terminal();
+  };
+  auto shown = [&]() {  // TERM's line, as the MCU put it in the window ([ ] as the ROM's B0H/B1H)
+    std::string t;
+    for (int i = 0; i < 26; i++) {
+      uint8_t c = m->bus.readME0(static_cast<uint16_t>(0x8000 + i));
+      t += c == 0xB0 ? '[' : c == 0xB1 ? ']' : c == 0xB2 ? '\'' : static_cast<char>(c);
+    }
+    return t.substr(0, t.find_last_not_of(' ') + 1);
+  };
+  auto glyph = [&](int at) {  // the 5 dot columns the LCD shows for character `at`
+    pc1500::Lcd lcd;
+    auto read = [&](uint16_t a) { return m->bus.readME0(a); };
+    std::vector<uint8_t> cols;
+    for (int c = 0; c < 5; c++) cols.push_back(lcd.columnBits(at * 6 + c, true, read));
+    return cols;
+  };
+
+  m->cpu.reset();
+  for (long c = 0; !m->cpu.halted() && c < 20'000'000; c++) stepOne(*m);
+  for (long i = 0; i < 4'000'000; i++) stepOne(*m);
+  enter("NEW0");
+  for (int i = 0; i < 3 && !(m->bus.readME0(0x764F) & 0x40); i++) {  // RUN mode
+    key(pc1500::Key::Cl);
+    key(pc1500::Key::Mode);
+    CHECK(idle());
+  }
+
+  // an exact name: its line alone, scrolled with Left/Right; CL leaves
+  const uint8_t font785D = m->bus.readME0(0x785D), font785E = m->bus.readME0(0x785E);
+  CHECK(help("HELP SDLOAD"));
+  CHECK(shown() == "SDLOAD [M] [name$[,addr]]:");
+  // [ and ] drawn from the ROM's glyphs (TERM_GLYPHS), not ROM1's square root and pi
+  CHECK(glyph(7) == std::vector<uint8_t>({0x00, 0x7F, 0x41, 0x41, 0x00}));
+  CHECK(glyph(9) == std::vector<uint8_t>({0x00, 0x41, 0x41, 0x7F, 0x00}));
+  CHECK(m->bus.readME0(0x785D) == 0x00 && m->bus.readME0(0x785E) == 0x9F);
+  key(pc1500::Key::Right);
+  CHECK(shown() == "DLOAD [M] [name$[,addr]]:");
+  key(pc1500::Key::Left);
+  key(pc1500::Key::Left);  // already at its start
+  CHECK(shown() == "SDLOAD [M] [name$[,addr]]:");
+  key(pc1500::Key::Down);  // nothing more
+  CHECK(shown() == "SDLOAD [M] [name$[,addr]]:");
+  key(pc1500::Key::Cl);
+  CHECK(idle());
+  CHECK(m->bus.readME0(0x785D) == font785D && m->bus.readME0(0x785E) == font785E);  // ROM1's font back
+  CHECK(!help_terminal());
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+
+  // an apostrophe: the ROM's glyph too (ROM1's 27H is a box)
+  CHECK(help("HELP SSHKEY"));
+  CHECK(shown() == "SSHKEY: the dongle's publi");
+  CHECK(m->bus.readME0(0x8000 + 18) == 0xB2);
+  CHECK(glyph(18) == std::vector<uint8_t>({0x00, 0x0B, 0x07, 0x00, 0x00}));
+  key(pc1500::Key::Cl);
+  CHECK(idle());
+
+  // a BASIC keyword typed (tokenized) is found by its name too
+  CHECK(help("HELP PRINT"));
+  CHECK(shown() == "PRINT [v[;/,v...]] / PRINT");
+  key(pc1500::Key::Cl);
+  CHECK(idle());
+
+  // part of a name: every name holding it, Up/Down; BREAK leaves
+  CHECK(help("HELP LOAD"));
+  CHECK(shown() == "BLLOAD [M] [name$[,addr]]:");
+  key(pc1500::Key::Down);
+  CHECK(shown() == "CLOAD [\"name\"] / CLOAD? [\"");
+  key(pc1500::Key::Down);
+  CHECK(shown() == "FNLOAD: brings back the re");
+  key(pc1500::Key::Up);
+  CHECK(shown() == "CLOAD [\"name\"] / CLOAD? [\"");
+  m->cpu.pressOnKey();
+  m->bus.ioPort().setOnKeyLine(true);
+  m->cpu.requestMI();
+  m->bus.ioPort().setOnKeyLine(false);
+  CHECK(idle());
+  CHECK(!help_terminal());
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+
+  // nothing matches: a line saying so, no viewer
+  CHECK(!help("HELP QQQ"));
+  key(pc1500::Key::Cl);
+  CHECK(idle());
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+
+  // still a working machine afterwards
+  enter("C=5");
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+  CHECK(((m->bus.readME0(0x7910) << 8) | m->bus.readME0(0x7912)) == 0x0050);
 #endif
 }
 
@@ -8485,6 +8650,7 @@ int main(int argc, char** argv) {
   RUN(testKeywordsInProgramWithExpressions);
   RUN(testExternalKeyboardDriver);
   RUN(testCommandHistory);
+  RUN(testHelp);
   RUN(testHistoryStageSleep);
   RUN(testPowerOnSleepConfigs);
   RUN(testBlkbdPairsKeyboard);

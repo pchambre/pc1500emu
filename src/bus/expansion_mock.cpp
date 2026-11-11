@@ -13,6 +13,7 @@
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
 #include "basic_xlate.h"
 #include "fl_store.h"
+#include "help.h"
 #include "kbd_seq.h"
 #include "keywords.h"
 #include "plotter.h"
@@ -608,6 +609,18 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     }
     default:
       if (cmd == 0x67 || cmd == 0x70) return ssh_.pingCommand(cmd, window, !wifiSsid_.empty());  // WFPING
+      if (cmd == kCommandHelp) {  // HELP (2026-11-10)
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+        sshWindow_ = &window;
+        return help_command(window.data());
+#else
+        return kStatusNotImplemented;
+#endif
+      }
+      if (cmd == kCommandHistClear) {  // HISTCLR (2026-11-10): works with HISTORY=0 too
+        history_.clear();
+        return kStatusSuccess;
+      }
       if (cmd == kCommandHistAdd || cmd == kCommandHistBegin) {  // the command history (2026-10-07)
         if (cmd == kCommandHistBegin) sshWindow_ = &window;
         return history_.command(cmd, window, config_[kConfigHistory] != 0);
@@ -907,6 +920,23 @@ void ExpansionMock::screenReset() {
   b.lock = [](void* c) { static_cast<ExpansionMock*>(c)->screenMutex_.lock(); };
   b.unlock = [](void* c) { static_cast<ExpansionMock*>(c)->screenMutex_.unlock(); };
   screen_init(&b);
+#endif
+}
+
+bool ExpansionMock::helpTerminal() const {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  return help_terminal();
+#else
+  return false;
+#endif
+}
+
+void ExpansionMock::helpPoll(std::vector<uint8_t>& window, uint32_t nowMs) {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  help_poll(window.data(), nowMs);
+#else
+  (void)window;
+  (void)nowMs;
 #endif
 }
 

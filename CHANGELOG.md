@@ -4,6 +4,15 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [1.8.0] - 2026-11-11
+
+### Added
+- HELP (firmware ECVER 0.17, command 0x89): the mock runs the firmware's
+  `RP2350/help.c` in TERM's window, as the command history's viewer.
+  `testHelp` checks a line and its scrolling, the ROM's glyphs for `[ ] '`
+  (and that 785DH/785EH are restored after), a list, BREAK and no match.
+- HISTCLR (firmware ECVER 0.16, command 0x88): forgets the command history.
+
 ## [1.7.1] - 2026-11-09
 
 ### Fixed

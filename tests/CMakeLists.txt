@@ -27,7 +27,7 @@ target_link_libraries(basic_load_roundtrip_test PRIVATE pc1500basic pc1500bus pc
 add_test(NAME basic_load_roundtrip_test COMMAND basic_load_roundtrip_test)
 
 add_executable(expansion_keyword_test expansion_keyword_test.cpp)
-target_link_libraries(expansion_keyword_test PRIVATE pc1500basic pc1500bus pc1500keyboard lh5801cpu)
+target_link_libraries(expansion_keyword_test PRIVATE pc1500basic pc1500bus pc1500keyboard pc1500lcd lh5801cpu)
 add_test(NAME expansion_keyword_test COMMAND expansion_keyword_test)
 # The firmware's portable pieces it tests directly (basic_xlate.h), when the
 # firmware is there -- see src/bus/CMakeLists.txt.

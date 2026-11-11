@@ -43,6 +43,8 @@ if(EXISTS "${PC1500_EXPANSION_FIRMWARE_DIR}/keywords.c")
     "${PC1500_EXPANSION_FIRMWARE_DIR}/ssh_keys.c"
     "${PC1500_EXPANSION_FIRMWARE_DIR}/sha256.c"
     "${PC1500_EXPANSION_FIRMWARE_DIR}/cmd_history.c"
+    # HELP (2026-11-10): a line per keyword, in TERM
+    "${PC1500_EXPANSION_FIRMWARE_DIR}/help.c"
     # ZIP/1500's console (2026-10-29, EXP_COMMAND_ZTERM)
     "${PC1500_EXPANSION_FIRMWARE_DIR}/zterm.c"
     # the Screen pane (2026-11-03, MCONF BLDISP): BASIC's buffers, SHOW, ZIP

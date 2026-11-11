@@ -152,11 +152,12 @@ class ExpansionMock {
     emulatedCycles_ += static_cast<uint64_t>(cycles);
     pumpCommands();
     if (sleepOn_ || sleepState_ != SleepState::Awake) stepSleep();
-    if (sshWindow_ && (ssh_.terminal() || history_.terminal()) &&
+    if (sshWindow_ && (ssh_.terminal() || history_.terminal() || helpTerminal()) &&
         emulatedCycles_ - sshPolledCycles_ >= kSshPollCycles) {
       sshPolledCycles_ = emulatedCycles_;
       ssh_.poll(*sshWindow_, kbdNowMs());
       history_.poll(*sshWindow_, kbdNowMs());  // the command history's browsing, the same way
+      helpPoll(*sshWindow_, kbdNowMs());       // HELP's viewer too (2026-11-10)
     }
     if (emulatedCycles_ - screenPolledCycles_ >= kSshPollCycles) {  // as core1, between commands
       screenPolledCycles_ = emulatedCycles_;
@@ -508,6 +509,8 @@ class ExpansionMock {
   SshMock& ssh() { return ssh_; }
   // The command history (2026-10-07, MCONF HISTORY): HIST_ADD/HIST_BEGIN, 0x71-0x72 -- history_mock.h
   static constexpr uint8_t kCommandHistAdd = 0x71, kCommandHistBegin = 0x72;
+  static constexpr uint8_t kCommandHistClear = 0x88;  // HISTCLR (2026-11-10)
+  static constexpr uint8_t kCommandHelp = 0x89;       // HELP (2026-11-10): RP2350/help.c, as the firmware
   // The clock from WFCON/BLCON, MCONF TZ (2026-10-08) -- RP2350/time_sync.h
   static constexpr uint8_t kCommandTimeGet = 0x73, kCommandConfigTzGet = 0x74, kCommandConfigTzSet = 0x75;
   static constexpr uint8_t kTimeSourceWifi = 0, kTimeSourceBle = 1;
@@ -1172,6 +1175,9 @@ class ExpansionMock {
   std::vector<std::vector<uint8_t>> bleDisplay_;
   void screenReset();  // screen_init(): a fresh MCU's RAM
   void screenPoll();
+  // HELP's viewer (RP2350/help.h), run in TERM's window as the history's.
+  bool helpTerminal() const;
+  void helpPoll(std::vector<uint8_t>& window, uint32_t nowMs);
   std::recursive_mutex screenMutex_;  // screen.c's state: the worker's keywords, the emulation's bus
   std::mutex screenPollMutex_;        // one sender at a time
   uint64_t screenPolledCycles_ = 0;
