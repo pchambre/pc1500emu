@@ -6,6 +6,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -146,6 +147,7 @@ class LinkCore : public BleBackend {
   uint8_t text(std::vector<uint8_t>& w);
   uint8_t filePut(std::vector<uint8_t>& w);
   uint8_t fileGet(std::vector<uint8_t>& w);
+  uint8_t folders(uint8_t cmd, std::vector<uint8_t>& w);  // DIR, FS (2026-11-13)
 
   // peer-to-peer (2026-09-28, BLE_PROTOCOL.md "Peer-to-peer files")
   uint8_t status(std::vector<uint8_t>& w);
@@ -159,9 +161,19 @@ class LinkCore : public BleBackend {
   void serverLoop();
   void serve(const Frame& f);
   void serveFileGet(const Frame& f);
+  // the server's folders (2026-11-13, BLE_PROTOCOL.md "Host folders")
+  void serveDir(const Frame& f);
+  void serveFs(const Frame& f);
+  std::string peerKey();
+  std::vector<std::string> cwd();  // the connected PC-1500's, the root if it's gone
+  bool hostFile(const std::string& name, std::filesystem::path* out);
+  std::filesystem::path hostPath(const std::vector<std::string>& names) const;
 
   std::unique_ptr<Transport> transport_;
   std::filesystem::path filesDir_;
+  // each paired PC-1500's current directory below filesDir_, by its id:
+  // the server thread's alone, kept while the emulator runs
+  std::map<std::string, std::vector<std::string>> cwds_;
   std::string name_;  // under mutex_: MCONF HOSTNAME may change it at any time
   int answerTimeoutMs_ = 5000;
 
@@ -207,6 +219,7 @@ class LinkCore : public BleBackend {
 
   // a server-side save in progress
   std::string putName_;
+  std::filesystem::path putPath_;  // where it goes (2026-11-13: a path in the folders)
   uint32_t putSize_ = 0;
   std::vector<uint8_t> putData_;
   bool putActive_ = false;

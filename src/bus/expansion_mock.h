@@ -424,7 +424,7 @@ class ExpansionMock {
   // value. The mock keeps them in memory (real firmware: flash).
   static constexpr uint8_t kCommandConfigGet = 0x30;
   static constexpr uint8_t kCommandConfigSet = 0x31;
-  static constexpr int kConfigCount = 14;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY, BRIDGEINT, TIMESYNC, BLDISP -- mcu_config.h
+  static constexpr int kConfigCount = 15;  // LED, SLEEPWAIT, LOGSIZE, LOGINFO, LOGGEN, (5 unused), AUTOSTAGE, BLKBD, POWMANDELAY, KBDLAYOUT, HISTORY, BRIDGEINT, TIMESYNC, BLDISP, BLDEBUG -- mcu_config.h
   static constexpr int kConfigTimeSync = 12;
   static constexpr int kConfigBldisp = 13;  // the screen to a linked peer (screen.c)
   static constexpr int kConfigAutostage = 6;
@@ -511,6 +511,14 @@ class ExpansionMock {
   static constexpr uint8_t kCommandHistAdd = 0x71, kCommandHistBegin = 0x72;
   static constexpr uint8_t kCommandHistClear = 0x88;  // HISTCLR (2026-11-10)
   static constexpr uint8_t kCommandHelp = 0x89;       // HELP (2026-11-10): RP2350/help.c, as the firmware
+  // The BLE server's folders (2026-11-13, BLE_PROTOCOL.md "Host folders"):
+  // EXP_COMMAND_BLE_DIR/FS, EXP_BLE_FS_ARGS.
+  static constexpr uint8_t kCommandBleDir = 0x8A;
+  static constexpr uint8_t kCommandBleFs = 0x8B;
+  static constexpr uint8_t kCommandBlePaper = 0x8C;  // BLPRTC/BLPRTP/BLCLP: [op] (2026-11-14)
+  static constexpr size_t kBleFsArgs = 84;
+  // What one DIR answer holds, small so the keywords' paging is tested
+  static constexpr size_t kBleDirRoom = 60;
   // The clock from WFCON/BLCON, MCONF TZ (2026-10-08) -- RP2350/time_sync.h
   static constexpr uint8_t kCommandTimeGet = 0x73, kCommandConfigTzGet = 0x74, kCommandConfigTzSet = 0x75;
   static constexpr uint8_t kTimeSourceWifi = 0, kTimeSourceBle = 1;
@@ -605,6 +613,11 @@ class ExpansionMock {
   const std::string& bleText() const { return bleText_; }
   void clearBleText() { bleText_.clear(); }
   std::map<std::string, std::vector<uint8_t>>& bleFiles() { return bleFiles_; }
+  // Its folders (2026-11-13): bleFiles()' keys are paths from the root,
+  // "SUB/NAME"; bleDirs() the directories, the same way; bleCwd() the
+  // current directory ("" the root).
+  std::set<std::string>& bleDirs() { return bleDirs_; }
+  std::string bleCwd() const;
   void setBleLinkDropAfter(long bytes) { bleDropAfter_ = bytes; }
 
   // Test-only, peer-to-peer (2026-09-28): the fake peer as another PC-1500.
@@ -673,6 +686,13 @@ class ExpansionMock {
   bool flFlag(const std::string& key, bool dflt);
   // Test-only: how many times BLCLS cleared the peer's screen pane.
   int bleScreenClears() const { return bleScreenClears_; }
+  // The PAPER ops the fake server took (1 print console, 2 print plot, 3 clear plot);
+  // a 3 also clears blePaper(). setBlePeerPrints(false): it answers UNSUPPORTED.
+  const std::vector<uint8_t>& blePaperOps() const { return blePaperOps_; }
+  void setBlePeerPrints(bool prints) { blePeerPrints_ = prints; }
+  // FILE_GET's kind (2026-11-16): the file's own (ble_paths.h fileKind()),
+  // or with true 0xFF, as an older server that doesn't say.
+  void setBleKindUnknown(bool unknown) { bleKindUnknown_ = unknown; }
   // The Screen pane (2026-11-03): the firmware's screen.c, fed by BASIC's
   // buffers (Bus::writeME0 hands over every ME0 write to 7000H-7FFFH, as
   // GreenPAK2 IO12 does), the keywords' SHOW/BROWSE, and ZIP's console;
@@ -1116,7 +1136,7 @@ class ExpansionMock {
   int sleepCount_ = 0, powmanCount_ = 0, wakeCount_ = 0;
   std::string lastUserLogMessage_;
   bool logInfoEnabled_ = false;
-  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1, 1, 1, 0};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on, BRIDGEINT on, TIMESYNC on, BLDISP off)
+  uint16_t config_[kConfigCount] = {1, 0, 100, 0, 0, 0, 0, 0, 0xFFFF, 33, 1, 1, 1, 0, 0};  // mcu_config.c's defaults (POWMANDELAY -1, KBDLAYOUT 33 = US, HISTORY on, BRIDGEINT on, TIMESYNC on, BLDISP off, BLDEBUG off)
   std::atomic<bool> kbdLoopInstalled_{false};
   std::vector<uint8_t> windowSeed_;  // setWindowSeed()
   std::vector<uint8_t> romImageBuilt_;  // romImage_ before KBD_INSTALL: the firmware's flash copy
@@ -1136,6 +1156,9 @@ class ExpansionMock {
   bool bleConnected_ = false;
   std::string bleText_;
   std::map<std::string, std::vector<uint8_t>> bleFiles_;
+  std::set<std::string> bleDirs_;
+  std::vector<std::string> bleCwdNames_;
+  uint8_t bleFolders(uint8_t cmd, std::vector<uint8_t>& window);
   enum class BleXfer { kNone, kPut, kGet } bleXfer_ = BleXfer::kNone;
   std::string bleXferName_;
   std::vector<uint8_t> bleXferData_;
@@ -1172,6 +1195,9 @@ class ExpansionMock {
   int blePlotFrames_ = 0;
   bool blePeerPlots_ = true;
   int bleScreenClears_ = 0;
+  std::vector<uint8_t> blePaperOps_;
+  bool blePeerPrints_ = true;
+  bool bleKindUnknown_ = false;
   std::vector<std::vector<uint8_t>> bleDisplay_;
   void screenReset();  // screen_init(): a fresh MCU's RAM
   void screenPoll();

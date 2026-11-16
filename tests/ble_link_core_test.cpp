@@ -313,6 +313,133 @@ void testSaveLoad() {
   CHECK(put("A/B", 0).second == 5);  // IO: not a plain file name
 }
 
+// The server's folders (2026-11-13, BLE_PROTOCOL.md "Host folders"): DIR in
+// pages (64-byte frames hold two or three entries), FS's ops on the server
+// emulator's real files, and FILE_PUT/FILE_GET names as paths from the
+// current directory, which the server keeps for the next link.
+// PAPER (2026-11-14): the emulator as server can't print, so it answers
+// UNSUPPORTED, which the PC-1500's keyword reports as ERROR 40.
+void testPaperUnsupported() {
+  Pair p("ble_core_paper");
+  p.server->setAdvertising(true);
+  auto w = window();
+  nameSlot(w, "PC-1500 EMU");
+  CHECK(p.pc->command(0x42, w) == kOk);
+  for (uint8_t op : {1, 2, 3}) {
+    auto pw = window();
+    pw[0] = op;
+    CHECK(p.pc->command(0x8C, pw) != kOk);
+    CHECK(pw[0] == 2);  // ERR UNSUPPORTED
+  }
+}
+
+void testFolders() {
+  Pair p("ble_core_folders");
+  p.server->setAdvertising(true);
+  auto w = window();
+  nameSlot(w, "PC-1500 EMU");
+  CHECK(p.pc->command(0x42, w) == kOk);
+  const fs::path root = p.dir[1];
+  auto fsOp = [&](uint8_t op, const std::string& a, const std::string& b = "", uint8_t flags = 0) {
+    auto fw = window();
+    nameSlot(fw, a);
+    fw[42] = 0;
+    fw[43] = static_cast<uint8_t>(b.size());
+    std::copy(b.begin(), b.end(), fw.begin() + 44);
+    fw[84] = op;
+    fw[85] = flags;
+    uint8_t s = p.pc->command(0x8B, fw);
+    return std::make_pair(s, s == kOk && op == 2 ? windowName(fw) : std::string(1, static_cast<char>(fw[0])));
+  };
+  auto err = [](const std::pair<uint8_t, std::string>& r) { return r.first == kOk ? 0 : r.second[0]; };
+  auto listing = [&](const std::string& path) {
+    std::vector<std::string> all;
+    size_t total = 1;
+    while (all.size() < total) {
+      auto dw = window();
+      nameSlot(dw, path);
+      dw[42] = static_cast<uint8_t>(all.size() >> 8);
+      dw[43] = static_cast<uint8_t>(all.size());
+      if (p.pc->command(0x8A, dw) != kOk) return std::vector<std::string>{"ERR"};
+      size_t len = static_cast<size_t>(dw[0] << 8 | dw[1]);
+      const uint8_t* q = &dw[2];
+      total = static_cast<size_t>(q[0] | q[1] << 8);
+      size_t at = 3;
+      for (int i = 0; i < q[2]; i++) {
+        uint32_t size = static_cast<uint32_t>(q[at + 1] | q[at + 2] << 8 | q[at + 3] << 16 | q[at + 4] << 24);
+        all.push_back(std::string(q[at] & 1 ? "D " : "F ") + std::to_string(size) + " " +
+                      std::string(q + at + 6, q + at + 6 + q[at + 5]));
+        at += 6u + q[at + 5];
+      }
+      CHECK(at == len);
+      if (q[2] == 0) break;
+    }
+    return all;
+  };
+
+  fs::create_directories(root / "zeta");
+  std::ofstream(root / "b.bas", std::ios::binary) << "12345";
+  std::ofstream(root / "A long file name.txt", std::ios::binary) << "1";
+  CHECK(err(fsOp(3, "Alpha")) == 0);  // MKDIR
+  CHECK(err(fsOp(3, "Alpha")) == 4);  // EXISTS
+  std::vector<std::string> want = {"D 0 Alpha", "D 0 zeta", "F 1 A long file name.txt", "F 5 b.bas"};
+  std::vector<std::string> got = listing("");
+  CHECK(got == want);
+  if (got != want)
+    for (const auto& e : got) std::printf("  [%s]\n", e.c_str());
+  CHECK(listing("NONE") == std::vector<std::string>{"ERR"});
+
+  CHECK(fsOp(2, "").second == "/");  // PWD
+  CHECK(err(fsOp(1, "Alpha")) == 0);  // CD
+  CHECK(fsOp(2, "").second == "/Alpha");
+  CHECK(err(fsOp(1, "..")) == 0);
+  CHECK(err(fsOp(1, "..")) == 3);     // never above the root
+  CHECK(err(fsOp(1, "Alpha")) == 0);
+
+  // a save by path relative to Alpha, then a load from the root
+  auto pw = window();
+  nameSlot(pw, "../zeta/P.BAS");
+  pw[44] = pw[45] = pw[46] = 0;
+  pw[47] = 3;
+  CHECK(p.pc->command(0x45, pw) == kOk);
+  auto dw = window();
+  dw[0] = 7, dw[1] = 8, dw[2] = 9;
+  dw[kLengthPort + 1] = 3;
+  CHECK(p.pc->write(dw) == kOk);
+  CHECK(p.pc->close() == kOk);
+  CHECK(fs::file_size(root / "zeta" / "P.BAS") == 3);
+  auto gw = window();
+  nameSlot(gw, "/zeta/P.BAS");
+  CHECK(p.pc->command(0x46, gw) == kOk);
+  auto rw = window();
+  rw[kLengthPort] = 0x04;
+  CHECK(p.pc->read(rw) == kOk && rw[kLengthPort + 1] == 3 && rw[2] == 9);
+  CHECK(p.pc->close() == kOk);
+
+  // the current directory outlives the link
+  w = window();
+  CHECK(p.pc->command(0x43, w) == kOk);
+  w = window();
+  nameSlot(w, "PC-1500 EMU");
+  CHECK(p.pc->command(0x42, w) == kOk);
+  CHECK(fsOp(2, "").second == "/Alpha");
+
+  CHECK(err(fsOp(6, "/zeta/P.BAS", "/b.bas")) == 4);     // CP: EXISTS
+  CHECK(err(fsOp(6, "/zeta/P.BAS", "/b.bas", 1)) == 0);  // overwrite
+  CHECK(fs::file_size(root / "b.bas") == 3);
+  CHECK(err(fsOp(6, "/zeta/P.BAS", ".")) == 0);          // into Alpha
+  CHECK(fs::exists(root / "Alpha" / "P.BAS"));
+  CHECK(err(fsOp(7, "/zeta", "/Omega")) == 0);           // MV a directory
+  CHECK(fs::exists(root / "Omega" / "P.BAS"));
+  CHECK(err(fsOp(4, "/Omega")) == 5);                    // RMDIR: not empty
+  CHECK(err(fsOp(5, "/Omega")) == 3);                    // RM: files only
+  CHECK(err(fsOp(5, "/Omega/P.BAS")) == 0);
+  CHECK(err(fsOp(4, "/Omega")) == 0);
+  CHECK(!fs::exists(root / "Omega"));
+  CHECK(err(fsOp(7, "P.BAS", "bad:name")) == 5);         // IO: not a name this host takes
+  CHECK(err(fsOp(9, "")) == 2);                          // UNSUPPORTED
+}
+
 // A server that stops answering: the request times out, the link drops,
 // and the save fails (the ROM then raises ERROR 40).
 void testPeerGoesQuiet() {
@@ -573,6 +700,8 @@ int main() {
   testText();
   testPlot();
   testSaveLoad();
+  testFolders();
+  testPaperUnsupported();
   testPeerGoesQuiet();
   testPeerToPeer();
   testMessages();

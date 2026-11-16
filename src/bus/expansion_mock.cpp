@@ -12,6 +12,7 @@
 
 #ifdef PC1500_HAVE_EXPANSION_KEYWORDS
 #include "basic_xlate.h"
+#include "ble_paths.h"
 #include "fl_store.h"
 #include "help.h"
 #include "kbd_seq.h"
@@ -563,6 +564,9 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
     case kCommandBlePairAnswer:
     case kCommandBleUnpair:
     case kCommandBleDisplayClear:
+    case kCommandBleDir:
+    case kCommandBleFs:
+    case kCommandBlePaper:
       return bleCommand(cmd, window);
     case kCommandWifiScan:
     case kCommandWifiConnect:
@@ -1165,6 +1169,133 @@ std::string upper(std::string s) {
 }
 }  // namespace
 
+std::string ExpansionMock::bleCwd() const { return pc1500::ble::joinHostPath(bleCwdNames_); }
+
+// The fake server's folders (2026-11-13), as BLE_PROTOCOL.md's DIR and FS
+// say and the host app does them: DIR's answer comes back as it would off
+// the link, [len hi][len lo] then the ACK's payload.
+uint8_t ExpansionMock::bleFolders(uint8_t cmd, std::vector<uint8_t>& window) {
+  namespace b = pc1500::ble;
+  auto fail = [&](uint8_t code) {
+    window[0] = code;
+    return kStatusError;
+  };
+  auto parentOf = [](const std::string& path) {
+    size_t slash = path.rfind('/');
+    return slash == std::string::npos ? std::string() : path.substr(0, slash);
+  };
+  auto leafOf = [](const std::string& path) {
+    size_t slash = path.rfind('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+  };
+  auto isDir = [&](const std::string& path) { return path.empty() || bleDirs_.count(path) > 0; };
+  auto lower = [](std::string s) {
+    for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return s;
+  };
+  if (!bleCwdNames_.empty() && !isDir(b::joinHostPath(bleCwdNames_))) bleCwdNames_.clear();  // gone: the root
+  std::vector<std::string> names;
+  if (cmd == kCommandBleDir) {
+    size_t start = static_cast<size_t>(window[kBleFileArgs]) << 8 | window[kBleFileArgs + 1];
+    if (!b::resolveHostPath(bleCwdNames_, bleNameFromSlot(window), &names)) return fail(3);
+    std::string dir = b::joinHostPath(names);
+    if (!isDir(dir)) return fail(3);
+    std::vector<std::pair<bool, std::string>> all;  // (file, path)
+    for (const std::string& d : bleDirs_)
+      if (parentOf(d) == dir) all.push_back({false, d});
+    for (const auto& f : bleFiles_)
+      if (parentOf(f.first) == dir) all.push_back({true, f.first});
+    std::sort(all.begin(), all.end(), [&](const auto& x, const auto& y) {
+      if (x.first != y.first) return !x.first;
+      return lower(leafOf(x.second)) < lower(leafOf(y.second));
+    });
+    std::vector<uint8_t> p{static_cast<uint8_t>(all.size()), static_cast<uint8_t>(all.size() >> 8), 0};
+    uint8_t count = 0;
+    for (size_t i = start; i < all.size() && count < 255; i++) {
+      std::string leaf = leafOf(all[i].second);
+      if (p.size() + 6 + leaf.size() > kBleDirRoom) break;
+      uint32_t size = all[i].first ? static_cast<uint32_t>(bleFiles_[all[i].second].size()) : 0;
+      p.push_back(all[i].first ? 0 : 1);
+      for (int k = 0; k < 4; k++) p.push_back(static_cast<uint8_t>(size >> (8 * k)));
+      p.push_back(static_cast<uint8_t>(leaf.size()));
+      p.insert(p.end(), leaf.begin(), leaf.end());
+      count++;
+    }
+    p[2] = count;
+    window[0] = static_cast<uint8_t>(p.size() >> 8);
+    window[1] = static_cast<uint8_t>(p.size());
+    std::copy(p.begin(), p.end(), window.begin() + 2);
+    return kStatusSuccess;
+  }
+  uint8_t op = window[kBleFsArgs];
+  bool overwrite = window[kBleFsArgs + 1] & 0x01;
+  std::vector<uint8_t> second(window.begin() + 42, window.begin() + 84);
+  std::string name = bleNameFromSlot(window), name2 = bleNameFromSlot(second);
+  bool okName = b::resolveHostPath(bleCwdNames_, name, &names);
+  std::string path = b::joinHostPath(names);
+  switch (op) {
+    case b::kFsPwd: {
+      std::string cwd = "/" + b::joinHostPath(bleCwdNames_);
+      window[0] = static_cast<uint8_t>(cwd.size());
+      std::copy(cwd.begin(), cwd.end(), window.begin() + 1);
+      return kStatusSuccess;
+    }
+    case b::kFsCd:
+      if (!okName || !isDir(path)) return fail(3);
+      bleCwdNames_ = names;
+      return kStatusSuccess;
+    case b::kFsMkdir:
+      if (!okName) return fail(5);
+      if (names.empty() || bleDirs_.count(path) || bleFiles_.count(path)) return fail(4);
+      if (!isDir(parentOf(path))) return fail(3);
+      bleDirs_.insert(path);
+      return kStatusSuccess;
+    case b::kFsRmdir:
+      if (!okName || names.empty() || !bleDirs_.count(path)) return fail(3);
+      for (const std::string& d : bleDirs_)
+        if (parentOf(d) == path) return fail(5);
+      for (const auto& f : bleFiles_)
+        if (parentOf(f.first) == path) return fail(5);
+      bleDirs_.erase(path);
+      return kStatusSuccess;
+    case b::kFsRm:
+      if (!okName || !bleFiles_.count(path)) return fail(3);
+      bleFiles_.erase(path);
+      return kStatusSuccess;
+    case b::kFsCp:
+    case b::kFsMv: {
+      if (!okName) return fail(5);
+      bool fromDir = !names.empty() && bleDirs_.count(path) > 0;
+      if (names.empty() || (!bleFiles_.count(path) && !(op == b::kFsMv && fromDir))) return fail(3);
+      std::vector<std::string> to;
+      if (!b::resolveHostPath(bleCwdNames_, name2, &to)) return fail(5);
+      if (isDir(b::joinHostPath(to))) to.push_back(names.back());  // into it
+      std::string dest = b::joinHostPath(to);
+      if (to.empty() || dest == path || bleDirs_.count(dest)) return fail(4);
+      if (fromDir && dest.rfind(path + "/", 0) == 0) return fail(5);  // into itself
+      if (bleFiles_.count(dest) && !overwrite) return fail(4);
+      if (!isDir(parentOf(dest))) return fail(3);
+      if (!fromDir) {
+        std::vector<uint8_t> data = bleFiles_[path];
+        bleFiles_[dest] = data;
+        if (op == b::kFsMv) bleFiles_.erase(path);
+        return kStatusSuccess;
+      }
+      std::set<std::string> dirs;  // a directory moved: everything under it too
+      for (const std::string& d : bleDirs_)
+        dirs.insert(d == path || d.rfind(path + "/", 0) == 0 ? dest + d.substr(path.size()) : d);
+      std::map<std::string, std::vector<uint8_t>> files;
+      for (auto& f : bleFiles_)
+        files[f.first.rfind(path + "/", 0) == 0 ? dest + f.first.substr(path.size()) : f.first] = std::move(f.second);
+      bleDirs_ = std::move(dirs);
+      bleFiles_ = std::move(files);
+      return kStatusSuccess;
+    }
+    default:
+      return fail(2);
+  }
+}
+
 void ExpansionMock::setBlePeerPaired(const std::string& name, bool paired) {
   if (paired) bleUnpaired_.erase(upper(name));
   else bleUnpaired_.insert(upper(name));
@@ -1302,7 +1433,13 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
     }
     case kCommandBleFilePut: {
       if (!bleConnected_) return fail(0);
-      std::string name = bleNameFromSlot(window);
+      std::vector<std::string> names;
+      if (!pc1500::ble::resolveHostPath(bleCwdNames_, bleNameFromSlot(window), &names) || names.empty())
+        return fail(5);
+      std::string name = pc1500::ble::joinHostPath(names);
+      names.pop_back();
+      if (bleDirs_.count(name) || (!names.empty() && !bleDirs_.count(pc1500::ble::joinHostPath(names))))
+        return fail(5);  // a directory, or no such parent
       bool overwrite = window[kBleFileArgs + 1] & 0x01;
       if (bleFiles_.count(name) && !overwrite) return fail(4);
       bleXfer_ = BleXfer::kPut;
@@ -1315,14 +1452,17 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
     }
     case kCommandBleFileGet: {
       if (!bleConnected_) return fail(0);
-      auto it = bleFiles_.find(bleNameFromSlot(window));
+      std::vector<std::string> names;
+      if (!pc1500::ble::resolveHostPath(bleCwdNames_, bleNameFromSlot(window), &names)) return fail(3);
+      auto it = bleFiles_.find(pc1500::ble::joinHostPath(names));
       if (it == bleFiles_.end()) return fail(3);
       bleXfer_ = BleXfer::kGet;
       bleXferData_ = it->second;
       bleXferPos_ = 0;
       bleXferFailed_ = false;
       bleRouted_ = true;
-      window[0] = 0xFF;  // kind unknown: this store doesn't record it
+      // its kind, unless a test wants an old server's "unknown"
+      window[0] = bleKindUnknown_ ? 0xFF : pc1500::ble::fileKind(it->second);
       return kStatusSuccess;
     }
 
@@ -1444,6 +1584,16 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       bleInbox_.pop_front();
       return kStatusSuccess;
     }
+    case kCommandBleDir:
+    case kCommandBleFs:
+      if (!bleConnected_) return fail(0);
+      return bleFolders(cmd, window);
+    case kCommandBlePaper:  // PAPER (BLE_PROTOCOL.md "Paper")
+      if (!bleConnected_) return fail(0);
+      if (!blePeerPrints_ || window[0] < 1 || window[0] > 3) return fail(2);  // ERR UNSUPPORTED
+      blePaperOps_.push_back(window[0]);
+      if (window[0] == 3) blePaper_.clear();
+      return kStatusSuccess;
     case kCommandBleDisplayClear:  // a DISPLAY CLEAR record to the peer
       if (!bleConnected_) return fail(0);
       bleScreenClears_++;

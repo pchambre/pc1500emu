@@ -4,6 +4,26 @@ All notable changes to this project are documented here. Versions follow
 `CMakeLists.txt`'s `project(pc1500emu VERSION ...)`, bumped on every push
 per this project's own convention (not just milestones).
 
+## [1.9.0] - 2026-11-16
+
+### Added
+- The BLE server's folders (firmware ECVER 0.18): BLLS, BLCD, BLPWD,
+  BLMKDIR, BLRMDIR, BLRM, BLCP, BLMV, BLLOAD's browse and a bare BLSAVE, on
+  the mock's fake server tree and in LinkCore (DIR/FS frames, shared path
+  rules in `src/bus/ble_paths.h`). `testBleFolders`.
+- BLPRTC, BLPRTP, BLCLP (command 0x8C, the PAPER frame): the mock records
+  the ops; LinkCore's server answers PAPER (and DEBUG) UNSUPPORTED, so
+  nothing is printed or sent to the emulator. MCONF BLDEBUG (setting 14).
+  `testBlePaperAndDebug`, `testPaperUnsupported`.
+
+### Changed
+- SDLOAD/BLLOAD without M load a file as what it is (the firmware's
+  `file_is_basic()`); FILE_GET's FILE_PUT now carries the file's kind, from
+  LinkCore and the mock alike (`fileKind()`; `setBleKindUnknown()` for an
+  older server). `testLoadWithoutMLooksAtFile`.
+- HELP of an exact name also lists the names starting with it (HELP MLOG:
+  MLOG, MLOGMSG).
+
 ## [1.8.0] - 2026-11-11
 
 ### Added

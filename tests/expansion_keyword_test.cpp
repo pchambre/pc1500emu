@@ -4078,8 +4078,9 @@ void testMconfShowsAndSetsSettings() {
   CHECK(shown(0x8002 + 8 * 30) == "BRIDGEINT=0");
   CHECK(shown(0x8002 + 9 * 30) == "TIMESYNC=1");  // 2026-10-08, on by default
   CHECK(shown(0x8002 + 10 * 30) == "BLDISP=0");  // every build since 2026-11-02 (ZIP's mirror), off by default
-  CHECK(shown(0x8002 + 11 * 30) == "HOSTNAME=KITCHEN");  // (ZWRAP: the FL store's since 2026-11-03)
-  CHECK(shown(0x8002 + 12 * 30) == "TZ=UTC");
+  CHECK(shown(0x8002 + 11 * 30) == "BLDEBUG=0");  // 2026-11-14, off by default
+  CHECK(shown(0x8002 + 12 * 30) == "HOSTNAME=KITCHEN");  // (ZWRAP: the FL store's since 2026-11-03)
+  CHECK(shown(0x8002 + 13 * 30) == "TZ=UTC");
   tapKey(*m, pc1500::Key::Ent);
   CHECK(waitForIdle(*m));
 
@@ -4717,6 +4718,214 @@ void testBleSaveLoad() {
   f->key(pc1500::Key::Ent);
   f->mock->setBleLinkDropAfter(4);
   CHECK(f->run("BLLOAD \"T\"") == 40);
+}
+
+// SDLOAD/BLLOAD without M (2026-11-16): the file says what it is. On the
+// card the MCU reads it through (keywords.c file_is_basic()): BASIC's own
+// line layout ending in FF is BASIC, anything else M by its header. Over
+// BLE the server's kind says; an old server's "unknown" is BASIC, as
+// before. M, M name and M name,addr are as they were.
+void testLoadWithoutMLooksAtFile() {
+  auto f = bleFixture("testLoadWithoutMLooksAtFile");
+  if (!f) return;
+  pc1500::Bus& bus = f->m->bus;
+  auto write = [&](const fs::path& p, const std::vector<uint8_t>& b) {
+    std::ofstream out(p, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+  };
+  // load 4400H, CALL 4403H: an RTN there
+  const std::vector<uint8_t> mFile = {0x44, 0x00, 0x44, 0x03, 1, 2, 3, 0x9A};
+  auto mLoaded = [&]() {
+    return bus.readME0(0x4400) == 1 && bus.readME0(0x4402) == 3 && bus.readME0(0x4403) == 0x9A;
+  };
+  auto mClear = [&]() {
+    for (uint16_t a = 0x4400; a < 0x4404; a++) bus.writeME0(a, 0);
+  };
+
+  CHECK(f->typeProgram("10 PRINT 1\n20 END\n"));
+  std::vector<uint8_t> original = f->program();
+  CHECK(f->run("SDSAVE \"P.BAS\"") == 0);
+  write(f->sdDir / "M.BIN", mFile);
+
+  // named, card
+  CHECK(f->run("NEW") == 0);
+  CHECK(f->run("SDLOAD \"P.BAS\"") == 0);
+  CHECK(f->program() == original);
+  mClear();
+  CHECK(f->run("SDLOAD \"M.BIN\"") == 0);
+  CHECK(mLoaded());
+  CHECK(f->program() == original);  // not loaded over the program
+  CHECK(f->run("SDSAVE") == 0);     // a bare SDSAVE still means the last BASIC load
+  CHECK(f->shown() == "FILE EXISTS. OVERWRITE Y/N");
+  f->key(pc1500::Key::N);
+
+  // browse, card: the M file alone in its folder
+  fs::create_directories(f->sdDir / "AUTO");
+  write(f->sdDir / "AUTO" / "M2.BIN", mFile);
+  CHECK(f->run("SDCD \"AUTO\"") == 0);
+  mClear();
+  CHECK(f->run("SDLOAD") == 0);
+  f->key(pc1500::Key::L);
+  CHECK(mLoaded());
+  CHECK(f->program() == original);
+  CHECK(f->run("SDCD \"/\"") == 0);
+
+  // M as before: the header's address, or one given
+  mClear();
+  CHECK(f->run("SDLOAD M \"M.BIN\"") == 0);
+  CHECK(mLoaded());
+  CHECK(f->run("SDLOAD M \"M.BIN\",&4500") == 0);
+  CHECK(bus.readME0(0x4500) == 1 && bus.readME0(0x4503) == 0x9A);
+
+  // a raw dump that isn't BASIC (SDSAVE M of ROM) loads as M, not over the program
+  CHECK(f->run("SDSAVE M \"ROM.BIN\",&C000,&C0FF") == 0);
+  CHECK(f->run("SDLOAD \"ROM.BIN\"") == 0);
+  CHECK(f->program() == original);
+
+  // BLE: by the server's kind
+  f->connect();
+  auto& files = f->mock->bleFiles();
+  files["MB"] = mFile;
+  files["PB"] = original;
+  CHECK(f->run("NEW") == 0);
+  CHECK(f->run("BLLOAD \"PB\"") == 0);
+  CHECK(f->program() == original);
+  mClear();
+  CHECK(f->run("BLLOAD \"MB\"") == 0);
+  CHECK(mLoaded());
+  CHECK(f->program() == original);
+  // an old server: unknown is BASIC, so M is needed, as before
+  f->mock->setBleKindUnknown(true);
+  mClear();
+  CHECK(f->run("BLLOAD M \"MB\"") == 0);
+  CHECK(mLoaded());
+  CHECK(f->run("BLLOAD \"PB\"") == 0);
+  CHECK(f->program() == original);
+  f->mock->setBleKindUnknown(false);
+}
+
+// The BLE server's folders (2026-11-13, BLE_PROTOCOL.md "Host folders"):
+// BLMKDIR/BLCD/BLPWD/BLLS/BLRMDIR/BLRM/BLCP/BLMV, as their SD twins, on the
+// fake server's tree. Names are paths as typed, past 8.3; BLLOAD with no
+// name browses the server's directory, and loads the pick by its full name
+// even past the listing's 16 characters; a bare BLSAVE saves as the last
+// BLLOAD. The fake server's DIR answers hold 60 bytes, so the listing
+// takes several pages.
+void testBleFolders() {
+  auto f = bleFixture("testBleFolders");
+  if (!f) return;
+  auto& files = f->mock->bleFiles();
+  auto& dirs = f->mock->bleDirs();
+  auto count = [&]() { return f->m->bus.readME0(0x8000) << 8 | f->m->bus.readME0(0x8001); };
+  auto record = [&](int i) { return f->shown(static_cast<uint16_t>(0x8002 + 30 * i)); };
+
+  CHECK(f->run("BLLS") == 40);  // no link yet
+  f->connect();
+  CHECK(f->typeProgram("10 PRINT 1\n20 END\n"));
+  std::vector<uint8_t> original = f->program();
+
+  CHECK(f->run("BLMKDIR \"GAMES\"") == 0);
+  CHECK(dirs.count("GAMES") == 1);
+  CHECK(f->run("BLMKDIR \"GAMES\"") == 40);  // there already
+  CHECK(f->run("BLCD \"GAMES\"") == 0);
+  CHECK(f->mock->bleCwd() == "GAMES");
+  CHECK(f->run("BLPWD") == 0);
+  CHECK(f->shown() == "/GAMES");
+  f->key(pc1500::Key::Ent);
+  CHECK(f->run("BLCD \"NOPE\"") == 40);
+
+  // past 8.3, relative to the server's current directory
+  CHECK(f->run("BLSAVE \"LONGNAME.BASIC\"") == 0);
+  CHECK(files["GAMES/LONGNAME.BASIC"] == original);
+  CHECK(f->run("BLCD \"/\"") == 0);
+  CHECK(f->run("NEW") == 0);
+  CHECK(f->run("BLLOAD \"GAMES/LONGNAME.BASIC\"") == 0);
+  CHECK(f->program() == original);
+  // a bare BLSAVE: as that file, wherever the current directory is now
+  CHECK(f->typeProgram("30 BEEP 1\n"));
+  std::vector<uint8_t> changed = f->program();
+  CHECK(f->run("BLSAVE") == 0);
+  CHECK(f->shown() == "FILE EXISTS. OVERWRITE Y/N");
+  f->key(pc1500::Key::Y);
+  CHECK(files["GAMES/LONGNAME.BASIC"] == changed);
+  CHECK(files.count("LONGNAME.BASIC") == 0);
+
+  // BLLS: directories first, then files, a page at a time
+  for (const char* n : {"Q1", "Q2", "Q3", "Q4", "Q5", "Q6"}) files[n] = {1, 2, 3};
+  files["ABCDEFGHIJKLMNOPQRSTU"] = original;  // 21 characters
+  CHECK(f->run("BLLS") == 0);
+  CHECK(count() == 8);
+  CHECK(record(0) == "GAMES                <DIR>");
+  CHECK(record(1) == "ABCDEFGHIJKLMNOP        14");
+  if (record(1) != "ABCDEFGHIJKLMNOP        14") std::printf("  record 1: [%s]\n", record(1).c_str());
+  CHECK(record(7) == "Q6                       3");
+  CHECK(f->shown(static_cast<uint16_t>(0x8002 + 30 * 8)) == "8 FILES 32B");
+  if (f->shown(static_cast<uint16_t>(0x8002 + 30 * 8)) != "8 FILES 32B")
+    std::printf("  summary: [%s]\n", f->shown(static_cast<uint16_t>(0x8002 + 30 * 8)).c_str());
+  f->key(pc1500::Key::Cl);
+
+  // BLLOAD's pick, by its full name
+  CHECK(f->run("NEW") == 0);
+  CHECK(f->run("BLLOAD") == 0);
+  f->key(pc1500::Key::Down);
+  f->key(pc1500::Key::L);
+  CHECK(f->program() == original);
+
+  // BLRM asks; BLCP/BLMV ask before overwriting
+  CHECK(f->run("BLRM \"Q1\"") == 0);
+  CHECK(f->shown() == "DELETE FILE? Y/N");
+  f->key(pc1500::Key::N);
+  CHECK(files.count("Q1") == 1);
+  CHECK(f->run("BLRM \"Q1\"") == 0);
+  f->key(pc1500::Key::Y);
+  CHECK(files.count("Q1") == 0);
+  CHECK(f->run("BLRM \"Q1\",-Y") == 40);  // gone
+  files["Q3"] = {9};
+  CHECK(f->run("BLCP \"Q3\",\"Q2\"") == 0);
+  CHECK(f->shown() == "FILE EXISTS. OVERWRITE Y/N");
+  f->key(pc1500::Key::N);
+  CHECK(files["Q2"] == std::vector<uint8_t>({1, 2, 3}));
+  CHECK(f->run("BLCP \"Q3\",\"Q2\",-Y") == 0);
+  CHECK(files["Q2"] == std::vector<uint8_t>({9}));
+  CHECK(f->run("BLMV \"Q2\",\"GAMES\"") == 0);  // into it
+  CHECK(files.count("Q2") == 0 && files["GAMES/Q2"] == std::vector<uint8_t>({9}));
+  CHECK(f->run("BLMV \"GAMES\",\"OLD\"") == 0);  // a directory renamed
+  CHECK(dirs.count("OLD") == 1 && files.count("OLD/Q2") == 1);
+  CHECK(f->run("BLRMDIR \"OLD\"") == 40);  // not empty
+  CHECK(f->run("BLRM \"OLD/Q2\",-Y") == 0);
+  CHECK(f->run("BLRM \"OLD/LONGNAME.BASIC\",-Y") == 0);
+  CHECK(f->run("BLRMDIR \"OLD\"") == 0);
+  CHECK(dirs.empty());
+  CHECK(f->run("BLCD \"..\"") == 40);  // never above the root
+
+  CHECK(f->run("BLDISC") == 0);
+  CHECK(f->run("BLPWD") == 40);
+}
+
+// BLPRTC, BLPRTP, BLCLP (2026-11-14): PAPER to the server; BLDEBUG is
+// MCONF BLDEBUG only.
+void testBlePaperAndDebug() {
+  auto f = bleFixture("testBlePaperAndDebug");
+  if (!f) return;
+  CHECK(f->run("BLPRTC") == 40);  // no link yet
+  f->connect();
+  CHECK(f->run("BLPRTC") == 0);
+  CHECK(f->run("BLPRTP") == 0);
+  CHECK(f->run("LPRINT \"AB\"") == 0);
+  CHECK(!f->mock->blePlotLines().empty());
+  CHECK(f->run("BLCLP") == 0);
+  CHECK(f->mock->blePlotLines().empty());
+  CHECK(f->mock->blePaperOps() == std::vector<uint8_t>({1, 2, 3}));
+  CHECK(f->run("BLPRTC 1") == 1);
+  f->mock->setBlePeerPrints(false);  // a peer that can't print
+  CHECK(f->run("BLPRTP") == 40);
+  f->mock->setBlePeerPrints(true);
+
+  CHECK(f->run("MCONF BLDEBUG=1") == 0);  // MCONF only: no BLDEBUG keyword (2026-11-15)
+  CHECK(f->mock->configValue(14) == 1);
+  CHECK(f->run("MCONF BLDEBUG=0") == 0);
+  CHECK(f->mock->configValue(14) == 0);
+  CHECK(f->run("BLDISC") == 0);
 }
 
 // SDSAVE with no name (2026-09-28): saves as the last BASIC program SDLOAD
@@ -7161,6 +7370,14 @@ void testHelp() {
   key(pc1500::Key::Cl);
   CHECK(idle());
 
+  // an exact name, then the names starting with it (2026-11-16)
+  CHECK(help("HELP MLOG"));
+  CHECK(shown() == "MLOG [VIEW/VERBOSE/QUIET/C");
+  key(pc1500::Key::Down);
+  CHECK(shown() == "MLOGMSG s$: writes s$ into");
+  key(pc1500::Key::Cl);
+  CHECK(idle());
+
   // part of a name: every name holding it, Up/Down; BREAK leaves
   CHECK(help("HELP LOAD"));
   CHECK(shown() == "BLLOAD [M] [name$[,addr]]:");
@@ -8700,6 +8917,9 @@ int main(int argc, char** argv) {
   RUN(testBleListMatchesDetokenizer);
   RUN(testBleListBreak);
   RUN(testBleSaveLoad);
+  RUN(testLoadWithoutMLooksAtFile);
+  RUN(testBleFolders);
+  RUN(testBlePaperAndDebug);
   RUN(testMlogmsgLogsLiteralAndStringVariable);
   RUN(testBootHookStagesRomThenSkipsOnReset);
   RUN(testStageQueryIsRecognizedKeyword);

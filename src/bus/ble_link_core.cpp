@@ -2,6 +2,7 @@
 // RP2350/ble_link.c, the advertiser side the laptop app's
 // ble_app/lib/link.dart; both follow RP2350/BLE_PROTOCOL.md.
 #include "ble_link_core.h"
+#include "ble_paths.h"
 
 #include <algorithm>
 #include <cctype>
@@ -36,12 +37,14 @@ constexpr uint8_t kHello = 0x01, kBye = 0x02, kText = 0x10;
 constexpr uint8_t kAuth = 0x03, kPairStart = 0x04, kPairNonce = 0x05, kPairConfirm = 0x06;  // sec.7
 constexpr uint8_t kFilePut = 0x20, kFileData = 0x21, kFileEnd = 0x22, kFileGet = 0x23, kFileAbort = 0x24;
 constexpr uint8_t kFileOffer = 0x25, kFileAnswer = 0x26;  // peer-to-peer (2026-09-28)
+constexpr uint8_t kDir = 0x27, kFs = 0x28;                 // the server's folders (2026-11-13)
+constexpr uint8_t kPaper = 0x42;  // the server's printer, the plotter's paper cleared (2026-11-14)
 constexpr uint8_t kMsg = 0x30;                             // peer messaging (2026-09-29)
 constexpr size_t kMsgMax = 220, kInboxMax = 8;             // EXP_BLE_MSG_MAX, EXP_BLE_MSG_INBOX
 constexpr uint8_t kAck = 0x7E, kErr = 0x7F;
 constexpr uint8_t kErrBadFrame = 1, kErrUnsupported = 2, kErrNotFound = 3, kErrExists = 4, kErrIo = 5,
                   kErrBusy = 6, kErrAborted = 7, kErrNotPaired = 8, kErrAuthFailed = 9;
-constexpr uint8_t kVersion = 2, kKindPc1500 = 1, kTargetServer = 0, kKindUnknown = 0xFF;  // 2: sec.7
+constexpr uint8_t kVersion = 2, kKindPc1500 = 1, kTargetServer = 0;  // 2: sec.7
 constexpr uint8_t kKindServer = 2;
 constexpr size_t kSealOverhead = 20;  // LS_OVERHEAD: a sealed frame's counter and tag
 constexpr size_t kIdLen = 8, kNonceLen = 16, kKeyLen = 32, kProofLen = 16;
@@ -58,6 +61,9 @@ constexpr uint8_t kCmdMsgSend = 0x51, kCmdMsgWait = 0x52, kCmdMsgRecv = 0x53, kC
 constexpr uint8_t kCmdPlot = 0x57;  // the CE-150 stand-in's drawing (2026-09-30)
 constexpr uint8_t kCmdPairBegin = 0x58, kCmdPairConfirm = 0x59, kCmdPairAnswer = 0x5A, kCmdUnpair = 0x5B;  // sec.7
 constexpr uint8_t kCmdDisplayClear = 0x5C;  // BLCLS: the peer's screen pane (2026-10-18)
+constexpr uint8_t kCmdDir = 0x8A, kCmdFs = 0x8B;  // EXP_COMMAND_BLE_DIR/FS (2026-11-13)
+constexpr uint8_t kCmdPaper = 0x8C;               // EXP_COMMAND_BLE_PAPER (2026-11-14)
+constexpr size_t kFsArgs = 84;                    // EXP_BLE_FS_ARGS: after two name slots
 constexpr uint8_t kStatusPairAsk = 0x20;
 constexpr uint8_t kPlot = 0x40;
 constexpr uint8_t kTime = 0x41;  // the server's clock, in its ACK (2026-10-08)
@@ -100,13 +106,6 @@ bool sameName(const std::string& a, const std::string& b) {
 }
 
 // A plain file name for the store: no folders, nothing a filesystem rejects.
-bool plainName(const std::string& n) {
-  if (n.empty() || n == "." || n == "..") return false;
-  for (unsigned char c : n)
-    if (c < 0x20 || std::string("\\/:*?\"<>|").find(static_cast<char>(c)) != std::string::npos) return false;
-  return true;
-}
-
 // A MSG's payload: whole value chunks ('N' + 8 bytes, 'S' + length +
 // characters), at least one.
 bool validChunks(const std::vector<uint8_t>& p) {
@@ -600,8 +599,8 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
       break;
   }
   // sec.7: only an authenticated link carries anything but pairing
-  if ((cmd == kCmdText || cmd == kCmdPlot || cmd == kCmdFilePut ||
-       cmd == kCmdFileGet) && isLinked() && !authed())
+  if ((cmd == kCmdText || cmd == kCmdPlot || cmd == kCmdFilePut || cmd == kCmdFileGet || cmd == kCmdDir ||
+       cmd == kCmdFs || cmd == kCmdPaper) && isLinked() && !authed())
     return fail(kErrNotPaired);
   if (server) {  // a peer is using this emulator as its server
     log("Busy: a peer is connected to this emulator");
@@ -659,6 +658,15 @@ uint8_t LinkCore::command(uint8_t cmd, std::vector<uint8_t>& w) {
       return filePut(w);
     case kCmdFileGet:
       return fileGet(w);
+    case kCmdDir:
+    case kCmdFs:
+      return folders(cmd, w);
+    case kCmdPaper: {  // [op]: print the console or the paper, or clear the paper
+      int r = request(kPaper, {w[0]});
+      if (r == 0) return kStatusSuccess;
+      w[0] = r > 0 ? static_cast<uint8_t>(r) : 0;
+      return kStatusError;
+    }
     default:
       return kStatusNotImplemented;
   }
@@ -887,6 +895,45 @@ uint8_t LinkCore::fileGet(std::vector<uint8_t>& w) {
   xferFailed_ = getEnded_ = false;
   getBuf_.clear();
   getPos_ = 0;
+  return kStatusSuccess;
+}
+
+// The server's folders (2026-11-13): DIR's ACK passed on as it came
+// ([len hi][len lo] then the payload), PWD's path as [len][path].
+uint8_t LinkCore::folders(uint8_t cmd, std::vector<uint8_t>& w) {
+  std::vector<uint8_t> p;
+  if (cmd == kCmdDir) {
+    p = {w[kFileArgs + 1], w[kFileArgs]};  // start, little-endian
+  } else {
+    p = {w[kFsArgs], w[kFsArgs + 1]};
+  }
+  std::vector<uint8_t> n = str8(nameFromSlot(w));
+  p.insert(p.end(), n.begin(), n.end());
+  if (cmd == kCmdFs) {
+    std::vector<uint8_t> second(w.begin() + 42, w.begin() + 84);
+    n = str8(nameFromSlot(second));
+    p.insert(p.end(), n.begin(), n.end());
+  }
+  uint8_t op = w[kFsArgs];
+  int r = request(cmd == kCmdDir ? kDir : kFs, p);
+  if (r != 0) {
+    w[0] = r > 0 ? static_cast<uint8_t>(r) : 0;
+    return kStatusError;
+  }
+  std::vector<uint8_t> d;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    d = answerData_;
+  }
+  if (cmd == kCmdDir) {
+    if (d.size() < 3) return w[0] = kErrBadFrame, kStatusError;
+    w[0] = static_cast<uint8_t>(d.size() >> 8);
+    w[1] = static_cast<uint8_t>(d.size());
+    std::copy(d.begin(), d.end(), w.begin() + 2);
+  } else if (op == kFsPwd) {
+    if (d.empty() || d[0] + 1u > d.size()) return w[0] = kErrBadFrame, kStatusError;
+    std::copy(d.begin(), d.begin() + 1 + d[0], w.begin());
+  }
   return kStatusSuccess;
 }
 
@@ -1162,10 +1209,15 @@ void LinkCore::serve(const Frame& f) {
       if (p[0] != kTargetServer) return answer(f.seq, kErrUnsupported);
       if (putActive_) return answer(f.seq, kErrBusy);
       std::string name(p.begin() + 8, p.begin() + 8 + p[7]);
-      if (!plainName(name)) return answer(f.seq, kErrIo);
+      std::filesystem::path path;
+      std::error_code ec;
+      if (!hostFile(name, &path) || std::filesystem::is_directory(path, ec) ||
+          !std::filesystem::is_directory(path.parent_path(), ec))
+        return answer(f.seq, kErrIo);
       bool overwrite = p[2] & 1;
-      if (!overwrite && std::filesystem::exists(filesDir_ / name)) return answer(f.seq, kErrExists);
+      if (!overwrite && std::filesystem::exists(path, ec)) return answer(f.seq, kErrExists);
       putName_ = name;
+      putPath_ = path;
       putSize_ = getU32(&p[3]);
       putData_.clear();
       putActive_ = true;
@@ -1183,9 +1235,7 @@ void LinkCore::serve(const Frame& f) {
         log(putName_ + ": got " + std::to_string(putData_.size()) + " bytes, expected " + std::to_string(putSize_));
         return answer(f.seq, kErrIo);
       }
-      std::error_code ec;
-      std::filesystem::create_directories(filesDir_, ec);
-      std::ofstream out(filesDir_ / putName_, std::ios::binary);
+      std::ofstream out(putPath_, std::ios::binary);
       out.write(reinterpret_cast<const char*>(putData_.data()), static_cast<std::streamsize>(putData_.size()));
       out.close();  // on disk before the ACK says it's saved (a BLLOAD may follow at once)
       if (!out) return answer(f.seq, kErrIo);
@@ -1207,6 +1257,10 @@ void LinkCore::serve(const Frame& f) {
       return answer(f.seq);
     case kFileGet:
       return serveFileGet(f);
+    case kDir:
+      return serveDir(f);
+    case kFs:
+      return serveFs(f);
     default:
       return answer(f.seq, kErrUnsupported);
   }
@@ -1217,14 +1271,16 @@ void LinkCore::serveFileGet(const Frame& f) {
   if (p.size() < 2 || 2u + p[1] > p.size()) return answer(f.seq, kErrBadFrame);
   if (p[0] != kTargetServer) return answer(f.seq, kErrUnsupported);
   std::string name(p.begin() + 2, p.begin() + 2 + p[1]);
-  std::ifstream in(filesDir_ / name, std::ios::binary);
-  if (!plainName(name) || !in) return answer(f.seq, kErrNotFound);
+  std::filesystem::path path;
+  if (!hostFile(name, &path)) return answer(f.seq, kErrNotFound);
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return answer(f.seq, kErrNotFound);
   std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   answer(f.seq);
   log("Sending " + name + " (" + std::to_string(data.size()) + " bytes)");
-  std::vector<uint8_t> header{kTargetServer, kKindUnknown, 0};
+  std::vector<uint8_t> header{kTargetServer, ble::fileKind(data), 0};  // its kind (2026-11-16)
   putU32(header, static_cast<uint32_t>(data.size()));
-  std::vector<uint8_t> n = str8(name);
+  std::vector<uint8_t> n = str8(path.filename().string());
   header.insert(header.end(), n.begin(), n.end());
   if (request(kFilePut, header) != 0) return log(name + ": refused");
   size_t chunk = plainMax() - 4;
@@ -1233,6 +1289,161 @@ void LinkCore::serveFileGet(const Frame& f) {
     if (int r = request(kFileData, part); r != 0) return log(name + ": stopped at byte " + std::to_string(at));
   }
   if (request(kFileEnd, {}) == 0) log("Sent " + name);
+}
+
+// ---- advertiser: the folders (2026-11-13, BLE_PROTOCOL.md "Host folders") ----
+
+std::string LinkCore::peerKey() {
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+  std::lock_guard<std::mutex> lock(sec_->m);
+  return std::string(reinterpret_cast<const char*>(sec_->peerId), kIdLen);
+#else
+  return {};
+#endif
+}
+
+std::filesystem::path LinkCore::hostPath(const std::vector<std::string>& names) const {
+  std::filesystem::path p = filesDir_;
+  for (const std::string& n : names) p /= n;
+  return p;
+}
+
+std::vector<std::string> LinkCore::cwd() {
+  auto it = cwds_.find(peerKey());
+  if (it == cwds_.end()) return {};
+  std::error_code ec;
+  if (!std::filesystem::is_directory(hostPath(it->second), ec)) {
+    cwds_.erase(it);
+    return {};
+  }
+  return it->second;
+}
+
+// A FILE_PUT/FILE_GET name: a file's path here, or false.
+bool LinkCore::hostFile(const std::string& name, std::filesystem::path* out) {
+  std::error_code ec;
+  std::filesystem::create_directories(filesDir_, ec);  // the root, before anything in it
+  std::vector<std::string> names;
+  if (!resolveHostPath(cwd(), name, &names) || names.empty()) return false;
+  *out = hostPath(names);
+  return true;
+}
+
+// DIR: start (u16 LE), path (str8) -> ACK: total u16, count, then entries of
+// [flags][size u32][name str8], directories first, by name ignoring case.
+void LinkCore::serveDir(const Frame& f) {
+  const std::vector<uint8_t>& p = f.payload;
+  if (p.size() < 3 || 3u + p[2] > p.size()) return answer(f.seq, kErrBadFrame);
+  size_t start = static_cast<size_t>(p[0] | p[1] << 8);
+  std::error_code ec;
+  std::filesystem::create_directories(filesDir_, ec);
+  std::vector<std::string> names;
+  if (!resolveHostPath(cwd(), std::string(p.begin() + 3, p.begin() + 3 + p[2]), &names))
+    return answer(f.seq, kErrNotFound);
+  std::filesystem::path dir = hostPath(names);
+  if (!std::filesystem::is_directory(dir, ec)) return answer(f.seq, kErrNotFound);
+  struct Entry {
+    bool isDir;
+    std::string name;
+    uint32_t size;
+  };
+  std::vector<Entry> all;
+  for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+    bool d = e.is_directory(ec);
+    if (!d && !e.is_regular_file(ec)) continue;
+    uintmax_t size = d ? 0 : e.file_size(ec);
+    all.push_back({d, e.path().filename().string(), static_cast<uint32_t>(std::min<uintmax_t>(size, 0xFFFFFFFFu))});
+  }
+  auto lower = [](std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+  };
+  std::sort(all.begin(), all.end(), [&](const Entry& a, const Entry& b) {
+    if (a.isDir != b.isDir) return a.isDir;
+    return lower(a.name) < lower(b.name);
+  });
+  size_t room = plainMax() - 4;
+  std::vector<uint8_t> out{static_cast<uint8_t>(all.size()), static_cast<uint8_t>(all.size() >> 8), 0};
+  uint8_t count = 0;
+  for (size_t i = start; i < all.size() && count < 255; i++) {
+    std::string n = all[i].name.substr(0, 255);
+    if (out.size() + 6 + n.size() > room) break;
+    out.push_back(all[i].isDir ? 1 : 0);
+    putU32(out, all[i].size);
+    out.push_back(static_cast<uint8_t>(n.size()));
+    out.insert(out.end(), n.begin(), n.end());
+    count++;
+  }
+  out[2] = count;
+  sendFrame(kAck, f.seq, out);
+}
+
+// FS: op, flags, name (str8), name2 (str8, may be left out).
+void LinkCore::serveFs(const Frame& f) {
+  const std::vector<uint8_t>& p = f.payload;
+  if (p.size() < 3 || 3u + p[2] > p.size()) return answer(f.seq, kErrBadFrame);
+  size_t at2 = 3u + p[2];
+  if (at2 < p.size() && at2 + 1 + p[at2] > p.size()) return answer(f.seq, kErrBadFrame);
+  uint8_t op = p[0];
+  bool overwrite = p[1] & 1;
+  std::string name(p.begin() + 3, p.begin() + static_cast<long>(at2));
+  std::string name2 = at2 < p.size() ? std::string(p.begin() + static_cast<long>(at2) + 1,
+                                                   p.begin() + static_cast<long>(at2) + 1 + p[at2])
+                                     : std::string();
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::create_directories(filesDir_, ec);
+  std::vector<std::string> here = cwd(), names;
+  bool ok = resolveHostPath(here, name, &names);
+  fs::path path = hostPath(names);
+  switch (op) {
+    case kFsPwd: {
+      std::vector<uint8_t> out = str8("/" + joinHostPath(here));
+      return sendFrame(kAck, f.seq, out), void();
+    }
+    case kFsCd:
+      if (!ok || !fs::is_directory(path, ec)) return answer(f.seq, kErrNotFound);
+      cwds_[peerKey()] = names;
+      log(peerName_ + " is in /" + joinHostPath(names));
+      return answer(f.seq);
+    case kFsMkdir:
+      if (!ok) return answer(f.seq, kErrIo);
+      if (names.empty() || fs::exists(path, ec)) return answer(f.seq, kErrExists);
+      if (!fs::is_directory(path.parent_path(), ec)) return answer(f.seq, kErrNotFound);
+      return answer(f.seq, fs::create_directory(path, ec) ? 0 : kErrIo);
+    case kFsRmdir:
+      if (!ok || names.empty() || !fs::is_directory(path, ec)) return answer(f.seq, kErrNotFound);
+      if (!fs::is_empty(path, ec)) return answer(f.seq, kErrIo);
+      return answer(f.seq, fs::remove(path, ec) ? 0 : kErrIo);
+    case kFsRm:
+      if (!ok || names.empty() || !fs::is_regular_file(path, ec)) return answer(f.seq, kErrNotFound);
+      return answer(f.seq, fs::remove(path, ec) ? 0 : kErrIo);
+    case kFsCp:
+    case kFsMv: {
+      if (!ok) return answer(f.seq, kErrIo);
+      bool isDir = fs::is_directory(path, ec);
+      if (names.empty() || !(fs::is_regular_file(path, ec) || (op == kFsMv && isDir)))
+        return answer(f.seq, kErrNotFound);
+      std::vector<std::string> to;
+      if (!resolveHostPath(here, name2, &to)) return answer(f.seq, kErrIo);
+      if (fs::is_directory(hostPath(to), ec)) to.push_back(names.back());  // into it
+      fs::path dest = hostPath(to);
+      if (to.empty() || dest == path || fs::is_directory(dest, ec)) return answer(f.seq, kErrExists);
+      bool there = fs::exists(dest, ec);
+      if (there && !overwrite) return answer(f.seq, kErrExists);
+      if (!fs::is_directory(dest.parent_path(), ec)) return answer(f.seq, kErrNotFound);
+      if (there) fs::remove(dest, ec);
+      if (op == kFsCp)
+        fs::copy_file(path, dest, fs::copy_options::overwrite_existing, ec);
+      else
+        fs::rename(path, dest, ec);
+      if (ec) return answer(f.seq, kErrIo);
+      log(std::string(op == kFsCp ? "Copied /" : "Moved /") + joinHostPath(names) + " to /" + joinHostPath(to));
+      return answer(f.seq);
+    }
+    default:
+      return answer(f.seq, kErrUnsupported);
+  }
 }
 
 // ---- advertiser: sec.7's HELLO, AUTH and pairing ----
