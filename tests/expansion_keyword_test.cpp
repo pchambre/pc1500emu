@@ -4322,7 +4322,9 @@ struct BleFixture {
 static std::unique_ptr<BleFixture> bleFixture(const char* testName, size_t extRam0000Bytes = 0x4000,
                                               size_t extRamExtBytes = 0x2800, bool stageable = false,
                                               bool internalCard = false) {
-  const std::string kRomPath = "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
+  // SYSROM: another system ROM (S1500ROM.BIN, the user's A01, say)
+  const char* sysRom = std::getenv("SYSROM");
+  const std::string kRomPath = sysRom ? sysRom : "C:/Users/paulc/Documents/PC1500/ROM1.BIN";
   // EXPROM_DIR: another build of the ROM (rom_8800.bin, rom.bin) -- an
   // older one in a scratch copy, say, to see a test fail without a fix.
   const char* romDir = std::getenv("EXPROM_DIR");
@@ -4331,6 +4333,7 @@ static std::unique_ptr<BleFixture> bleFixture(const char* testName, size_t extRa
   const std::string kExpRomPath = kRomDir + "/rom_8800.bin";
   std::vector<uint8_t> rom = readFile(kRomPath);
   std::vector<uint8_t> expRom = readFile(kExpRomPath);
+  if (rom.size() == 0x4004) rom.erase(rom.begin(), rom.begin() + 4);  // SDSAVE M's header
   if (rom.empty() || expRom.empty()) {
     std::printf("SKIP: %s -- ROM1.BIN and/or rom_8800.bin not found.\n", testName);
     return nullptr;
@@ -5999,7 +6002,13 @@ void testScreenBasic() {
   CHECK(f->run("SDLS") == 0);
   settle();
   CHECK(count(2) >= 1);  // the listing, every row of it, and its summary
+  CHECK(has(1, "SDLS"));  // the module keyword's own line, before its listing
   f->key(pc1500::Key::Cl);
+  f->mock->clearBleDisplay();
+  CHECK(f->run("SDDF") == 0);
+  settle();
+  CHECK(has(1, "SDDF"));
+  CHECK(count(1) == 1);  // once: not again when the keyword's done
 
   f->mock->clearBleDisplay();
   CHECK(f->run("CLS") == 0);  // back at the prompt a few ms after ENTER: before it settles

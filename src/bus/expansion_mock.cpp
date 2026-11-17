@@ -2497,7 +2497,8 @@ void ExpansionMock::reopenAfterPowmanPrepare() {
   z.saved = z.zt;               // the session record, written before the sleep
   zterm_init(&z.zt);            // the RAM state, gone
   z.zt = z.saved;               // ...and read back at the wake
-  screen_watch_mute(z.zt.open); // zterm_session_resume()
+  // No mute here: as zterm_session_resume() (2026-11-17), the game's next
+  // command mutes BASIC's buffers -- a stale "open" record muted them for good.
   if (z.zt.open && !z.storyPath.empty() && z.zt.story_channel >= 1 && z.zt.story_channel <= kMaxSdChannels &&
       !channels_[z.zt.story_channel - 1].isOpen) {
     SdChannel& ch = channels_[z.zt.story_channel - 1];
