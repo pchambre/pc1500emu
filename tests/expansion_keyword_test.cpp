@@ -5728,6 +5728,12 @@ void testZipGamePrompt() {
     g->tap(pc1500::Key::Ent);
     CHECK(g->settle());
     g->keyAction(pc1500::Key::Ent, false, pc1500::basic::kIdleFrames);
+    if (lcd().rfind("RESUME?", 0) == 0) {  // the game BREAK left (testZipResume): not here
+      g->tap(pc1500::Key::N);
+      CHECK(g->settle());
+      g->tap(pc1500::Key::Ent);
+      CHECK(g->settle());
+    }
   };
   auto key = [&](pc1500::Key k) {
     g->tap(k);
@@ -5770,6 +5776,104 @@ void testZipGamePrompt() {
   brk();  // BREAK at the prompt: BASIC
   CHECK(g->f->m->bus.readME0(kErlAbs) == 0);
   CHECK(g->f->run("A=5") == 0);
+}
+
+// ZIP's resume (2026-11-17, zmachine/DESIGN.md): BREAK at the input line
+// leaves the game in RAM, sealed with a checksum; SDLOAD M "ZIP" again asks
+// RESUME? -- ENTER takes the game up where it was, N starts a new one. A
+// byte of the game changed since (BASIC's POKE): no question, GAME FILE.
+void testZipResume() {
+  auto g = zipStart("testZipResume", "zork1.z3");
+  if (!g) return;
+  auto has = [&](const std::string& text) { return g->transcript().find(text) != std::string::npos; };
+  auto lcd = [&]() {
+    std::string t;
+    for (uint16_t a = 0x8001; a < 0x8001 + 26; a++) t += static_cast<char>(g->f->m->bus.readME0(a));
+    return t.substr(0, t.find_last_not_of(' ') + 1);
+  };
+  auto toBasic = [&]() {  // BREAK (the ON key) at the input line
+    g->keyAction(pc1500::Key::Ent, false, pc1500::basic::kIdleFrames);
+    g->f->m->cpu.pressOnKey();
+    g->f->m->bus.ioPort().setOnKeyLine(true);
+    g->f->m->cpu.requestMI();
+    g->f->m->bus.ioPort().setOnKeyLine(false);
+    CHECK(waitForIdle(*g->f->m, 20'000'000));
+  };
+  auto zip = [&]() {
+    g->f->m->bus.writeME0(kErlAbs, 0);
+    g->tap(pc1500::Key::Cl);
+    g->type("SDLOAD M \"ZIP\"");
+    g->tap(pc1500::Key::Ent);
+    CHECK(g->settle());
+    g->keyAction(pc1500::Key::Ent, false, pc1500::basic::kIdleFrames);
+  };
+  auto key = [&](pc1500::Key k) {
+    g->tap(k);
+    CHECK(g->settle());
+  };
+
+  CHECK(g->command("OPEN MAILBOX"));
+  toBasic();
+  CHECK(g->f->run("A=5") == 0);  // BASIC meanwhile, its own variables only
+  zip();
+  CHECK(lcd() == "RESUME? (Y/N) _");
+  key(pc1500::Key::Ent);
+  CHECK(has("(Resumed)"));
+  CHECK(g->command("TAKE LEAFLET"));  // the mailbox is still open
+  CHECK(has("(Resumed)\nTAKE LEAFLET\nTaken."));  // a new console: the game's ">" was in the old one
+  if (!has("(Resumed)\nTAKE LEAFLET\nTaken.")) {
+    std::string t = g->transcript();
+    std::printf("  resumed: ...%s\n", t.substr(t.size() > 300 ? t.size() - 300 : 0).c_str());
+  }
+
+  toBasic();  // a BREAK at the question keeps the game
+  zip();
+  CHECK(lcd() == "RESUME? (Y/N) _");
+  g->f->m->cpu.pressOnKey();
+  g->f->m->bus.ioPort().setOnKeyLine(true);
+  g->f->m->cpu.requestMI();
+  g->f->m->bus.ioPort().setOnKeyLine(false);
+  CHECK(waitForIdle(*g->f->m, 20'000'000));
+  zip();
+  CHECK(lcd() == "RESUME? (Y/N) _");
+  key(pc1500::Key::Y);
+  key(pc1500::Key::Ent);
+  CHECK(g->command("INVENTORY"));
+  CHECK(has("A leaflet"));
+  if (!has("A leaflet")) {
+    std::string t = g->transcript();
+    std::printf("  inventory: ...%s\n", t.substr(t.size() > 300 ? t.size() - 300 : 0).c_str());
+  }
+
+  toBasic();  // dynamic memory changed: no question
+  {
+    int e = g->f->run("A=PEEK &200");
+    if (!e) e = g->f->run("POKE &200,255-A");
+    CHECK(e == 0);
+    if (e) std::printf("  POKE: error %d\n", e);
+  }
+  zip();
+  CHECK(lcd() == "GAME FILE: /ZORK1.Z3_");
+
+  key(pc1500::Key::Ent);  // N: a new game, and the old one's gone
+  CHECK(g->command("OPEN MAILBOX"));
+  toBasic();
+  zip();
+  CHECK(lcd() == "RESUME? (Y/N) _");
+  key(pc1500::Key::N);
+  key(pc1500::Key::Ent);
+  CHECK(lcd() == "GAME FILE: /ZORK1.Z3_");
+  toBasic();
+  zip();
+  CHECK(lcd() == "GAME FILE: /ZORK1.Z3_");
+
+  key(pc1500::Key::Ent);  // QUIT: nothing to resume either
+  CHECK(g->command("QUIT"));
+  CHECK(g->command("Y"));
+  g->tap(pc1500::Key::Ent);
+  CHECK(g->settle());
+  zip();
+  CHECK(lcd() == "GAME FILE: /ZORK1.Z3_");
 }
 
 // The FL store (2026-11-02): FLSET/FLGET/FLRM/FLLS/FLDF, values that
@@ -6136,7 +6240,7 @@ void testZipPowerCycle() {
   // The MCU alone: the next key finds no console.
   g->f->mock->simulateColdBoot(true);
   CHECK(g->command("TAKE LEAFLET"));  // the mailbox still open
-  CHECK(has("[Resumed]"));
+  CHECK(has("(Resumed)"));
   CHECK(has("Taken."));
   if (!has("Taken.")) std::printf("  transcript:\n%s\n", g->transcript().c_str());
   // OFF and ON, the MCU's power going with the PC-1500's.
@@ -6152,7 +6256,7 @@ void testZipPowerCycle() {
   m.bus.ioPort().setOnKeyLine(false);
   CHECK(g->settle());
   CHECK(g->command("INVENTORY"));
-  CHECK(has("[Resumed]"));
+  CHECK(has("(Resumed)"));
   CHECK(has("A leaflet"));
   if (!has("A leaflet")) std::printf("  transcript:\n%s\n", g->transcript().c_str());
 }
@@ -8912,6 +9016,7 @@ int main(int argc, char** argv) {
   RUN(testZipConsoleKeys);
   RUN(testZipSaveRestore);
   RUN(testZipGamePrompt);
+  RUN(testZipResume);
   RUN(testZipMirror);
   RUN(testZipMirrorRestore);
   RUN(testScreenBasic);
