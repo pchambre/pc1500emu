@@ -3712,6 +3712,8 @@ void testMlogViewIsRecognized() {
   tapKey(*m, pc1500::Key::Cl);
   typeText(*m, "MLOG VIEW");
   tapKey(*m, pc1500::Key::Ent);
+  for (long i = 0; i < 1'000'000; i++) stepOne(*m);
+  tapKey(*m, pc1500::Key::Cl);  // leaves HELP's viewer (2026-11-18)
   CHECK(waitForIdle(*m));
   uint8_t erl = m->bus.readME0(kErlAbs);
   CHECK(erl == 0);
@@ -6549,7 +6551,7 @@ void testBlePutToPeer() {
   CHECK(f->mock->bleReceived().size == 8);
   CHECK(f->mock->bleReceived().data == mExpected);
 
-  std::vector<uint8_t> file = testBytes(3000);  // several 1K pieces
+  std::vector<uint8_t> file = testBytes(13000);  // several 1K pieces, and 4K steps (2026-11-18)
   {
     std::ofstream out(f->sdDir / "F.BIN", std::ios::binary);
     out.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
@@ -6612,6 +6614,56 @@ void testBleGetFromPeer() {
   CHECK(onCard("G.BIN") == other);
 
   CHECK(f->runThenBreak("BLGET") == 0);  // nothing offered: waits until BREAK
+}
+
+// BLGET from the app (2026-11-17): no BLPUT there. BLGET "name" fetches the
+// app's file onto the card at once; a bare BLGET is BLLOAD's browse.
+void testBleGetFromHost() {
+  auto f = bleFixture("testBleGetFromHost");
+  if (!f) return;
+  f->mock->setBlePeerIsServer(true);
+  f->connect();
+  auto onCard = [&](const char* name) {
+    std::ifstream in(f->sdDir / name, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  };
+  std::vector<uint8_t> file = testBytes(3000);
+  f->mock->bleFiles()["ZIP"] = file;
+  CHECK(f->run("BLGET \"ZIP\"") == 0);
+  CHECK(onCard("ZIP") == file);
+
+  // a big one: 4 KB a step, with "BLGET: n/size" between (2026-11-18: all in
+  // one step, 85 KB outran the MCU's 30 s command watchdog -- ERROR 1)
+  std::vector<uint8_t> big = testBytes(20000);
+  f->mock->bleFiles()["BIG"] = big;
+  CHECK(f->run("BLGET \"BIG\"") == 0);
+  CHECK(onCard("BIG") == big);
+  f->mock->bleFiles().erase("BIG");  // the bare BLGET below picks the first file
+
+  std::vector<uint8_t> other = testBytes(10);
+  f->mock->bleFiles()["ZIP"] = other;
+  CHECK(f->run("BLGET \"ZIP\"") == 0);
+  CHECK(f->shown() == "FILE EXISTS. OVERWRITE Y/N");
+  f->key(pc1500::Key::N);
+  CHECK(onCard("ZIP") == file);
+  CHECK(f->run("BLGET \"ZIP\",-Y") == 0);
+  CHECK(onCard("ZIP") == other);
+
+  CHECK(f->run("BLGET \"NONE.BIN\"") == 40);  // not on the app: the card is left alone
+  CHECK(!std::filesystem::exists(f->sdDir / "NONE.BIN"));
+
+  // a bare BLGET browses the app's folder, and G gets the pick onto the card
+  // (2026-11-18: it was BLLOAD's browse, and L loaded it into memory)
+  CHECK(f->typeProgram("10 PRINT 3\n20 END\n"));
+  std::vector<uint8_t> program = f->program();
+  CHECK(f->run("BLSAVE \"P\"") == 0);
+  CHECK(f->run("NEW") == 0);
+  CHECK(f->run("BLGET") == 0);
+  f->key(pc1500::Key::L);  // not BLGET's key: nothing happens
+  CHECK(!std::filesystem::exists(f->sdDir / "P"));
+  f->key(pc1500::Key::G);
+  CHECK(onCard("P") == f->mock->bleFiles()["P"]);
+  CHECK(f->program().empty() || f->program() != program);  // not loaded
 }
 
 // The CE-150 printer/plotter's keywords (2026-09-30), drawn on the fake
@@ -7512,6 +7564,14 @@ void testHelp() {
   CHECK(!help("HELP QQQ"));
   key(pc1500::Key::Cl);
   CHECK(idle());
+  CHECK(m->bus.readME0(kErlAbs) == 0);
+
+  // MLOG VIEW, in the same viewer (2026-11-18): the mock has no log, just its count
+  CHECK(help("MLOG VIEW"));
+  CHECK(shown() == "0 ENTRIES");
+  key(pc1500::Key::Cl);
+  CHECK(idle());
+  CHECK(!help_terminal());
   CHECK(m->bus.readME0(kErlAbs) == 0);
 
   // still a working machine afterwards
@@ -9001,6 +9061,7 @@ int main(int argc, char** argv) {
   RUN(testSshSessionLive);
   RUN(testBlePutToPeer);
   RUN(testBleGetFromPeer);
+  RUN(testBleGetFromHost);
   RUN(testBleMessaging);
   RUN(testSdeofEndsReadLoop);
   RUN(testSdopenModes);

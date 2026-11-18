@@ -529,7 +529,8 @@ class ExpansionMock {
                            kWifiErrNeedPassword = 3, kWifiErrNoneKnown = 4, kWifiErrWep = 5;
   // EXP_BLE_STATUS_*
   static constexpr uint8_t kBleStatusLinked = 0x01, kBleStatusAdvertising = 0x02, kBleStatusOfferIn = 0x04,
-                           kBleStatusAnswered = 0x08, kBleStatusAccepted = 0x10, kBleStatusPairAsk = 0x20;
+                           kBleStatusAnswered = 0x08, kBleStatusAccepted = 0x10, kBleStatusPairAsk = 0x20,
+                           kBleStatusServer = 0x40;
   static constexpr int kBleFileArgs = 42;
   static constexpr int kStoreParams = 0x7F0;
 
@@ -693,6 +694,10 @@ class ExpansionMock {
   // FILE_GET's kind (2026-11-16): the file's own (ble_paths.h fileKind()),
   // or with true 0xFF, as an older server that doesn't say.
   void setBleKindUnknown(bool unknown) { bleKindUnknown_ = unknown; }
+  // Whether the linked peer says it's a file server (the app), as STATUS's
+  // EXP_BLE_STATUS_SERVER: BLGET then fetches from bleFiles() (2026-11-17).
+  // Off by default, so the peer-to-peer tests keep their PC-1500.
+  void setBlePeerIsServer(bool server) { blePeerIsServer_ = server; }
   // The Screen pane (2026-11-03): the firmware's screen.c, fed by BASIC's
   // buffers (Bus::writeME0 hands over every ME0 write to 7000H-7FFFH, as
   // GreenPAK2 IO12 does), the keywords' SHOW/BROWSE, and ZIP's console;
@@ -1198,6 +1203,7 @@ class ExpansionMock {
   std::vector<uint8_t> blePaperOps_;
   bool blePeerPrints_ = true;
   bool bleKindUnknown_ = false;
+  bool blePeerIsServer_ = false;
   std::vector<std::vector<uint8_t>> bleDisplay_;
   void screenReset();  // screen_init(): a fresh MCU's RAM
   void screenPoll();

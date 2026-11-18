@@ -305,6 +305,41 @@ void testSaveLoad() {
   CHECK(p.pc->close() == kOk);
   CHECK(loaded == data);
 
+  // FILE_GET gives the size, big end first (BLGET's progress, 2026-11-18)
+  CHECK(((gw[42 + 2] << 24) | (gw[42 + 3] << 16) | (gw[42 + 4] << 8) | gw[42 + 5]) == 700);
+
+  // stopped early (BREAK during BLGET, 2026-11-18): DATA_CLOSE abandons it,
+  // the sender's next frame is refused -- not left to be taken for the next
+  // load's answer -- and the next load works, with the link still up
+  gw = window();
+  nameSlot(gw, "T");
+  CHECK(p.pc->command(0x46, gw) == kOk);
+  {
+    auto rw = window();
+    rw[kLengthPort] = 0;
+    rw[kLengthPort + 1] = 100;
+    CHECK(p.pc->read(rw) == kOk);
+    auto cw = window();
+    cw[0] = 1;  // abandon
+    CHECK(p.pc->command(0x50, cw) == kError);
+  }
+  gw = window();
+  nameSlot(gw, "T");
+  CHECK(p.pc->command(0x46, gw) == kOk);
+  loaded.clear();
+  for (;;) {
+    auto rw = window();
+    rw[kLengthPort] = 0x04;
+    rw[kLengthPort + 1] = 0x00;
+    if (p.pc->read(rw) != kOk) break;
+    size_t n = static_cast<size_t>(rw[kLengthPort] << 8 | rw[kLengthPort + 1]);
+    if (n == 0) break;
+    loaded.insert(loaded.end(), rw.begin(), rw.begin() + static_cast<long>(n));
+  }
+  CHECK(p.pc->close() == kOk);
+  CHECK(loaded == data);
+  CHECK(p.wire.connected);
+
   gw = window();
   nameSlot(gw, "NONE");
   CHECK(p.pc->command(0x46, gw) == kError && gw[0] == 3);  // NOT_FOUND

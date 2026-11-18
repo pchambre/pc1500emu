@@ -416,16 +416,15 @@ uint8_t ExpansionMock::dispatchCommand(uint8_t cmd, std::vector<uint8_t>& window
 #else
       return kStatusNotImplemented;
 #endif
-    case kCommandLogList: {
-      // No MCU log here: an empty listing (just the summary line), in
-      // LIST_SD_DIR's shape, so MLOG VIEW has something to browse.
-      static const char kSummary[] = "0 ENTRIES";
-      window[0] = 0;
-      window[1] = 0;
-      for (int i = 0; i < kSummaryLineLen; i++)
-        window[2 + i] = i < static_cast<int>(sizeof kSummary - 1) ? static_cast<uint8_t>(kSummary[i]) : ' ';
-      return kStatusSuccess;
-    }
+    case kCommandLogList:
+      // MLOG VIEW (2026-11-18): HELP's viewer over the log, as the
+      // firmware's. No MCU log here: just its count.
+#ifdef PC1500_HAVE_EXPANSION_KEYWORDS
+      sshWindow_ = &window;
+      return help_view_command(window.data(), 1, [](uint16_t, char*) -> const char* { return "0 ENTRIES"; });
+#else
+      return kStatusNotImplemented;
+#endif
     case kCommandConfigGet:
       if (window[0] >= kConfigCount) return kStatusError;
       window[1] = static_cast<uint8_t>(config_[window[0]] >> 8);
@@ -1460,9 +1459,11 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       bleXferData_ = it->second;
       bleXferPos_ = 0;
       bleXferFailed_ = false;
-      bleRouted_ = true;
+      bleRouted_ = window[kBleFileArgs] != 0;  // unrouted: BLGET "name" onto the card
       // its kind, unless a test wants an old server's "unknown"
       window[0] = bleKindUnknown_ ? 0xFF : pc1500::ble::fileKind(it->second);
+      for (int i = 0; i < 4; i++)  // its size, big end first (BLGET's progress)
+        window[kBleFileArgs + 2 + i] = static_cast<uint8_t>(it->second.size() >> (24 - 8 * i));
       return kStatusSuccess;
     }
 
@@ -1485,6 +1486,7 @@ uint8_t ExpansionMock::bleCommand(uint8_t cmd, std::vector<uint8_t>& window) {
       }
       uint8_t flags = 0;
       if (bleConnected_) flags |= kBleStatusLinked;
+      if (bleConnected_ && blePeerIsServer_) flags |= kBleStatusServer;
       if (bleAdvertising_) flags |= kBleStatusAdvertising;
       if (bleOfferIn_ && bleConnected_) flags |= kBleStatusOfferIn;
       if (bleOfferOut_ && bleAnswered_) flags |= kBleStatusAnswered | (bleAccepted_ ? kBleStatusAccepted : 0);

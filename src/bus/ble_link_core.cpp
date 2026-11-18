@@ -70,7 +70,7 @@ constexpr uint8_t kTime = 0x41;  // the server's clock, in its ACK (2026-10-08)
 constexpr uint8_t kDisplay = 0x50;  // the PC-1500's screen text (2026-10-17)
 // EXP_BLE_STATUS_*
 constexpr uint8_t kStatusLinked = 0x01, kStatusAdvertising = 0x02, kStatusOfferIn = 0x04, kStatusAnswered = 0x08,
-                  kStatusAccepted = 0x10;
+                  kStatusAccepted = 0x10, kStatusServer = 0x40;
 constexpr size_t kFileArgs = 42;      // EXP_BLE_FILE_ARGS: after the name slot
 constexpr size_t kLengthPort = 0x7FD; // EXP_LENGTH_PORT_PAGE/ADDRESS
 constexpr size_t kPathMax = 40;       // EXP_PATH_ARG_LEN
@@ -874,6 +874,7 @@ uint8_t LinkCore::filePut(std::vector<uint8_t>& w) {
 }
 
 uint8_t LinkCore::fileGet(std::vector<uint8_t>& w) {
+  bool routed = w[kFileArgs] != 0;  // unrouted: BLGET "name" from the app, onto the card
   std::vector<uint8_t> p{kTargetServer};
   std::vector<uint8_t> n = str8(nameFromSlot(w));
   p.insert(p.end(), n.begin(), n.end());
@@ -890,8 +891,10 @@ uint8_t LinkCore::fileGet(std::vector<uint8_t>& w) {
   }
   answer(f.seq);
   w[0] = f.payload[1];  // kind
+  for (int i = 0; i < 4; i++)  // its size, big end first, as OFFER_GET's (BLGET's progress)
+    w[kFileArgs + 2 + i] = f.payload[6 - i];
   xfer_ = Xfer::kGet;
-  routed_ = true;
+  routed_ = routed;
   xferFailed_ = getEnded_ = false;
   getBuf_.clear();
   getPos_ = 0;
@@ -982,6 +985,7 @@ uint8_t LinkCore::read(std::vector<uint8_t>& w) {
     } else {
       answer(f.seq, f.type == kFileAbort ? 0 : kErrBadFrame);
       xferFailed_ = true;
+      getEnded_ = true;  // nothing more comes: close() has none to refuse
       log("Load aborted");
       return kStatusError;
     }
@@ -999,6 +1003,22 @@ uint8_t LinkCore::close() {
     if (!ok && isLinked()) request(kFileAbort, {});
   } else {
     ok = !xferFailed_ && getEnded_ && getPos_ == getBuf_.size();
+    if (!ok && !getEnded_ && isLinked()) {
+      // Stopped early (BREAK, 2026-11-18): the sender's next frame is here
+      // or on its way -- refuse it, as the firmware's xfer_close(), without
+      // dropping the link if it never comes.
+      std::unique_lock<std::mutex> lock(mutex_);
+      unsigned gen = linkGen_;
+      cv_.wait_for(lock, std::chrono::milliseconds(answerTimeoutMs_),
+                   [&] { return !incoming_.empty() || linkGen_ != gen; });
+      if (linkGen_ == gen && !incoming_.empty()) {
+        Frame f = std::move(incoming_.front());
+        incoming_.pop_front();
+        lock.unlock();
+        if (f.type == kFileAbort) answer(f.seq);
+        else answer(f.seq, kErrAborted);
+      }
+    }
   }
   xfer_ = Xfer::kNone;
   return ok ? kStatusSuccess : kStatusError;
@@ -1010,6 +1030,7 @@ uint8_t LinkCore::status(std::vector<uint8_t>& w) {
   std::lock_guard<std::mutex> lock(mutex_);
   uint8_t flags = 0;
   if (linked_ && helloDone_) flags |= kStatusLinked;
+  if (linked_ && helloDone_ && !asServer_ && peerKind_ == kKindServer) flags |= kStatusServer;  // BLGET fetches
   if (advertising_ && !linked_) flags |= kStatusAdvertising;
   if (offerIn_) flags |= kStatusOfferIn;
   if (offerOut_ && answered_) flags |= kStatusAnswered | (accepted_ ? kStatusAccepted : 0);
